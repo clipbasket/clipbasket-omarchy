@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.clipbasket.demo",
+  "name": "Clipbasket Demo",
+  "version": "0.2.0",
+  "author": "Clipbasket",
+  "description": "Bar pill + Omarchy-native popup listing recent clips",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Clipbasket Demo",
+    "description": "Recent clips popup",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
