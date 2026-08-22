@@ -1,0 +1,821 @@
+#!/usr/bin/env bash
+#
+# clipbasket-omarchy — control the Clipbasket plugin for Omarchy.
+#
+#   clipbasket-omarchy enable            Turn the bar widget on
+#   clipbasket-omarchy disable           Turn it off (keeps history)
+#   clipbasket-omarchy make-default      Take SUPER + CTRL + V
+#   clipbasket-omarchy restore-default   Give it back, exactly
+#   clipbasket-omarchy status            What is on right now
+#   clipbasket-omarchy doctor            Diagnose a broken install
+#
+# Every command that writes to your config accepts --dry-run.
+
+set -euo pipefail
+
+readonly VERSION="0.3.0"
+readonly PLUGIN_ID="clipbasket.clipboard"
+
+# The keybinding Omarchy ships for its own clipboard overlay, and the one we
+# swap ourselves into on `make-default`.
+readonly DEFAULT_KEY="SUPER + CTRL + V"
+readonly TOGGLE_COMMAND="omarchy-shell shell toggle $PLUGIN_ID"
+readonly OMARCHY_CLIPBOARD_PLUGIN="omarchy.clipboard"
+
+# Everything the managed block in bindings.lua is delimited by. Never widen
+# these: `restore-default` deletes strictly between them, so a user's own lines
+# can never be caught up in it.
+readonly BLOCK_BEGIN="-- >>> clipbasket"
+readonly BLOCK_END="-- <<< clipbasket"
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+
+PLUGIN_DIR="$CONFIG_HOME/omarchy/plugins/$PLUGIN_ID"
+SETTINGS_FILE="${CLIPBASKET_SETTINGS:-$CONFIG_HOME/clipbasket/settings.json}"
+# History lives under XDG_STATE_HOME, not XDG_DATA_HOME: it is regenerable machine
+# state, not user data. clipbasket-db and clipbasket-capture resolve it the same
+# way — these three must never drift apart.
+DATA_DIR="$STATE_HOME/clipbasket"
+DB_FILE="${CLIPBASKET_DB:-$DATA_DIR/clips.db}"
+STATE_DIR="$STATE_HOME/clipbasket"
+BACKUP_DIR="$STATE_DIR/backups"
+DEFAULT_STATE_FILE="$STATE_DIR/make-default.json"
+BINDINGS_FILE="${CLIPBASKET_BINDINGS:-$CONFIG_HOME/hypr/bindings.lua}"
+
+DRY_RUN=0
+BAR_SECTION="right"
+RELOAD=1
+KEEP_OMARCHY_CLIPBOARD=0
+BIND_KEY="$DEFAULT_KEY"
+
+# ---------------------------------------------------------------- output ----
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_BLUE=$'\033[34m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_BLUE=""
+fi
+
+step() { printf '%s==>%s %s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$*" "$C_RESET"; }
+info() { printf '    %s\n' "$*"; }
+ok()   { printf '    %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '    %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+quoted() {
+  local out="" arg
+  for arg in "$@"; do out+="${out:+ }$(printf '%q' "$arg")"; done
+  printf '%s' "$out"
+}
+
+run() {
+  if (( DRY_RUN )); then
+    printf '    %s[dry-run]%s %s\n' "$C_DIM" "$C_RESET" "$(quoted "$@")"
+    return 0
+  fi
+  "$@"
+}
+
+run_soft() {
+  if (( DRY_RUN )); then
+    printf '    %s[dry-run]%s %s\n' "$C_DIM" "$C_RESET" "$(quoted "$@")"
+    return 0
+  fi
+  "$@" || return $?
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# `omarchy plugin` and `omarchy-shell` resolve their plugin roots through
+# $OMARCHY_PATH and fail with a misleading `find: '/shell/plugins'` when it is
+# unset — which it is for any invocation outside a desktop session (a cron job,
+# an SSH shell, a systemd unit).
+ensure_omarchy_path() {
+  local candidate
+  [[ -n "${OMARCHY_PATH:-}" && -d "${OMARCHY_PATH:-}/shell" ]] && return 0
+  for candidate in \
+      "$DATA_HOME/omarchy" \
+      "$HOME/.local/share/omarchy" \
+      "/usr/share/omarchy" \
+      "/usr/lib/omarchy"; do
+    if [[ -d "$candidate/shell" ]]; then
+      export OMARCHY_PATH="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ------------------------------------------------------------ inspection ----
+
+# Whether our plugin is enabled in the bar. `omarchy plugin list` is the source
+# of truth; when it cannot be asked, say "unknown" rather than guess.
+#   prints: enabled | disabled | unknown
+plugin_state() {
+  local listing
+  if ! have omarchy; then printf 'unknown'; return; fi
+  ensure_omarchy_path || true
+  if ! listing="$(omarchy plugin list 2>/dev/null)"; then printf 'unknown'; return; fi
+  if [[ -z "$listing" ]]; then printf 'unknown'; return; fi
+  # A listing that mentions the id at all means it is registered; Omarchy marks
+  # disabled entries explicitly, so absence from the enabled set is the signal.
+  if printf '%s\n' "$listing" | grep -qiE "^[^#]*${PLUGIN_ID//./\\.}.*\b(enabled|on|active)\b"; then
+    printf 'enabled'
+  elif printf '%s\n' "$listing" | grep -qF -- "$PLUGIN_ID"; then
+    printf 'disabled'
+  else
+    printf 'unknown'
+  fi
+}
+
+omarchy_clipboard_state() {
+  local listing
+  if ! have omarchy; then printf 'unknown'; return; fi
+  ensure_omarchy_path || true
+  if ! listing="$(omarchy plugin list 2>/dev/null)"; then printf 'unknown'; return; fi
+  if printf '%s\n' "$listing" | grep -qiE "^[^#]*${OMARCHY_CLIPBOARD_PLUGIN//./\\.}.*\b(enabled|on|active)\b"; then
+    printf 'enabled'
+  elif printf '%s\n' "$listing" | grep -qF -- "$OMARCHY_CLIPBOARD_PLUGIN"; then
+    printf 'disabled'
+  else
+    printf 'unknown'
+  fi
+}
+
+daemon_running() {
+  if have systemctl && systemctl --user is-active --quiet clipbasket-omarchy.service 2>/dev/null; then
+    return 0
+  fi
+  pgrep -f 'clipbasket-daemon|clipbasket-omarchy-daemon' >/dev/null 2>&1
+}
+
+shell_running() {
+  pgrep -f 'quickshell -n -p' >/dev/null 2>&1
+}
+
+managed_block_present() {
+  [[ -f "$BINDINGS_FILE" ]] && grep -qF -- "$BLOCK_BEGIN" "$BINDINGS_FILE"
+}
+
+# The key our managed block currently binds, read back from the file itself.
+managed_block_key() {
+  [[ -f "$BINDINGS_FILE" ]] || return 1
+  awk -v b="$BLOCK_BEGIN" -v e="$BLOCK_END" '
+    index($0, b) { inblock = 1; next }
+    index($0, e) { inblock = 0; next }
+    inblock && /o\.bind\(/ {
+      if (match($0, /"[^"]*"/)) {
+        print substr($0, RSTART + 1, RLENGTH - 2)
+        exit
+      }
+    }
+  ' "$BINDINGS_FILE"
+}
+
+# Whether Hyprland has actually loaded a binding that runs our toggle. Only
+# answerable inside a live session.
+keybind_live() {
+  have hyprctl || return 2
+  local binds
+  binds="$(hyprctl binds 2>/dev/null)" || return 2
+  [[ -n "$binds" ]] || return 2
+  printf '%s\n' "$binds" | grep -qF -- "toggle $PLUGIN_ID"
+}
+
+# --------------------------------------------------------- bindings.lua -----
+
+backup_bindings() {
+  [[ -f "$BINDINGS_FILE" ]] || return 0
+  local stamp dest n
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  dest="$BACKUP_DIR/bindings.lua.$stamp"
+  # Two runs inside the same second must not silently overwrite each other's
+  # backup — that is exactly when a user is retrying and needs the earlier one.
+  n=1
+  while [[ -e "$dest" ]]; do
+    dest="$BACKUP_DIR/bindings.lua.$stamp.$n"
+    n=$((n + 1))
+  done
+  run mkdir -p -- "$BACKUP_DIR"
+  run cp -p -- "$BINDINGS_FILE" "$dest"
+  (( DRY_RUN )) || ok "Backed up bindings.lua to $dest"
+}
+
+# Write $1 to $BINDINGS_FILE atomically, preserving the original's mode.
+write_bindings() {
+  local content="$1" tmp
+  if (( DRY_RUN )); then
+    printf '    %s[dry-run]%s would write %s:\n' "$C_DIM" "$C_RESET" "$BINDINGS_FILE"
+    printf '%s\n' "$content" | sed 's/^/        /'
+    return 0
+  fi
+  tmp="$(mktemp -- "${BINDINGS_FILE}.clipbasket.XXXXXX")"
+
+  # The write goes to a sibling temp file and lands with a single rename, so an
+  # out-of-space or interrupted write can never leave the user with a truncated
+  # bindings.lua — they either get the old file or the new one. Failures clean
+  # the temp file up explicitly rather than through a RETURN trap, which bash
+  # runs after the local `tmp` is already out of scope.
+  if [[ -f "$BINDINGS_FILE" ]]; then
+    chmod --reference="$BINDINGS_FILE" -- "$tmp" 2>/dev/null || true
+  fi
+  if ! printf '%s\n' "$content" >"$tmp"; then
+    rm -f -- "$tmp"
+    die "Failed to write $tmp — $BINDINGS_FILE is unchanged."
+  fi
+  if ! mv -f -- "$tmp" "$BINDINGS_FILE"; then
+    rm -f -- "$tmp"
+    die "Failed to replace $BINDINGS_FILE — it is unchanged."
+  fi
+}
+
+# The file with our managed block removed, markers included. Everything outside
+# the markers is passed through byte-for-byte: this is what makes
+# `restore-default` an exact reversal rather than a reformat.
+bindings_without_block() {
+  [[ -f "$BINDINGS_FILE" ]] || return 0
+  awk -v b="$BLOCK_BEGIN" -v e="$BLOCK_END" '
+    index($0, b) { inblock = 1; next }
+    inblock && index($0, e) { inblock = 0; next }
+    !inblock { print }
+  ' "$BINDINGS_FILE"
+}
+
+managed_block_text() {
+  cat <<EOF
+$BLOCK_BEGIN — managed by \`clipbasket-omarchy make-default\`. Do not edit by
+-- hand; \`clipbasket-omarchy restore-default\` deletes this block verbatim.
+hl.unbind("$BIND_KEY")
+o.bind("$BIND_KEY", "Clipbasket", "$TOGGLE_COMMAND")
+$BLOCK_END
+EOF
+}
+
+reload_hyprland() {
+  (( RELOAD )) || { info "Skipping the compositor reload (--no-reload)."; return 0; }
+  if ! have hyprctl; then
+    warn "hyprctl not found — log out and back in, or reload Hyprland by hand."
+    return 0
+  fi
+  if run_soft hyprctl reload >/dev/null 2>&1; then
+    ok "Hyprland reloaded"
+  else
+    warn "hyprctl reload failed (no live session?). The binding applies at your next login."
+  fi
+}
+
+# ---------------------------------------------------------- state file -----
+
+# `restore-default` must undo exactly what `make-default` did — no more. It
+# re-enables Omarchy's clipboard only if we were the ones who disabled it, so a
+# user who had already turned it off stays turned off.
+record_default_state() {
+  local disabled_theirs="$1"
+  if (( DRY_RUN )); then
+    printf '    %s[dry-run]%s record state (disabledOmarchyClipboard=%s) in %s\n' \
+      "$C_DIM" "$C_RESET" "$disabled_theirs" "$DEFAULT_STATE_FILE"
+    return 0
+  fi
+  mkdir -p -- "$STATE_DIR"
+  cat >"$DEFAULT_STATE_FILE" <<EOF
+{
+  "boundKey": $(json_string "$BIND_KEY"),
+  "disabledOmarchyClipboard": $disabled_theirs,
+  "at": $(json_string "$(date -Is 2>/dev/null || date)")
+}
+EOF
+}
+
+read_default_state_flag() {
+  [[ -f "$DEFAULT_STATE_FILE" ]] || { printf 'false'; return; }
+  if have jq; then
+    jq -r '.disabledOmarchyClipboard // false' <"$DEFAULT_STATE_FILE" 2>/dev/null || printf 'false'
+  elif grep -q '"disabledOmarchyClipboard": *true' "$DEFAULT_STATE_FILE"; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+# Mirror the bound key into settings.json so the panel can render the shortcut
+# without parsing Lua. Best-effort by design: a missing settings file or a
+# missing jq must never fail a keybinding change, because the file in
+# ~/.config/hypr is the one that actually decides the binding.
+mirror_shortcut_setting() {
+  local value="$1"
+  if (( DRY_RUN )); then
+    printf '    %s[dry-run]%s set globalShortcut=%s in %s\n' \
+      "$C_DIM" "$C_RESET" "$(json_string "$value")" "$SETTINGS_FILE"
+    return 0
+  fi
+  have jq || return 0
+  [[ -f "$SETTINGS_FILE" ]] || return 0
+  local tmp
+  tmp="$(mktemp -- "${SETTINGS_FILE}.clipbasket.XXXXXX")" || return 0
+  if jq --arg key "$value" '.globalShortcut = $key' <"$SETTINGS_FILE" >"$tmp" 2>/dev/null; then
+    mv -f -- "$tmp" "$SETTINGS_FILE"
+  else
+    rm -f -- "$tmp"
+    warn "Could not update globalShortcut in $SETTINGS_FILE (invalid JSON?)."
+  fi
+}
+
+json_string() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+# ------------------------------------------------------------- commands -----
+
+cmd_enable() {
+  step "Enabling Clipbasket"
+  ensure_omarchy_path || warn "OMARCHY_PATH could not be resolved; Omarchy commands may fail."
+
+  have omarchy-shell && run_soft omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+
+  if have omarchy; then
+    if run_soft omarchy plugin enable "$PLUGIN_ID" "$BAR_SECTION"; then
+      ok "Bar widget enabled ($BAR_SECTION section)"
+    else
+      die "\`omarchy plugin enable $PLUGIN_ID $BAR_SECTION\` failed. Run it directly for the error."
+    fi
+  else
+    die "omarchy is not on PATH."
+  fi
+
+  if have systemctl && [[ -f "$CONFIG_HOME/systemd/user/clipbasket-omarchy.service" ]]; then
+    run_soft systemctl --user enable --now clipbasket-omarchy.service || \
+      warn "Could not start the capture daemon."
+  fi
+
+  info ""
+  info "Clipbasket is in your bar. Omarchy's clipboard still owns $DEFAULT_KEY;"
+  info "run \`clipbasket-omarchy make-default\` to change that."
+}
+
+cmd_disable() {
+  step "Disabling Clipbasket"
+  ensure_omarchy_path || true
+
+  if have omarchy; then
+    if run_soft omarchy plugin disable "$PLUGIN_ID"; then
+      ok "Bar widget disabled"
+    else
+      warn "\`omarchy plugin disable $PLUGIN_ID\` failed."
+    fi
+  else
+    warn "omarchy is not on PATH; skipping the plugin step."
+  fi
+
+  if have systemctl && systemctl --user list-unit-files clipbasket-omarchy.service >/dev/null 2>&1; then
+    run_soft systemctl --user disable --now clipbasket-omarchy.service >/dev/null 2>&1 && \
+      ok "Capture daemon stopped" || true
+  fi
+
+  if managed_block_present; then
+    warn "$DEFAULT_KEY is still bound to Clipbasket."
+    warn "Run \`clipbasket-omarchy restore-default\` to hand it back to Omarchy."
+  fi
+
+  info ""
+  info "Your clip history is untouched at $DB_FILE."
+}
+
+cmd_make_default() {
+  step "Making Clipbasket the default clipboard"
+
+  if [[ ! -f "$BINDINGS_FILE" ]]; then
+    die "$BINDINGS_FILE does not exist. Is this Omarchy? Pass CLIPBASKET_BINDINGS=… to override."
+  fi
+
+  local current_key
+  if managed_block_present; then
+    current_key="$(managed_block_key || true)"
+    if [[ "$current_key" == "$BIND_KEY" ]]; then
+      ok "Already bound: $BIND_KEY -> Clipbasket"
+    else
+      info "Rebinding from ${current_key:-an earlier key} to $BIND_KEY"
+    fi
+  fi
+
+  backup_bindings
+
+  # Strip any previous block first, then append exactly one. Running this twice
+  # produces the same file as running it once.
+  local rest block content
+  rest="$(bindings_without_block)"
+  block="$(managed_block_text)"
+  # Exactly one blank line between the user's content and our block.
+  rest="${rest%$'\n'}"
+  content="${rest}"$'\n\n'"${block}"
+  write_bindings "$content"
+  (( DRY_RUN )) || ok "$BIND_KEY -> $TOGGLE_COMMAND"
+
+  local disabled_theirs="false"
+  if (( KEEP_OMARCHY_CLIPBOARD )); then
+    info "Leaving $OMARCHY_CLIPBOARD_PLUGIN enabled (--keep-omarchy-clipboard)."
+  else
+    ensure_omarchy_path || true
+    local their_state
+    their_state="$(omarchy_clipboard_state)"
+    case "$their_state" in
+      enabled)
+        if run_soft omarchy plugin disable "$OMARCHY_CLIPBOARD_PLUGIN" >/dev/null 2>&1; then
+          disabled_theirs="true"
+          (( DRY_RUN )) || ok "Disabled $OMARCHY_CLIPBOARD_PLUGIN"
+        else
+          warn "Could not disable $OMARCHY_CLIPBOARD_PLUGIN; both overlays may respond."
+        fi
+        ;;
+      disabled) ok "$OMARCHY_CLIPBOARD_PLUGIN was already disabled — leaving it that way" ;;
+      *)        warn "Could not read the state of $OMARCHY_CLIPBOARD_PLUGIN; leaving it alone." ;;
+    esac
+  fi
+
+  record_default_state "$disabled_theirs"
+  mirror_shortcut_setting "$BIND_KEY"
+  reload_hyprland
+
+  info ""
+  info "Undo any time with: clipbasket-omarchy restore-default"
+}
+
+cmd_restore_default() {
+  step "Restoring Omarchy's default clipboard"
+
+  if ! managed_block_present; then
+    ok "No Clipbasket block in $BINDINGS_FILE — nothing to undo there"
+  else
+    backup_bindings
+    local content
+    content="$(bindings_without_block)"
+    # Drop the blank separator we added, so the file returns to its prior shape.
+    content="${content%$'\n'}"
+    write_bindings "$content"
+    (( DRY_RUN )) || ok "Removed the Clipbasket block from $BINDINGS_FILE"
+  fi
+
+  local we_disabled_theirs
+  we_disabled_theirs="$(read_default_state_flag)"
+  if [[ "$we_disabled_theirs" == "true" ]]; then
+    ensure_omarchy_path || true
+    if have omarchy && run_soft omarchy plugin enable "$OMARCHY_CLIPBOARD_PLUGIN" >/dev/null 2>&1; then
+      (( DRY_RUN )) || ok "Re-enabled $OMARCHY_CLIPBOARD_PLUGIN"
+    else
+      warn "Could not re-enable $OMARCHY_CLIPBOARD_PLUGIN. Run:"
+      warn "  omarchy plugin enable $OMARCHY_CLIPBOARD_PLUGIN"
+    fi
+  else
+    info "$OMARCHY_CLIPBOARD_PLUGIN was not disabled by Clipbasket — leaving it as you set it."
+  fi
+
+  if (( DRY_RUN )); then
+    printf '    %s[dry-run]%s rm -f %s\n' "$C_DIM" "$C_RESET" "$(printf '%q' "$DEFAULT_STATE_FILE")"
+  else
+    rm -f -- "$DEFAULT_STATE_FILE"
+  fi
+
+  mirror_shortcut_setting ""
+  reload_hyprland
+
+  info ""
+  info "Clipbasket is still installed and still in your bar — it just no longer"
+  info "owns $DEFAULT_KEY. Backups of bindings.lua are in $BACKUP_DIR."
+}
+
+cmd_status() {
+  local plugin their_clip key
+  plugin="$(plugin_state)"
+  their_clip="$(omarchy_clipboard_state)"
+  key="$(managed_block_key || true)"
+
+  step "Clipbasket for Omarchy $VERSION"
+  printf '\n'
+  printf '    %-26s %s\n' "Plugin directory"  "$PLUGIN_DIR"
+  printf '    %-26s %s\n' "Settings"          "$SETTINGS_FILE"
+  printf '    %-26s %s\n' "Database"          "$DB_FILE"
+  printf '\n'
+  printf '    %-26s %s\n' "Bar widget"        "$plugin"
+  printf '    %-26s %s\n' "Capture daemon"    "$(daemon_running && echo running || echo 'not running')"
+  printf '    %-26s %s\n' "Omarchy shell"     "$(shell_running && echo running || echo 'not running')"
+  printf '    %-26s %s\n' "Omarchy clipboard" "$their_clip"
+  if [[ -n "$key" ]]; then
+    printf '    %-26s %s\n' "Our keybinding"   "$key"
+  else
+    printf '    %-26s %s\n' "Our keybinding"   "not bound (Omarchy owns $DEFAULT_KEY)"
+  fi
+  printf '\n'
+  info "Run \`clipbasket-omarchy doctor\` for a full check."
+}
+
+# --------------------------------------------------------------- doctor -----
+
+DOCTOR_FAILURES=0
+DOCTOR_WARNINGS=0
+
+check_pass() { printf '  %sPASS%s  %-34s %s\n' "$C_GREEN" "$C_RESET" "$1" "${2:-}"; }
+check_fail() { printf '  %sFAIL%s  %-34s %s\n' "$C_RED"   "$C_RESET" "$1" "${2:-}"; DOCTOR_FAILURES=$((DOCTOR_FAILURES + 1)); }
+check_warn() { printf '  %sWARN%s  %-34s %s\n' "$C_YELLOW" "$C_RESET" "$1" "${2:-}"; DOCTOR_WARNINGS=$((DOCTOR_WARNINGS + 1)); }
+check_info() { printf '  %sINFO%s  %-34s %s\n' "$C_DIM"   "$C_RESET" "$1" "${2:-}"; }
+
+check_binary() {
+  local label="$1" bin="$2" package="$3"
+  if have "$bin"; then
+    check_pass "$label" "$(command -v "$bin")"
+  else
+    check_fail "$label" "not found — sudo pacman -S $package"
+  fi
+}
+
+cmd_doctor() {
+  step "Clipbasket for Omarchy $VERSION — diagnostics"
+  printf '\n'
+
+  printf '  %sEnvironment%s\n' "$C_BOLD" "$C_RESET"
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    check_pass "Operating system" "Linux"
+  else
+    check_fail "Operating system" "$(uname -s) — this build is Linux-only"
+  fi
+
+  if ensure_omarchy_path; then
+    check_pass "OMARCHY_PATH" "$OMARCHY_PATH"
+  else
+    check_fail "OMARCHY_PATH" "no Omarchy checkout found; export OMARCHY_PATH yourself"
+  fi
+
+  if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    check_pass "Wayland session" "$WAYLAND_DISPLAY"
+  else
+    check_warn "Wayland session" "WAYLAND_DISPLAY unset (fine over SSH; clipboard reads need a session)"
+  fi
+
+  printf '\n  %sDependencies%s\n' "$C_BOLD" "$C_RESET"
+  check_binary "sqlite3"       "sqlite3"      "sqlite"
+  check_binary "wl-clipboard (wl-copy)"  "wl-copy"  "wl-clipboard"
+  check_binary "wl-clipboard (wl-paste)" "wl-paste" "wl-clipboard"
+  check_binary "jq"            "jq"           "jq"
+  if have omarchy; then check_pass "omarchy CLI" "$(command -v omarchy)"; else check_fail "omarchy CLI" "not found"; fi
+  if have omarchy-shell; then check_pass "omarchy-shell CLI" "$(command -v omarchy-shell)"; else check_fail "omarchy-shell CLI" "not found"; fi
+
+  printf '\n  %sInstallation%s\n' "$C_BOLD" "$C_RESET"
+  if [[ -f "$PLUGIN_DIR/manifest.json" ]]; then
+    check_pass "Plugin installed" "$PLUGIN_DIR"
+  else
+    check_fail "Plugin installed" "no manifest.json at $PLUGIN_DIR"
+  fi
+
+  case "$(plugin_state)" in
+    enabled)  check_pass "Bar widget enabled" ;;
+    disabled) check_fail "Bar widget enabled" "run: clipbasket-omarchy enable" ;;
+    *)        check_warn "Bar widget enabled" "could not read \`omarchy plugin list\`" ;;
+  esac
+
+  if shell_running; then
+    check_pass "Omarchy shell running"
+  else
+    check_warn "Omarchy shell running" "no quickshell process (expected outside a desktop session)"
+  fi
+
+  if [[ -L "$HOME/.local/bin/clipbasket-omarchy" || -f "$HOME/.local/bin/clipbasket-omarchy" ]]; then
+    check_pass "CLI on PATH" "$HOME/.local/bin/clipbasket-omarchy"
+  else
+    check_warn "CLI on PATH" "not linked into ~/.local/bin"
+  fi
+
+  printf '\n  %sRuntime%s\n' "$C_BOLD" "$C_RESET"
+  if daemon_running; then
+    check_pass "Capture daemon running"
+  else
+    check_fail "Capture daemon running" "history will not update — see docs/INSTALL.md"
+  fi
+
+  if [[ -f "$DB_FILE" ]]; then
+    if [[ -w "$DB_FILE" ]]; then
+      local clip_count=""
+      if have sqlite3; then
+        clip_count="$(sqlite3 "$DB_FILE" 'select count(*) from clips;' 2>/dev/null || true)"
+      fi
+      check_pass "Database writable" "$DB_FILE${clip_count:+ ($clip_count clips)}"
+    else
+      check_fail "Database writable" "$DB_FILE is not writable by $(id -un)"
+    fi
+    if have sqlite3; then
+      if sqlite3 "$DB_FILE" 'pragma quick_check;' 2>/dev/null | grep -qx 'ok'; then
+        check_pass "Database integrity" "ok"
+      else
+        check_fail "Database integrity" "sqlite3 quick_check did not return ok"
+      fi
+    fi
+  elif [[ ! -d "$DATA_DIR" ]]; then
+    check_fail "Database writable" "$DATA_DIR does not exist — run install.sh"
+  elif [[ -w "$DATA_DIR" ]]; then
+    check_warn "Database writable" "no database yet, but $DATA_DIR is writable"
+  else
+    check_fail "Database writable" "$DATA_DIR is not writable by $(id -un)"
+  fi
+
+  if [[ -f "$SETTINGS_FILE" ]]; then
+    if ! have jq; then
+      check_warn "Settings file" "$SETTINGS_FILE (install jq to validate it)"
+    elif jq -e . <"$SETTINGS_FILE" >/dev/null 2>&1; then
+      check_pass "Settings file" "$SETTINGS_FILE"
+    else
+      check_fail "Settings file" "$SETTINGS_FILE is not valid JSON"
+    fi
+  else
+    check_warn "Settings file" "missing — run: clipbasket-omarchy settings-init"
+  fi
+
+  printf '\n  %sKeybindings%s\n' "$C_BOLD" "$C_RESET"
+  if [[ -f "$BINDINGS_FILE" ]]; then
+    check_pass "bindings.lua present" "$BINDINGS_FILE"
+  else
+    check_fail "bindings.lua present" "$BINDINGS_FILE not found"
+  fi
+
+  local bound_key
+  bound_key="$(managed_block_key || true)"
+  if [[ -n "$bound_key" ]]; then
+    check_pass "Clipbasket keybinding" "$bound_key (managed block)"
+  else
+    check_info "Clipbasket keybinding" "not bound — run: clipbasket-omarchy make-default"
+  fi
+
+  if keybind_live; then
+    check_pass "Keybinding loaded by Hyprland"
+  else
+    case $? in
+      2) check_info "Keybinding loaded by Hyprland" "cannot ask hyprctl outside a session" ;;
+      *) if [[ -n "$bound_key" ]]; then
+           check_fail "Keybinding loaded by Hyprland" "block is in the file but not live — run: hyprctl reload"
+         else
+           check_info "Keybinding loaded by Hyprland" "nothing bound"
+         fi ;;
+    esac
+  fi
+
+  case "$(omarchy_clipboard_state)" in
+    enabled)
+      if [[ -n "$bound_key" ]]; then
+        check_warn "Omarchy clipboard" "still enabled while Clipbasket owns $bound_key — both may respond"
+      else
+        check_info "Omarchy clipboard" "enabled (owns $DEFAULT_KEY; coexisting by design)"
+      fi
+      ;;
+    disabled) check_info "Omarchy clipboard" "disabled" ;;
+    *)        check_warn "Omarchy clipboard" "state unknown" ;;
+  esac
+
+  printf '\n'
+  if (( DOCTOR_FAILURES )); then
+    printf '  %s%d failed%s, %d warnings.\n' "$C_RED" "$DOCTOR_FAILURES" "$C_RESET" "$DOCTOR_WARNINGS"
+    printf '  Fix the FAIL lines first — each names the command that resolves it.\n\n'
+    return 1
+  fi
+  if (( DOCTOR_WARNINGS )); then
+    printf '  %sAll checks passed%s with %d warnings.\n\n' "$C_GREEN" "$C_RESET" "$DOCTOR_WARNINGS"
+  else
+    printf '  %sAll checks passed.%s\n\n' "$C_GREEN" "$C_RESET"
+  fi
+  return 0
+}
+
+# ------------------------------------------------------- settings-init -----
+
+# Seed ~/.config/clipbasket/settings.json from the schema, so defaults live in
+# exactly one place. Never overwrites an existing file without --force.
+cmd_settings_init() {
+  local force=0
+  [[ "${1:-}" == "--force" ]] && force=1
+
+  local schema="$PLUGIN_DIR/settings.schema.json"
+  if [[ ! -f "$schema" ]]; then
+    local here
+    here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -P)"
+    schema="$here/settings.schema.json"
+  fi
+  [[ -f "$schema" ]] || die "settings.schema.json not found (looked in $PLUGIN_DIR)."
+  have jq || die "jq is required to seed settings. sudo pacman -S jq"
+
+  if [[ -f "$SETTINGS_FILE" && $force -eq 0 ]]; then
+    info "$SETTINGS_FILE already exists. Pass --force to overwrite it with defaults."
+    return 0
+  fi
+
+  local defaults
+  defaults="$(jq -S '.properties | with_entries(.value |= .default) | with_entries(select(.value != null))' "$schema")"
+
+  if (( DRY_RUN )); then
+    printf '    %s[dry-run]%s would write %s:\n' "$C_DIM" "$C_RESET" "$SETTINGS_FILE"
+    printf '%s\n' "$defaults" | sed 's/^/        /'
+    return 0
+  fi
+
+  mkdir -p -- "$(dirname -- "$SETTINGS_FILE")"
+  printf '%s\n' "$defaults" >"$SETTINGS_FILE"
+  ok "Wrote defaults to $SETTINGS_FILE"
+}
+
+# ----------------------------------------------------------------- help -----
+
+usage() {
+  cat <<EOF
+${C_BOLD}clipbasket-omarchy${C_RESET} $VERSION — control the Clipbasket plugin for Omarchy
+
+${C_BOLD}Usage${C_RESET}
+  clipbasket-omarchy <command> [options]
+
+${C_BOLD}Commands${C_RESET}
+  enable              Enable the bar widget and start the capture daemon
+  disable             Disable the bar widget and stop the daemon (history kept)
+  make-default        Bind $DEFAULT_KEY to Clipbasket and step
+                      Omarchy's own clipboard aside
+  restore-default     Undo make-default exactly
+  status              Show what is installed and enabled
+  doctor              Diagnose the install, PASS/FAIL per check
+  settings-init       Write default settings from settings.schema.json
+  version             Print the version
+  help                Show this help
+
+${C_BOLD}Options${C_RESET}
+  --dry-run                  Print every change without making it
+  --section <l|c|r>          Bar section for enable (default: right)
+  --key "<binding>"          Key for make-default (default: "$DEFAULT_KEY")
+  --keep-omarchy-clipboard   make-default: leave $OMARCHY_CLIPBOARD_PLUGIN enabled
+  --no-reload                Do not run \`hyprctl reload\` afterwards
+  --force                    settings-init: overwrite an existing settings file
+  -h, --help                 Show this help
+
+${C_BOLD}Files${C_RESET}
+  Plugin      $PLUGIN_DIR
+  Settings    $SETTINGS_FILE
+  Database    $DB_FILE
+  Bindings    $BINDINGS_FILE
+  Backups     $BACKUP_DIR
+
+Clipbasket for Omarchy is free. The macOS and Windows apps are paid — see
+https://clipbasket.com.
+EOF
+}
+
+# ------------------------------------------------------------------ main ----
+
+main() {
+  local command="" force_flag=""
+  # Seeded with the default so an empty invocation never indexes an empty array
+  # (which `set -u` rejects on older bash).
+  local -a positional=("help")
+  local seen_command=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) DRY_RUN=1; shift ;;
+      --section) [[ $# -ge 2 ]] || die "--section needs a value"; BAR_SECTION="$2"; shift 2 ;;
+      --section=*) BAR_SECTION="${1#*=}"; shift ;;
+      --key)     [[ $# -ge 2 ]] || die "--key needs a value"; BIND_KEY="$2"; shift 2 ;;
+      --key=*)   BIND_KEY="${1#*=}"; shift ;;
+      --keep-omarchy-clipboard) KEEP_OMARCHY_CLIPBOARD=1; shift ;;
+      --no-reload) RELOAD=0; shift ;;
+      --force)   force_flag="--force"; shift ;;
+      -h|--help) usage; return 0 ;;
+      --) shift ;;
+      -*) die "unknown option: $1 (try --help)" ;;
+      *)  if (( seen_command )); then
+            die "unexpected argument: $1 (try --help)"
+          fi
+          positional[0]="$1"; seen_command=1; shift ;;
+    esac
+  done
+
+  command="${positional[0]}"
+
+  case "$BAR_SECTION" in
+    left|center|right) ;;
+    *) die "--section must be left, center, or right (got: $BAR_SECTION)" ;;
+  esac
+
+  if [[ -z "${BIND_KEY// /}" ]]; then
+    die "--key cannot be empty"
+  fi
+
+  case "$command" in
+    enable)          cmd_enable ;;
+    disable)         cmd_disable ;;
+    make-default)    cmd_make_default ;;
+    restore-default) cmd_restore_default ;;
+    status)          cmd_status ;;
+    doctor)          cmd_doctor ;;
+    settings-init)   cmd_settings_init "$force_flag" ;;
+    version|--version) printf '%s\n' "$VERSION" ;;
+    help)            usage ;;
+    *)               die "unknown command: $command (try --help)" ;;
+  esac
+}
+
+main "$@"

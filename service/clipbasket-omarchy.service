@@ -1,0 +1,38 @@
+[Unit]
+Description=Clipbasket clipboard capture for Omarchy
+Documentation=https://github.com/clipbasket/clipbasket-omarchy
+# The watchers need a compositor to read the clipboard from, so the unit is
+# bound to the graphical session rather than to login. Omarchy starts Hyprland
+# through uwsm, which reaches graphical-session.target with WAYLAND_DISPLAY
+# already in the user environment — that is what makes this work without the
+# unit having to guess a display name.
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+# A capture daemon that flaps must give up loudly instead of hammering the
+# compositor forever; `clipbasket-omarchy doctor` reports the failed state.
+# These live in [Unit], not [Service] — systemd moved them and only warns.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# `foreground` rather than `start`: systemd owns the lifecycle here, so the
+# daemon must not fork away or write a pid file that systemd would disagree
+# with. Restart handling below replaces the supervisor's own backoff.
+ExecStart=%h/.config/omarchy/plugins/clipbasket.clipboard/bin/clipbasket-daemon foreground
+Restart=on-failure
+RestartSec=2
+# It reads the clipboard and writes one SQLite database. Nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/clipbasket
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+MemoryMax=256M
+
+[Install]
+WantedBy=graphical-session.target

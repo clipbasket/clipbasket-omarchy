@@ -1,15 +1,15 @@
 {
   "schemaVersion": 1,
-  "id": "dev.clipbasket.demo",
-  "name": "Clipbasket Demo",
-  "version": "0.2.0",
+  "id": "clipbasket.clipboard",
+  "name": "Clipbasket",
+  "version": "0.3.0",
   "author": "Clipbasket",
-  "description": "Bar pill + Omarchy-native popup listing recent clips",
+  "description": "Clipboard history for Omarchy — search everything you have copied",
   "kinds": ["bar-widget"],
   "entryPoints": { "barWidget": "BarWidget.qml" },
   "barWidget": {
-    "displayName": "Clipbasket Demo",
-    "description": "Recent clips popup",
+    "displayName": "Clipbasket",
+    "description": "Clipboard history: search, filter, pin and paste",
     "category": "Productivity",
     "allowMultiple": false,
     "defaultSection": "right"

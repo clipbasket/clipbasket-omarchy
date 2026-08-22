@@ -7,7 +7,7 @@ import qs.Ui
 // first-party widgets (audio, microphone, ...).
 BarWidget {
   id: root
-  moduleName: "dev.clipbasket.demo"
+  moduleName: "clipbasket.clipboard"
 
   function injectPanel() {
     var target = panelLoader.item
