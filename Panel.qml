@@ -4,8 +4,9 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Two views in one panel: the clip list, and a settings page reached from the
-// cog in the header. The list is a faithful port of the desktop app's popup --
+// Three views in one panel: the clip list, the detail view for a single clip
+// (reached from a row), and a settings page reached from the cog in the
+// header. The list is a faithful port of the desktop app's popup --
 // same row anatomy (leading visual, title, secondary line, time + action rail),
 // same time sections, same filter set, same delete-confirmation rule -- driven
 // by the `clipbasket-db` CLI instead of Tauri commands.
@@ -26,6 +27,7 @@ Panel {
   property string query: ""
   property string filter: "all"
   property bool settingsOpen: false
+  property bool detailOpen: false
   property bool loading: false
   property bool loaded: false
   property string warning: ""
@@ -43,6 +45,22 @@ Panel {
 
   // ---- Delete confirmation (armed by clip id, like the desktop app)
   property int armedDeleteId: -1
+
+  // ---- Detail view. Keyed by clip *id*, not by row index: pin, save and copy
+  // all queue a reload that re-sorts the model underneath us, so the index is
+  // re-resolved from the id after every list replace (see listProc below).
+  // `detailClip` is the full record from `clipbasket-db get` -- the list
+  // endpoint truncates `text`, which is exactly what this view exists to show.
+  property int detailClipId: -1
+  property int detailIndex: -1
+  property var detailClip: null
+  property bool detailLoading: false
+  property string detailError: ""
+  // Pinned/saved are mirrored here rather than read off `detailClip`: the
+  // toggles below update the model optimistically and the fetched record would
+  // otherwise stay stale until the next `get`.
+  property bool detailPinned: false
+  property bool detailSaved: false
 
   // ---- Copy-variant menu (panel-level overlay so the ListView cannot clip it)
   property int menuClipRow: -1
@@ -76,6 +94,7 @@ Panel {
   readonly property string glyphBrand:    "\uf0ea"  // clipboard
   readonly property string glyphCog:      "\uf013"  // cog
   readonly property string glyphBack:     "\uf053"  // chevron-left
+  readonly property string glyphForward:  "\uf054"  // chevron-right
   readonly property string glyphSearch:   "\uf002"  // magnifier
   readonly property string glyphChevron:  "\uf078"  // chevron-down
   readonly property string glyphText:     "\uf15c"  // file-text-o
@@ -89,6 +108,15 @@ Panel {
   readonly property string glyphSaved:    "\uf02e"  // bookmark (solid)
   readonly property string glyphUnsaved:  "\uf097"  // bookmark-o
   readonly property string glyphTrash:    "\uf014"  // trash-o
+
+  // Armed-delete tint. Omarchy's palette exposes no danger role, so the one
+  // literal lives here instead of being repeated at every call site.
+  readonly property color dangerTint: "#ff9b90"
+
+  // Style carries no documented monospace token; probing for one keeps us on a
+  // token if the theme grows it, and otherwise falls back to Fontconfig's
+  // generic alias rather than naming a font that may not be installed.
+  readonly property string monoFamily: Style.font.mono || Style.font.familyMono || "monospace"
 
   // ---------------------------------------------------------------- helpers
 
@@ -228,6 +256,13 @@ Panel {
     return Qt.formatDateTime(d, "MMM d, h:mm AP");
   }
 
+  // The list trades precision for scannability; the detail view has room for
+  // the unambiguous stamp, like formatAbsoluteDateTime in the desktop popup.
+  function formatAbsolute(ts) {
+    if (!ts) return "";
+    return Qt.formatDateTime(new Date(ts), "MMM d, yyyy  ·  h:mm AP");
+  }
+
   // -------------------------------------------------------------- the model
 
   ListModel { id: clipModel }
@@ -266,7 +301,13 @@ Panel {
       imageHeight: root.num(clip.image_height, 0),
       fileCount: root.num(clip.file_count, 0),
       urlTitle: String(clip.url_title || ""),
-      urlDomain: String(clip.url_domain || "")
+      urlDomain: String(clip.url_domain || ""),
+      // Absent on an older CLI, which simply degrades to the URL-only
+      // Markdown rule this build shipped with.
+      hasHtml: clip.has_html === true,
+      sourceApp: String(clip.source_app || ""),
+      sizeBytes: root.num(clip.size_bytes, 0),
+      createdAt: root.createdMs(clip)
     };
   }
 
@@ -298,13 +339,22 @@ Panel {
     return args;
   }
 
+  // `count` has to be told the same filter and query as `list`, or its
+  // `filtered` total describes the whole history instead of what is on screen
+  // -- searching for one clip among sixteen reported "16 matches".
+  function countArgs() {
+    var args = "count --filter " + root.filter;
+    if (root.query.length > 0) args += " --query " + root.shq(root.query);
+    return args;
+  }
+
   function reload() {
     if (listProc.running) listProc.running = false;
     root.replaceOnNextPage = true;
     root.loading = true;
     listProc.command = ["sh", "-c", root.dbCmd(root.listArgs(0), "[]")];
     listProc.running = true;
-    countProc.command = ["sh", "-c", root.dbCmd("count", "{}")];
+    countProc.command = ["sh", "-c", root.dbCmd(root.countArgs(), "{}")];
     countProc.running = true;
   }
 
@@ -325,6 +375,7 @@ Panel {
       // search cleared, selection on the first row, search field focused.
       root.suspendReloads = true;
       root.settingsOpen = false;
+      root.resetDetail();
       root.armedDeleteId = -1;
       root.closeMenu();
       root.notice = "";
@@ -340,6 +391,7 @@ Panel {
       Qt.callLater(function () { searchInput.forceActiveFocus(); searchInput.selectAll(); });
     } else {
       root.settingsOpen = false;
+      root.resetDetail();
       root.closeMenu();
     }
   }
@@ -374,8 +426,23 @@ Panel {
         root.appendPage(parsed, wasReplace);
         root.loaded = true;
         if (wasReplace) {
-          clipList.currentIndex = clipModel.count > 0 ? 0 : -1;
-          clipList.positionViewAtBeginning();
+          // Pin toggles and copies both re-sort the model, so an open detail
+          // view is re-bound by clip id instead of by its stale row index. A
+          // clip that no longer exists (deleted, or trimmed by maxClips) sends
+          // the panel back to the list rather than showing a dead record.
+          var keep = root.detailOpen ? root.indexOfClipId(root.detailClipId) : -1;
+          if (root.detailOpen && keep < 0) root.closeDetail();
+          if (keep >= 0) {
+            root.detailIndex = keep;
+            var kept = clipModel.get(keep);
+            root.detailPinned = kept.pinned === true;
+            root.detailSaved = kept.saved === true;
+            clipList.currentIndex = keep;
+            clipList.positionViewAtIndex(keep, ListView.Contain);
+          } else {
+            clipList.currentIndex = clipModel.count > 0 ? 0 : -1;
+            clipList.positionViewAtBeginning();
+          }
         }
       }
     }
@@ -391,6 +458,66 @@ Panel {
           root.totalCount = root.num(c.total, 0);
           root.matchingCount = root.num(c.filtered, root.totalCount);
         } catch (e) { /* leave the previous counts alone */ }
+      }
+    }
+  }
+
+  // `get` returns the untruncated record for one clip. Kept off the action
+  // queue so opening the detail view never waits behind a pending mutation.
+  Process {
+    id: detailProc
+    running: false
+    stdout: StdioCollector {
+      onStreamFinished: {
+        if (!root.detailOpen) return;
+        var parsed = null;
+        try { parsed = JSON.parse(String(text).trim()); } catch (e) { parsed = null; }
+        if (!parsed || typeof parsed !== "object") {
+          root.detailLoading = false;
+          root.detailClip = null;
+          root.detailError = "Unable to load this clip.";
+          return;
+        }
+        // A fast Enter-Escape-Enter run can land an older response after the
+        // view has moved on; the id is the only thing that can tell. Leaving
+        // the loading flag alone keeps the placeholder up for the live request.
+        if (root.num(parsed.id, -1) !== root.detailClipId) return;
+        root.detailLoading = false;
+        root.detailError = "";
+        root.detailClip = parsed;
+        root.detailPinned = parsed.pinned === true;
+        root.detailSaved = parsed.saved === true;
+      }
+    }
+  }
+
+  // HTML -> Markdown is the CLI's job; QML never parses HTML. A clip with no
+  // HTML answers with a JSON error object, which is why the payload is read
+  // back here instead of being piped straight into wl-copy.
+  property int markdownClipId: -1
+
+  Process {
+    id: markdownProc
+    running: false
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var id = root.markdownClipId;
+        root.markdownClipId = -1;
+        var md = "";
+        try {
+          var parsed = JSON.parse(String(text).trim());
+          if (parsed && typeof parsed.markdown === "string") md = parsed.markdown;
+        } catch (e) { md = ""; }
+        if (md.length === 0) {
+          // Belt and braces: a URL clip whose HTML failed to convert still has
+          // the link form the desktop app falls back to.
+          md = root.markdownFor(root.rowAt(root.indexOfClipId(id)));
+        }
+        if (md.length === 0) {
+          root.showNotice("Clipbasket couldn't convert this clip to Markdown.");
+          return;
+        }
+        root.finishMarkdown(md);
       }
     }
   }
@@ -454,6 +581,14 @@ Panel {
     return clipModel.get(index);
   }
 
+  function indexOfClipId(id) {
+    if (id < 0) return -1;
+    for (var i = 0; i < clipModel.count; i++) {
+      if (clipModel.get(i).clipId === id) return i;
+    }
+    return -1;
+  }
+
   function copyTextCommand(value) {
     return "printf %s " + root.shq(value) + " | wl-copy";
   }
@@ -478,8 +613,9 @@ Panel {
   }
 
   // The desktop app derives Markdown by running turndown over the clip's
-  // stored HTML flavor. The CLI contract carries no HTML, so the only rule we
-  // can honour losslessly is the link form for URL clips.
+  // stored HTML flavor. Here the conversion belongs to `clipbasket-db
+  // markdown`; this stays the fallback for a URL clip that has no HTML, which
+  // is the one rule that can be honoured losslessly without any HTML at all.
   function markdownFor(row) {
     if (!row || row.kind !== "url") return "";
     var url = row.payload;
@@ -488,11 +624,32 @@ Panel {
     return "[" + label + "](" + url + ")";
   }
 
+  // Offered whenever the clip has an HTML flavor, plus the URL case that
+  // predates it. Shared by the row's variant menu and the detail view so the
+  // two can never disagree about when the action exists.
+  function supportsMarkdown(row) {
+    if (!row) return false;
+    if (row.hasHtml === true) return true;
+    return row.kind === "url" && String(row.payload || "").length > 0;
+  }
+
   function copyMarkdown(index) {
     var row = root.rowAt(index);
-    var md = root.markdownFor(row);
+    if (!row) return;
     root.clearTransientState();
+    if (row.hasHtml === true) {
+      root.markdownClipId = row.clipId;
+      if (markdownProc.running) markdownProc.running = false;
+      markdownProc.command = ["sh", "-c", root.dbCmd("markdown " + row.clipId, "{}")];
+      markdownProc.running = true;
+      return;
+    }
+    var md = root.markdownFor(row);
     if (!md) { root.showNotice("Clipbasket couldn't convert this clip to Markdown."); return; }
+    root.finishMarkdown(md);
+  }
+
+  function finishMarkdown(md) {
     root.runAction(root.copyTextCommand(md), false);
     if (root.closePanelAfterAction) root.close();
     else root.showNotice("Markdown copied.");
@@ -544,6 +701,7 @@ Panel {
     var next = !row.pinned;
     root.clearTransientState();
     clipModel.setProperty(index, "pinned", next);
+    if (root.detailOpen && row.clipId === root.detailClipId) root.detailPinned = next;
     root.runAction(root.dbCmd("pin " + row.clipId + (next ? " --on" : " --off"), ""), true);
   }
 
@@ -553,6 +711,7 @@ Panel {
     var next = !row.saved;
     root.clearTransientState();
     clipModel.setProperty(index, "saved", next);
+    if (root.detailOpen && row.clipId === root.detailClipId) root.detailSaved = next;
     root.runAction(root.dbCmd("save " + row.clipId + (next ? " --on" : " --off"), ""), true);
   }
 
@@ -587,7 +746,7 @@ Panel {
   function menuActionsFor(row) {
     var actions = [];
     if (!row) return actions;
-    if (row.kind === "url" && row.payload.length > 0) actions.push({ id: "markdown", label: "Copy as Markdown" });
+    if (root.supportsMarkdown(row)) actions.push({ id: "markdown", label: "Copy as Markdown" });
     if (row.kind === "files") {
       actions.push({ id: "file-full", label: "Copy full path" });
       actions.push({ id: "file-name", label: "Copy file name" });
@@ -619,6 +778,119 @@ Panel {
     else if (actionId === "file-parent") root.copyFileVariant(index, "parent");
   }
 
+  // ---------------------------------------------------------- detail view
+
+  // Everything the detail view renders is derived from the fetched record by
+  // the same toRow() the list uses, so title/secondary/glyph rules can never
+  // drift between the two views.
+  readonly property var detailRow: root.detailClip ? root.toRow(root.detailClip) : null
+  readonly property string detailKind: root.detailRow ? root.detailRow.kind : ""
+  readonly property string detailTitle: root.detailRow ? root.detailRow.title : ""
+  readonly property string detailText: root.detailRow ? root.detailRow.payload : ""
+  readonly property string detailMime: root.detailRow ? root.detailRow.mime : ""
+  readonly property string detailImagePath: root.detailRow ? root.detailRow.imagePath : ""
+  readonly property int detailImageW: root.detailRow ? root.detailRow.imageWidth : 0
+  readonly property int detailImageH: root.detailRow ? root.detailRow.imageHeight : 0
+  readonly property string detailSourceApp: root.detailRow ? root.detailRow.sourceApp : ""
+  readonly property string detailWhen: root.detailRow ? root.formatAbsolute(root.detailRow.createdAt) : ""
+  readonly property bool detailHasMarkdown: root.supportsMarkdown(root.detailRow)
+
+  readonly property string detailDimensions:
+    root.detailImageW > 0 && root.detailImageH > 0
+      ? root.detailImageW + " × " + root.detailImageH
+      : ""
+
+  readonly property var detailFiles: {
+    if (!root.detailRow || root.detailRow.kind !== "files") return [];
+    var items = root.fileItems(root.detailRow);
+    var out = [];
+    for (var i = 0; i < items.length; i++) {
+      var p = String(items[i].path || "");
+      if (p.length > 0) out.push(p);
+    }
+    return out;
+  }
+
+  readonly property string detailSize: {
+    if (!root.detailRow) return "";
+    var s = root.humanSize(root.detailRow.sizeBytes);
+    if (s.length > 0) return s;
+    // Text and URL clips carry no size_bytes in the CLI contract, so the
+    // character count is the only size signal they have.
+    var n = root.detailText.length;
+    return n > 0 ? n + (n === 1 ? " character" : " characters") : "";
+  }
+
+  readonly property string detailStateLabel: {
+    if (!root.detailRow) return "";
+    return (root.detailPinned ? "Pinned" : "Not pinned")
+      + "  ·  " + (root.detailSaved ? "Saved" : "Not saved");
+  }
+
+  readonly property string detailKindLabel: {
+    switch (root.detailKind) {
+      case "url":   return "Link";
+      case "image": return "Image";
+      case "files": return root.detailFiles.length === 1 ? "File" : "Files";
+      case "text":  return "Text";
+    }
+    return "";
+  }
+
+  function openDetail(index) {
+    var row = root.rowAt(index);
+    if (!row) return;
+    root.clearTransientState();
+    root.settingsOpen = false;
+    root.detailIndex = index;
+    root.detailClipId = row.clipId;
+    root.detailPinned = row.pinned === true;
+    root.detailSaved = row.saved === true;
+    root.detailClip = null;
+    root.detailError = "";
+    root.detailLoading = true;
+    root.detailOpen = true;
+    // Inspecting a row is also selecting it, so leaving the list is a no-op
+    // for the selection the user comes back to.
+    clipList.currentIndex = index;
+    if (detailProc.running) detailProc.running = false;
+    detailProc.command = ["sh", "-c", root.dbCmd("get " + row.clipId, "null")];
+    detailProc.running = true;
+    // The view has to exist before it can hold focus.
+    Qt.callLater(function () { detailBody.contentY = 0; detailView.forceActiveFocus(); });
+  }
+
+  function resetDetail() {
+    root.detailOpen = false;
+    root.detailClip = null;
+    root.detailError = "";
+    root.detailLoading = false;
+    root.detailIndex = -1;
+    root.detailClipId = -1;
+  }
+
+  function closeDetail() {
+    if (!root.detailOpen) return;
+    root.resetDetail();
+    // The list keeps whatever currentIndex it had; only focus travels back.
+    Qt.callLater(function () { searchInput.forceActiveFocus(); });
+  }
+
+  // deleteClip() only removes the row once its confirmation (if the clip is
+  // protected) is satisfied, so "did the clip survive" is the honest test for
+  // whether the detail view still has anything to show.
+  function deleteFromDetail() {
+    if (root.detailIndex < 0) return;
+    var id = root.detailClipId;
+    root.deleteClip(root.detailIndex);
+    if (root.indexOfClipId(id) < 0) root.closeDetail();
+  }
+
+  function scrollDetail(delta) {
+    var max = Math.max(0, detailBody.contentHeight - detailBody.height);
+    detailBody.contentY = Math.min(max, Math.max(0, detailBody.contentY + delta));
+  }
+
   // ------------------------------------------------------- keyboard handling
 
   function moveSelection(delta) {
@@ -640,6 +912,7 @@ Panel {
   // matter which of the two currently owns focus. Returns true when handled.
   function handleNavKey(event) {
     if (root.settingsOpen) return false;
+    if (root.detailOpen) return root.handleDetailKey(event);
     if (root.menuClipRow >= 0 && event.key === Qt.Key_Escape) { root.closeMenu(); return true; }
     switch (event.key) {
       case Qt.Key_Down:     root.moveSelection(1); return true;
@@ -654,7 +927,18 @@ Panel {
         root.selectAbsolute(clipModel.count - 1); return true;
       case Qt.Key_Return:
       case Qt.Key_Enter:
-        if (clipModel.count > 0) root.copyClip(clipList.currentIndex);
+        // Enter inspects, the way the desktop popup's row body does. Ctrl+Enter
+        // keeps the one-keystroke copy for anyone who lived on plain Enter.
+        if (clipModel.count > 0) {
+          if (event.modifiers & Qt.ControlModifier) root.copyClip(clipList.currentIndex);
+          else root.openDetail(clipList.currentIndex);
+        }
+        return true;
+      case Qt.Key_Right:
+        // Same guard as Home/End: the search field's own cursor keys win while
+        // there is text to move through.
+        if (searchInput.activeFocus && searchInput.text.length > 0) return false;
+        if (clipModel.count > 0) root.openDetail(clipList.currentIndex);
         return true;
       case Qt.Key_Delete:
       case Qt.Key_Backspace:
@@ -664,6 +948,34 @@ Panel {
           if (clipModel.count > 0) root.deleteClip(clipList.currentIndex);
           return true;
         }
+        return false;
+    }
+    return false;
+  }
+
+  // Detail-view keys. Escape also reaches PanelKeyCatcher.onCloseRequested when
+  // focus sits in one of the selectable text blocks, and both paths land on
+  // closeDetail(), so the view closes either way.
+  function handleDetailKey(event) {
+    switch (event.key) {
+      case Qt.Key_Escape:
+      case Qt.Key_Left:
+        root.closeDetail(); return true;
+      case Qt.Key_Return:
+      case Qt.Key_Enter:
+        root.copyClip(root.detailIndex); return true;
+      case Qt.Key_Down:     root.scrollDetail(Style.space(48)); return true;
+      case Qt.Key_Up:       root.scrollDetail(-Style.space(48)); return true;
+      case Qt.Key_PageDown: root.scrollDetail(detailBody.height * 0.9); return true;
+      case Qt.Key_PageUp:   root.scrollDetail(-detailBody.height * 0.9); return true;
+      case Qt.Key_Home:     detailBody.contentY = 0; return true;
+      case Qt.Key_End:      root.scrollDetail(detailBody.contentHeight); return true;
+      case Qt.Key_Delete:
+        root.deleteFromDetail(); return true;
+      case Qt.Key_Backspace:
+        // Backspace is a reading-position key inside the selectable text
+        // blocks, so deleting from here needs the explicit modifier.
+        if (event.modifiers & Qt.ControlModifier) { root.deleteFromDetail(); return true; }
         return false;
     }
     return false;
@@ -825,6 +1137,58 @@ Panel {
     }
   }
 
+  // ---- Labelled, selectable field card used by the detail view. Hides itself
+  // when there is nothing to say, so each kind's grid falls out of one list.
+  component DetailField: Item {
+    id: fld
+    property string label: ""
+    property string value: ""
+    property bool mono: false
+    visible: fld.value.length > 0
+    width: parent ? parent.width - Style.space(28) : 0
+    x: Style.space(14)
+    height: fld.visible ? fldCol.implicitHeight + Style.space(14) : 0
+
+    Rectangle {
+      anchors.fill: parent
+      radius: 8
+      color: Qt.rgba(1, 1, 1, 0.05)
+      border.width: 1
+      border.color: Qt.rgba(1, 1, 1, 0.10)
+    }
+
+    Column {
+      id: fldCol
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+
+      Text {
+        text: fld.label.toUpperCase()
+        color: root.barForeground
+        opacity: 0.4
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      // TextEdit rather than Text: the whole point of this view is being able
+      // to read *and* take the content, so every value is selectable.
+      TextEdit {
+        width: parent.width
+        text: fld.value
+        readOnly: true
+        selectByMouse: true
+        wrapMode: Text.Wrap
+        color: root.barForeground
+        font.family: fld.mono ? root.monoFamily : Style.font.family
+        font.pixelSize: Style.font.body
+      }
+    }
+  }
+
   component SectionHeader: Text {
     color: root.barForeground
     opacity: 0.4
@@ -876,13 +1240,17 @@ Panel {
     centerOnBar: false
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(400))
-    contentHeight: panel.fittedContentHeight(Math.min(Style.space(600), root.settingsOpen ? settingsColumn.implicitHeight : clipView.desiredHeight))
+    contentHeight: panel.fittedContentHeight(Math.min(Style.space(600),
+      root.settingsOpen ? settingsColumn.implicitHeight
+      : root.detailOpen ? detailView.desiredHeight
+      : clipView.desiredHeight))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
       onCloseRequested: {
         if (root.menuClipRow >= 0) root.closeMenu();
+        else if (root.detailOpen) root.closeDetail();
         else if (root.settingsOpen) root.settingsOpen = false;
         else root.close();
       }
@@ -893,6 +1261,8 @@ Panel {
       // Keys.onPressed, so PanelKeyCatcher's own Esc/Tab handling is untouched.
       Keys.onUpPressed: function (event) { event.accepted = root.handleNavKey(event); }
       Keys.onDownPressed: function (event) { event.accepted = root.handleNavKey(event); }
+      Keys.onLeftPressed: function (event) { event.accepted = root.handleNavKey(event); }
+      Keys.onRightPressed: function (event) { event.accepted = root.handleNavKey(event); }
       Keys.onReturnPressed: function (event) { event.accepted = root.handleNavKey(event); }
       Keys.onEnterPressed: function (event) { event.accepted = root.handleNavKey(event); }
       Keys.onDeletePressed: function (event) { event.accepted = root.handleNavKey(event); }
@@ -901,7 +1271,7 @@ Panel {
       Item {
         id: clipView
         anchors.fill: parent
-        visible: !root.settingsOpen
+        visible: !root.settingsOpen && !root.detailOpen
 
         readonly property real maxListHeight: Style.space(440)
         readonly property real minListHeight: Style.space(120)
@@ -1149,8 +1519,10 @@ Panel {
             readonly property bool armed: root.armedDeleteId === clipId
             readonly property string rowPayload: model.payload
             readonly property string rowFiles: model.files
+            readonly property bool rowHasHtml: model.hasHtml
             readonly property var visual: root.visualSize(model.imageWidth, model.imageHeight)
-            readonly property bool hasVariants: (rowKind === "url" && rowPayload.length > 0) || rowKind === "files"
+            readonly property bool hasVariants: rowKind === "files"
+              || root.supportsMarkdown({ kind: rowKind, payload: rowPayload, hasHtml: rowHasHtml })
 
             width: ListView.view ? ListView.view.width : 0
             // Deliberately constant: ListView estimates contentHeight from the
@@ -1160,15 +1532,15 @@ Panel {
             height: Style.space(62)
             color: selected ? Qt.rgba(1, 1, 1, 0.07) : "transparent"
 
-            // Row body opens copy directly. The desktop app opens an inspector
-            // here instead; this build has no detail sheet, so the primary
-            // action is promoted to the row.
+            // Row body opens the detail view, as the desktop app's row does.
+            // Copying stays an explicit act: the Copy button in the rail, or
+            // Ctrl+Enter from the keyboard.
             MouseArea {
               id: rowArea
               anchors.fill: parent
               hoverEnabled: true
               onEntered: clipList.currentIndex = clipRow.rowIndex
-              onClicked: root.copyClip(clipRow.rowIndex)
+              onClicked: root.openDetail(clipRow.rowIndex)
             }
 
             // ---- Leading visual: thumbnail for image clips, kind tile otherwise
@@ -1272,10 +1644,19 @@ Panel {
                   spacing: Style.space(2)
                   visible: clipRow.selected || root.menuClipRow === clipRow.rowIndex
 
+                  // Explicit "open the detail view" affordance. The row body
+                  // does the same thing, but a chevron is the only visible
+                  // sign that a row leads somewhere.
+                  RowAction {
+                    anchors.verticalCenter: parent.verticalCenter
+                    glyph: root.glyphForward
+                    onActivated: root.openDetail(clipRow.rowIndex)
+                  }
+
                   RowAction {
                     anchors.verticalCenter: parent.verticalCenter
                     glyph: root.glyphTrash
-                    tint: clipRow.armed ? "#ff9b90" : root.barForeground
+                    tint: clipRow.armed ? root.dangerTint : root.barForeground
                     restOpacity: clipRow.armed ? 1.0 : 0.45
                     onActivated: root.deleteClip(clipRow.rowIndex)
                   }
@@ -1518,6 +1899,355 @@ Panel {
               }
             }
           }
+        }
+      }
+
+      // ================= CLIP DETAIL =================
+      // The third view, in the same slot as the list and settings. Header,
+      // body and footer are anchored the way clipView does it, so only the
+      // middle scrolls: the action rail can never end up out of reach, and the
+      // body clips instead of painting past the panel's rounded background.
+      Item {
+        id: detailView
+        anchors.fill: parent
+        visible: root.detailOpen
+
+        readonly property real maxBodyHeight: Style.space(440)
+        readonly property real minBodyHeight: Style.space(120)
+        readonly property real desiredHeight: detailHeader.implicitHeight + detailFooter.implicitHeight
+          + Math.max(detailView.minBodyHeight,
+                     Math.min(detailView.maxBodyHeight, detailContent.implicitHeight))
+
+        // Focused by openDetail(). Keys land here first and route through the
+        // same handleNavKey() the list and the search field use; anything left
+        // unaccepted (Escape from inside a text block, Tab) keeps bubbling to
+        // PanelKeyCatcher.
+        Keys.onPressed: function (event) {
+          if (root.handleNavKey(event)) event.accepted = true;
+        }
+
+        // ---- Header: back chevron, "Clip details", kind pill
+        Column {
+          id: detailHeader
+          anchors.top: parent.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          spacing: Style.space(6)
+
+          Item { width: 1; height: Style.space(12) }
+
+          Item {
+            width: parent.width - Style.space(28)
+            x: Style.space(14)
+            height: Style.space(24)
+
+            Item {
+              id: detailBack
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              width: backRow.implicitWidth
+              height: parent.height
+
+              Row {
+                id: backRow
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(8)
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: root.glyphBack
+                  color: root.barForeground
+                  opacity: detailBackHover.containsMouse ? 0.9 : 0.5
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Clip details"
+                  color: root.barForeground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+              }
+
+              MouseArea {
+                id: detailBackHover
+                anchors.fill: parent
+                hoverEnabled: true
+                onClicked: root.closeDetail()
+              }
+            }
+
+            Rectangle {
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              visible: root.detailKindLabel.length > 0
+              width: kindLabel.implicitWidth + Style.space(14)
+              height: Style.space(18)
+              radius: 4
+              color: Qt.rgba(1, 1, 1, 0.06)
+              border.width: 1
+              border.color: Qt.rgba(1, 1, 1, 0.12)
+
+              Text {
+                id: kindLabel
+                anchors.centerIn: parent
+                text: root.detailKindLabel.toUpperCase()
+                color: root.barForeground
+                opacity: 0.6
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          Text {
+            x: Style.space(14)
+            width: parent.width - Style.space(28)
+            visible: text.length > 0
+            text: root.detailTitle
+            color: root.barForeground
+            opacity: 0.55
+            elide: Text.ElideRight
+            maximumLineCount: 2
+            wrapMode: Text.Wrap
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          Item { width: 1; height: Style.space(4) }
+        }
+
+        // ---- Body. Same containment rule as the settings page: a capped
+        // panel height means the content must clip and scroll, never overflow.
+        Flickable {
+          id: detailBody
+          anchors.top: detailHeader.bottom
+          anchors.bottom: detailFooter.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          clip: true
+          contentWidth: width
+          contentHeight: detailContent.implicitHeight
+          boundsBehavior: Flickable.StopAtBounds
+
+          Column {
+            id: detailContent
+            width: parent.width
+            spacing: Style.space(6)
+
+            Text {
+              x: Style.space(14)
+              width: parent.width - Style.space(28)
+              visible: root.detailLoading || root.detailError.length > 0
+              text: root.detailError.length > 0 ? root.detailError : "Loading clip…"
+              color: root.detailError.length > 0 ? root.dangerTint : root.barForeground
+              opacity: root.detailError.length > 0 ? 0.85 : 0.5
+              wrapMode: Text.WordWrap
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+            }
+
+            // ---- image: the picture itself, at a size worth calling a preview.
+            // The slot's height follows the clip's own aspect ratio so a wide
+            // screenshot does not reserve a square of empty panel.
+            Item {
+              x: Style.space(14)
+              width: parent.width - Style.space(28)
+              visible: root.detailKind === "image" && root.detailImagePath.length > 0
+              height: visible
+                ? (root.detailImageW > 0 && root.detailImageH > 0
+                    ? Math.min(Style.space(240),
+                               Math.round(root.detailImageH * Math.min(1, width / root.detailImageW)))
+                    : Style.space(240))
+                : 0
+
+              Rectangle {
+                anchors.fill: parent
+                radius: 8
+                color: Qt.rgba(1, 1, 1, 0.05)
+                border.width: 1
+                border.color: Qt.rgba(1, 1, 1, 0.10)
+                clip: true
+
+                Image {
+                  anchors.fill: parent
+                  anchors.margins: Style.space(4)
+                  source: root.fileUrl(root.detailImagePath)
+                  fillMode: Image.PreserveAspectFit
+                  asynchronous: true
+                  cache: false
+                  sourceSize.width: 1024
+                  sourceSize.height: 1024
+                  smooth: true
+                }
+              }
+            }
+
+            // ---- text: the whole thing, monospaced, selectable, scrolled by
+            // the Flickable above rather than truncated the way the list is.
+            DetailField {
+              label: "Text"
+              mono: true
+              value: root.detailKind === "text" ? root.detailText : ""
+            }
+
+            // ---- url
+            DetailField {
+              label: "URL"
+              mono: true
+              value: root.detailKind === "url" ? root.detailText : ""
+            }
+            DetailField {
+              label: "Title"
+              value: root.detailKind === "url" && root.detailRow ? root.detailRow.urlTitle : ""
+            }
+            DetailField {
+              label: "Domain"
+              value: root.detailKind === "url" && root.detailRow ? root.detailRow.urlDomain : ""
+            }
+
+            // ---- files: the full list, one path per line.
+            DetailField {
+              label: root.detailFiles.length === 1 ? "File" : "Files"
+              mono: true
+              value: root.detailFiles.join("\n")
+            }
+
+            DetailField { label: "Dimensions"; value: root.detailDimensions }
+            DetailField { label: "Type"; value: root.detailMime }
+
+            // ---- always present
+            DetailField { label: "Source app"; value: root.detailSourceApp }
+            DetailField { label: "Captured"; value: root.detailWhen }
+            DetailField { label: "Size"; value: root.detailSize }
+            DetailField { label: "State"; value: root.detailStateLabel }
+
+            Item { width: 1; height: Style.space(8) }
+          }
+        }
+
+        // ---- Footer: the same actions the row rail carries, plus the notice
+        // slot, so the two-step delete confirmation is legible from here too.
+        Column {
+          id: detailFooter
+          anchors.bottom: parent.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+          spacing: 0
+
+          Item {
+            width: parent.width - Style.space(28)
+            x: Style.space(14)
+            height: Style.space(18)
+            visible: root.notice.length > 0
+
+            Text {
+              anchors.fill: parent
+              verticalAlignment: Text.AlignVCenter
+              text: root.notice
+              color: root.barForeground
+              opacity: 0.7
+              elide: Text.ElideRight
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          Item {
+            width: parent.width - Style.space(28)
+            x: Style.space(14)
+            height: Style.space(34)
+
+            Row {
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
+
+              RowAction {
+                anchors.verticalCenter: parent.verticalCenter
+                glyph: root.glyphTrash
+                tint: root.armedDeleteId === root.detailClipId ? root.dangerTint : root.barForeground
+                restOpacity: root.armedDeleteId === root.detailClipId ? 1.0 : 0.45
+                onActivated: root.deleteFromDetail()
+              }
+
+              RowAction {
+                anchors.verticalCenter: parent.verticalCenter
+                glyph: root.glyphPin
+                restOpacity: root.detailPinned ? 0.9 : 0.45
+                onActivated: root.togglePinned(root.detailIndex)
+              }
+
+              RowAction {
+                anchors.verticalCenter: parent.verticalCenter
+                glyph: root.detailSaved ? root.glyphSaved : root.glyphUnsaved
+                restOpacity: root.detailSaved ? 0.9 : 0.45
+                onActivated: root.toggleSaved(root.detailIndex)
+              }
+            }
+
+            Row {
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
+
+              Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.detailHasMarkdown
+                width: mdLabel.implicitWidth + Style.space(20)
+                height: Style.space(24)
+                radius: height / 2
+                color: mdArea.containsMouse ? Qt.rgba(1, 1, 1, 0.10) : "transparent"
+                border.width: 1
+                border.color: Qt.rgba(1, 1, 1, 0.16)
+
+                Text {
+                  id: mdLabel
+                  anchors.centerIn: parent
+                  text: "Copy as Markdown"
+                  color: root.barForeground
+                  opacity: 0.85
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+
+                MouseArea {
+                  id: mdArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  onClicked: root.copyMarkdown(root.detailIndex)
+                }
+              }
+
+              Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: detailCopyLabel.implicitWidth + Style.space(22)
+                height: Style.space(24)
+                radius: height / 2
+                color: root.barForeground
+
+                Text {
+                  id: detailCopyLabel
+                  anchors.centerIn: parent
+                  text: root.detailKind === "image" ? "Copy image" : "Copy"
+                  color: Color.background
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  onClicked: root.copyClip(root.detailIndex)
+                }
+              }
+            }
+          }
+
+          Item { width: 1; height: Style.space(8) }
         }
       }
 

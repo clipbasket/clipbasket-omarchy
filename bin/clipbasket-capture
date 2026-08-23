@@ -14,6 +14,10 @@
 # Two watchers, not three: which one records a given change is decided here
 # from the offer, so a copy that carries both an image and its alt text is
 # recorded once. Priority matches the Tauri app — files, then image, then text.
+#
+# A web copy also advertises text/html. That is a *flavour*, not a kind: the
+# plain text stays the clip's text so an ordinary paste is unchanged, and the
+# markup rides along in `html` for `clipbasket-db markdown` to convert later.
 
 set -euo pipefail
 
@@ -26,6 +30,7 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 DB_CLI="${CLIPBASKET_DB_CLI:-$SCRIPT_DIR/clipbasket-db}"
 
 MAX_TEXT_BYTES="${CLIPBASKET_MAX_TEXT_BYTES:-8388608}"    # 8 MiB, as in the Tauri app
+MAX_HTML_BYTES="${CLIPBASKET_MAX_HTML_BYTES:-8388608}"    # CLIPBOARD_HTML_MAX_BYTES
 MAX_IMAGE_BYTES="${CLIPBASKET_MAX_IMAGE_BYTES:-67108864}" # 64 MiB
 MAX_FILE_ITEMS="${CLIPBASKET_MAX_FILE_ITEMS:-1024}"
 MAX_CLIPS="${CLIPBASKET_MAX_CLIPS:-1000}"
@@ -329,7 +334,7 @@ image_dimensions() {
 	local file="$1" magick
 	magick=$(magick_cmd)
 	if [ -n "$magick" ]; then
-		"$magick" identify -format '%w %h' "$file[0]" 2>/dev/null && return 0
+		"$magick" identify -format '%w %h' "${file}[0]" 2>/dev/null && return 0
 	fi
 	# 89 50 4E 47 = \x89PNG; IHDR width/height are bytes 16..23, big-endian.
 	if [ "$(od -An -tx1 -N4 "$file" | tr -d ' \n')" = "89504e47" ]; then
@@ -353,13 +358,52 @@ make_thumbnail() {
 		printf '%s' "$source"
 		return 0
 	fi
-	if "$magick" "$source[0]" -thumbnail "${THUMB_SIZE}x${THUMB_SIZE}>" \
+	if "$magick" "${source}[0]" -thumbnail "${THUMB_SIZE}x${THUMB_SIZE}>" \
 		-background none -alpha background "$thumb" 2>/dev/null && [ -s "$thumb" ]; then
 		printf '%s' "$thumb"
 	else
 		rm -f "$thumb"
 		printf '%s' "$source"
 	fi
+}
+
+# --- the text/html flavour -------------------------------------------------
+
+# CRLF out, invalid UTF-8 out -- the same two guarantees capture_text makes
+# about the plain text, because everything downstream (JSON, SQLite, QML)
+# assumes valid UTF-8. Reads $1, writes $2.
+normalise_utf8() {
+	if command -v iconv >/dev/null 2>&1; then
+		tr -d '\r' <"$1" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null >"$2"
+	else
+		tr -d '\r' <"$1" >"$2"
+	fi
+}
+
+# Prints the path of a temp file holding the offer's text/html rendering, or
+# nothing. HTML is an *extra flavour* on a text clip, never a kind of its own:
+# the plain text stays the clip's `text`, so a normal paste keeps producing the
+# plain text and only "Copy as Markdown" reaches for this. Same split as
+# captured_text_like_clip() on macOS, where html_content rides alongside
+# text_content on a Text or Url clip.
+read_html_flavor() {
+	local types="$1" mime file clean size
+	mime=$(printf '%s\n' "$types" | awk '/^text\/html([;[:space:]]|$)/ { print; exit }')
+	[ -n "$mime" ] || return 0
+
+	file=$(mktempfile)
+	wl-paste --no-newline --type "$mime" >"$file" 2>/dev/null || return 0
+	size=$(file_size "$file")
+	[ "$size" -gt 0 ] || return 0
+	if [ "$size" -gt "$MAX_HTML_BYTES" ]; then
+		log "dropping ${size}-byte html flavour (limit $MAX_HTML_BYTES); keeping the plain text"
+		return 0
+	fi
+
+	clean=$(mktempfile)
+	normalise_utf8 "$file" "$clean"
+	[ -s "$clean" ] || return 0
+	printf '%s' "$clean"
 }
 
 # --- recording -------------------------------------------------------------
@@ -482,7 +526,8 @@ capture_image() {
 }
 
 capture_text() {
-	local stdin_file="$1" size text_file hash app payload kind=text domain='' preview='' head_line
+	local stdin_file="$1" types="${2-}"
+	local size text_file html_file='' hash app payload kind=text domain='' preview='' head_line
 
 	size=$(file_size "$stdin_file")
 	[ "$size" -gt 0 ] || return 1
@@ -516,11 +561,15 @@ capture_text() {
 		preview=$(url_preview "$head_line" "$domain")
 	fi
 
+	# The dedupe hash covers the plain text only. Two copies of the same words
+	# are the same clip whether or not the second one carried markup, which is
+	# the same key the Tauri app builds.
 	hash=$(sha256_of "$kind" "$text_file")
 	if consume_suppression "$hash"; then
 		return 0
 	fi
 	app=$(source_app)
+	html_file=$(read_html_flavor "$types")
 
 	payload=$(mktempfile)
 	{
@@ -537,7 +586,13 @@ capture_text() {
 		# it in SQL, where substr() counts characters rather than bytes and so
 		# cannot cut a multi-byte character in half.
 		json_field preview "$preview"
-		printf ',"text":"'
+		printf ','
+		if [ -n "$html_file" ]; then
+			printf '"html":"'
+			json_escape_stream <"$html_file"
+			printf '",'
+		fi
+		printf '"text":"'
 		json_escape_stream <"$text_file"
 		printf '"}'
 	} >"$payload"
@@ -590,7 +645,7 @@ main() {
 			# would give one copy two rows.
 			exit 0
 		fi
-		capture_text "$stdin_file" || true
+		capture_text "$stdin_file" "$types" || true
 		;;
 	*)
 		log "unknown mode: $mode"

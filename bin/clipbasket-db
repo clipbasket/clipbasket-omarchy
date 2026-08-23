@@ -23,7 +23,8 @@
 
 set -euo pipefail
 
-SCHEMA_VERSION=1
+# 1 -> 2 added clips.html, the text/html clipboard flavour a web copy carries.
+SCHEMA_VERSION=2
 APP_NAME=Clipbasket
 
 STATE_DIR="${CLIPBASKET_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/clipbasket}"
@@ -32,6 +33,10 @@ IMAGE_DIR="$STATE_DIR/images"
 THUMB_DIR="$STATE_DIR/thumbs"
 SUPPRESS_FILE="$STATE_DIR/suppress"
 SQLITE_BIN="${CLIPBASKET_SQLITE:-sqlite3}"
+WL_COPY_BIN="${CLIPBASKET_WL_COPY:-wl-copy}"
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+HTML2MD="${CLIPBASKET_HTML2MD:-$SCRIPT_DIR/clipbasket-html2md}"
 
 # Mirrors RECENT_DUPLICATE_CAPTURE_WINDOW_MS in the Tauri app: re-copying the
 # same payload inside this window is a no-op rather than a re-order, so a clip
@@ -127,6 +132,7 @@ base_schema() {
 		  kind         TEXT    NOT NULL,
 		  preview      TEXT    NOT NULL DEFAULT '',
 		  text         TEXT,
+		  html         TEXT,
 		  hash         TEXT    NOT NULL UNIQUE,
 		  source_app   TEXT,
 		  created_at   INTEGER NOT NULL,
@@ -190,12 +196,16 @@ fts_schema() {
 }
 
 build_projections() {
-	local text_expr truncated_expr
+	local text_expr truncated_expr has_html_expr
 	text_expr="CASE WHEN c.text IS NULL THEN NULL
 	            WHEN length(c.text) > $LIST_TEXT_CHARS THEN substr(c.text, 1, $LIST_TEXT_CHARS)
 	            ELSE c.text END"
 	truncated_expr="CASE WHEN c.text IS NOT NULL AND length(c.text) > $LIST_TEXT_CHARS
 	                 THEN 'true' ELSE 'false' END"
+	# The HTML flavour itself never appears in a listing — one Wikipedia page
+	# is bigger than a whole page of clips. Callers get a boolean and ask
+	# `get` or `markdown` for the payload when the user actually wants it.
+	has_html_expr="CASE WHEN c.html IS NOT NULL AND c.html <> '' THEN 'true' ELSE 'false' END"
 
 	local template="json_object(
 	  'id',             c.id,
@@ -218,13 +228,56 @@ build_projections() {
 	  'files',          CASE WHEN c.files_json IS NOT NULL AND json_valid(c.files_json)
 	                         THEN json(c.files_json) ELSE json('null') END,
 	  'mime',           c.mime,
-	  'size_bytes',     c.size_bytes
+	  'size_bytes',     c.size_bytes,
+	  'has_html',       json($has_html_expr)%HTML%
 	)"
 
 	CLIP_JSON_LIST=${template/\%TEXT\%/$text_expr}
 	CLIP_JSON_LIST=${CLIP_JSON_LIST/\%TRUNCATED\%/$truncated_expr}
+	CLIP_JSON_LIST=${CLIP_JSON_LIST/\%HTML\%/}
 	CLIP_JSON_FULL=${template/\%TEXT\%/c.text}
 	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%TRUNCATED\%/\'false\'}
+	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%HTML\%/,$'\n'"	  'html',           c.html"}
+}
+
+# Adds a column to an existing table, once. Checking pragma_table_info rather
+# than trusting user_version means a database that was hand-edited, restored
+# from a backup, or half-migrated by an interrupted run still converges.
+add_column() {
+	# $1 table, $2 column, $3 type
+	local present
+	present=$(printf "SELECT count(*) FROM pragma_table_info('%s') WHERE name = '%s';\n" "$1" "$2" |
+		run_raw 2>/dev/null) || present=''
+	[ "${present:-0}" = "0" ] || return 0
+	printf 'ALTER TABLE %s ADD COLUMN %s %s;\n' "$1" "$2" "$3" | run_raw >/dev/null 2>&1 ||
+		die "could not add $1.$2 to $DB_PATH"
+}
+
+# Brings an existing database up to SCHEMA_VERSION. Runs *before* base_schema,
+# because base_schema stamps PRAGMA user_version and would otherwise hide the
+# version this file is actually at. Additive only: no table is dropped or
+# rebuilt, so a history that is already on disk survives an upgrade untouched.
+migrate_schema() {
+	local from table_exists
+	[ -f "$DB_PATH" ] || return 0
+
+	table_exists=$(printf "SELECT count(*) FROM sqlite_master
+	                       WHERE type = 'table' AND name = 'clips';\n" |
+		run_raw 2>/dev/null) || table_exists=''
+	# No clips table yet: base_schema is about to create it at the current
+	# version, with every column already in place.
+	[ "${table_exists:-0}" = "1" ] || return 0
+
+	from=$(printf 'PRAGMA user_version;\n' | run_raw 2>/dev/null) || from=''
+	case "$from" in
+	'' | *[!0-9]*) from=0 ;;
+	esac
+
+	# v1 -> v2: the text/html clipboard flavour. Nullable, so every existing
+	# row is valid as it stands and simply reports has_html:false.
+	if [ "$from" -lt 2 ]; then
+		add_column clips html TEXT
+	fi
 }
 
 drop_fts_triggers() {
@@ -254,6 +307,7 @@ ensure_schema() {
 	mkdir -p "$STATE_DIR" "$IMAGE_DIR" "$THUMB_DIR"
 	chmod 700 "$STATE_DIR" 2>/dev/null || true
 
+	migrate_schema
 	base_schema | run_raw >/dev/null || die "could not open or create $DB_PATH"
 
 	if fts_schema | run_raw >/dev/null 2>&1; then
@@ -264,6 +318,9 @@ ensure_schema() {
 	fi
 
 	printf '%s\n' "$FTS_ENABLED" >"$STATE_DIR/.fts"
+	# The stamp is per-version, so an upgraded binary always takes the slow
+	# path once and runs its migrations. Older stamps are dead weight.
+	rm -f -- "$STATE_DIR"/.schema-v*
 	: >"$stamp"
 }
 
@@ -471,6 +528,7 @@ cmd_insert() {
 			SELECT
 			  kind,
 			  text,
+			  html,
 			  COALESCE(
 			    NULLIF(TRIM(preview_in), ''),
 			    NULLIF(
@@ -501,6 +559,7 @@ cmd_insert() {
 			    CASE WHEN json_extract(j, '\$.kind') IN ('text','url','image','files')
 			         THEN json_extract(j, '\$.kind') ELSE 'text' END       AS kind,
 			    json_extract(j, '\$.text')                                 AS text,
+			    NULLIF(json_extract(j, '\$.html'), '')                     AS html,
 			    COALESCE(json_extract(j, '\$.preview'), '')                AS preview_in,
 			    COALESCE(json_extract(j, '\$.hash'), '')                   AS hash_in,
 			    json_extract(j, '\$.source_app')                           AS source_app,
@@ -528,12 +587,12 @@ cmd_insert() {
 			) AS recent;
 
 			INSERT INTO clips (
-			  kind, preview, text, hash, source_app, created_at,
+			  kind, preview, text, html, hash, source_app, created_at,
 			  image_path, thumb_path, image_width, image_height,
 			  url_domain, url_title, files_json, file_count, mime, size_bytes, searchable
 			)
 			SELECT
-			  p.kind, p.preview, p.text, p.hash, p.source_app, p.created_at,
+			  p.kind, p.preview, p.text, p.html, p.hash, p.source_app, p.created_at,
 			  p.image_path, p.thumb_path, p.image_width, p.image_height,
 			  p.url_domain, p.url_title, p.files_json, p.file_count, p.mime, p.size_bytes,
 			  TRIM(
@@ -551,6 +610,10 @@ cmd_insert() {
 			  kind         = excluded.kind,
 			  preview      = excluded.preview,
 			  text         = excluded.text,
+			  -- Not COALESCEd: the dedupe hash covers the plain text only, so
+			  -- a re-copy of the same text from a source that offers no HTML
+			  -- must clear the stale flavour rather than keep it.
+			  html         = excluded.html,
 			  source_app   = excluded.source_app,
 			  created_at   = excluded.created_at,
 			  image_path   = COALESCE(excluded.image_path, clips.image_path),
@@ -686,43 +749,126 @@ cmd_suppress() {
 # capture watcher's read, so it arms suppression and bumps the clip itself
 # rather than waiting for the echo to come back around.
 cmd_copy() {
-	local row kind hash image_path mime payload
+	local kind='' hash='' image_path='' mime='' payload hash_file path_file mime_file
+	local q_hash q_path q_mime q_payload
 	require_id "${1:-}"
-	command -v wl-copy >/dev/null 2>&1 || die "wl-copy is not installed"
+	command -v "$WL_COPY_BIN" >/dev/null 2>&1 || die "wl-copy is not installed"
 
-	row=$(run_sql "SELECT kind || char(31) || hash || char(31) ||
-	                      COALESCE(image_path, '') || char(31) || COALESCE(mime, '')
-	               FROM clips WHERE id = $1;") || die "copy failed"
-	[ -n "$row" ] || die "no clip with id $1"
+	# Nothing is packed into one row with a separator any more. sqlite3's -list
+	# output caret-escapes control characters -- char(31) comes back as the two
+	# printable bytes "^_" -- so a packed row never splits, `kind` swallowed the
+	# whole line, and every clip fell through to the plain-text branch: clicking
+	# Copy on an image put the string "Image 300x300" on the clipboard, which
+	# the watcher then recorded as a brand new text clip.
+	#
+	# `kind` is safe to read back as text because it is one of four literals.
+	# Everything else goes through writefile(), which writes raw bytes.
+	kind=$(run_sql "SELECT kind FROM clips WHERE id = $1;") || die "copy failed"
+	[ -n "$kind" ] || die "no clip with id $1"
 
-	IFS=$'\037' read -r kind hash image_path mime <<<"$row"
+	hash_file=$(mktempfile)
+	path_file=$(mktempfile)
+	mime_file=$(mktempfile)
+	sql_quote "$hash_file"
+	q_hash="$REPLY_QUOTED"
+	sql_quote "$path_file"
+	q_path="$REPLY_QUOTED"
+	sql_quote "$mime_file"
+	q_mime="$REPLY_QUOTED"
+
+	run_sql "SELECT writefile($q_hash, COALESCE(hash, '')),
+	                writefile($q_path, COALESCE(image_path, '')),
+	                writefile($q_mime, COALESCE(mime, ''))
+	         FROM clips WHERE id = $1;" >/dev/null || die "copy failed"
+	IFS= read -r hash <"$hash_file" || true
+	IFS= read -r image_path <"$path_file" || true
+	IFS= read -r mime <"$mime_file" || true
 
 	mkdir -p "$STATE_DIR"
 	printf '%s\n' "$hash" >"$SUPPRESS_FILE"
 
+	payload=$(mktempfile)
+	sql_quote "$payload"
+	q_payload="$REPLY_QUOTED"
+
 	case "$kind" in
 	image)
 		[ -n "$image_path" ] && [ -f "$image_path" ] || die "clip $1 has no image on disk"
-		wl-copy --type "${mime:-image/png}" <"$image_path" || die "wl-copy failed"
+		"$WL_COPY_BIN" --type "${mime:-image/png}" <"$image_path" || die "wl-copy failed"
 		;;
 	files)
-		payload=$(mktempfile)
-		run_sql "SELECT group_concat('file://' || json_extract(value, '\$.path'), char(10))
-		         FROM clips, json_each(clips.files_json) WHERE clips.id = $1;" \
-			>"$payload" || die "copy failed"
-		wl-copy --type text/uri-list <"$payload" || die "wl-copy failed"
+		run_sql "SELECT writefile($q_payload, COALESCE((
+		           SELECT group_concat('file://' || json_extract(value, '\$.path'), char(10))
+		           FROM clips, json_each(clips.files_json) WHERE clips.id = $1), ''));" \
+			>/dev/null || die "copy failed"
+		[ -s "$payload" ] || die "clip $1 has no file paths"
+		"$WL_COPY_BIN" --type text/uri-list <"$payload" || die "wl-copy failed"
 		;;
 	*)
-		payload=$(mktempfile)
-		sql_quote "$payload"
-		run_sql "SELECT writefile($REPLY_QUOTED, COALESCE(text, preview)) FROM clips WHERE id = $1;" \
+		run_sql "SELECT writefile($q_payload, COALESCE(text, preview)) FROM clips WHERE id = $1;" \
 			>/dev/null || die "copy failed"
-		wl-copy --type 'text/plain;charset=utf-8' <"$payload" || die "wl-copy failed"
+		"$WL_COPY_BIN" --type 'text/plain;charset=utf-8' <"$payload" || die "wl-copy failed"
 		;;
 	esac
 
 	run_sql "UPDATE clips SET created_at = unixepoch() WHERE id = $1;" >/dev/null || true
 	printf '{"ok":true}\n'
+}
+
+# Renders a clip's HTML flavour as GitHub-Flavored Markdown -- the Linux half of
+# what ClipDetailSheet does with turndown in the Tauri app. The conversion is
+# done by bin/clipbasket-html2md, and the result comes back through the database
+# so json_object() does the escaping rather than a hand-rolled encoder.
+cmd_markdown() {
+	local id base='' has html_file md_file out q_html q_md
+	require_id "${1:-}"
+	id="$1"
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--base-url)
+			base="${2:-}"
+			shift 2
+			;;
+		*) die "markdown: unknown option $1" ;;
+		esac
+	done
+	[ -x "$HTML2MD" ] || die "clipbasket-html2md is not executable at $HTML2MD"
+
+	has=$(run_sql "SELECT CASE WHEN html IS NOT NULL AND html <> '' THEN 1 ELSE 0 END
+	               FROM clips WHERE id = $id;") || die "markdown failed"
+	[ -n "$has" ] || die "no clip with id $id"
+	[ "$has" = "1" ] || die "clip $id has no HTML flavour to convert"
+
+	html_file=$(mktempfile)
+	sql_quote "$html_file"
+	q_html="$REPLY_QUOTED"
+	run_sql "SELECT writefile($q_html, html) FROM clips WHERE id = $id;" >/dev/null ||
+		die "markdown failed"
+
+	# A link clip's own URL is the right base for the relative hrefs the page's
+	# HTML is full of. Guarded in SQL so a multi-line or non-URL text can never
+	# reach the converter's --base-url.
+	if [ -z "$base" ]; then
+		base=$(run_sql "SELECT COALESCE(CASE WHEN kind = 'url' AND instr(text, '://') > 0
+		                                     AND instr(text, char(10)) = 0
+		                                THEN text END, '')
+		                FROM clips WHERE id = $id;") || base=''
+	fi
+
+	md_file=$(mktempfile)
+	if [ -n "$base" ]; then
+		"$HTML2MD" --base-url "$base" <"$html_file" >"$md_file" || die "markdown conversion failed"
+	else
+		"$HTML2MD" <"$html_file" >"$md_file" || die "markdown conversion failed"
+	fi
+
+	sql_quote "$md_file"
+	q_md="$REPLY_QUOTED"
+	out=$(run_sql "SELECT json_object('markdown', COALESCE(CAST(readfile($q_md) AS TEXT), ''));") ||
+		die "markdown failed"
+	[ -n "$out" ] || die "markdown failed"
+	printf '%s\n' "$out"
 }
 
 cmd_info() {
@@ -778,10 +924,104 @@ cmd_selftest() {
 		esac
 	}
 
+	# The v1 schema, verbatim, so the migration is exercised against what is
+	# actually on a user's disk rather than against base_schema minus a column.
+	legacy_v1_schema() {
+		cat <<-'SQL'
+			CREATE TABLE IF NOT EXISTS clips (
+			  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			  kind         TEXT    NOT NULL,
+			  preview      TEXT    NOT NULL DEFAULT '',
+			  text         TEXT,
+			  hash         TEXT    NOT NULL UNIQUE,
+			  source_app   TEXT,
+			  created_at   INTEGER NOT NULL,
+			  pinned       INTEGER NOT NULL DEFAULT 0,
+			  saved        INTEGER NOT NULL DEFAULT 0,
+			  image_path   TEXT,
+			  thumb_path   TEXT,
+			  image_width  INTEGER,
+			  image_height INTEGER,
+			  url_domain   TEXT,
+			  url_title    TEXT,
+			  file_count   INTEGER NOT NULL DEFAULT 0,
+			  files_json   TEXT,
+			  mime         TEXT,
+			  size_bytes   INTEGER,
+			  searchable   TEXT    NOT NULL DEFAULT ''
+			);
+			PRAGMA user_version=1;
+		SQL
+	}
+
+	column_count() {
+		# $1 column name
+		printf "SELECT count(*) FROM pragma_table_info('clips') WHERE name = '%s';\n" "$1" | run_raw
+	}
+
+	# Upgrading a database that already holds the user's history is the one
+	# migration step that cannot be re-run, so it gets its own sandbox rather
+	# than borrowing the main selftest database.
+	selftest_migration() {
+		local legacy="$SELFTEST_ROOT/legacy" out
+		local keep_state="$STATE_DIR" keep_db="$DB_PATH" keep_img="$IMAGE_DIR"
+		local keep_thumb="$THUMB_DIR" keep_fts="$FTS_ENABLED"
+
+		mkdir -p "$legacy"
+		STATE_DIR="$legacy"
+		DB_PATH="$legacy/clips.db"
+		IMAGE_DIR="$legacy/images"
+		THUMB_DIR="$legacy/thumbs"
+
+		legacy_v1_schema | run_raw >/dev/null
+		run_raw >/dev/null <<-'SQL'
+			INSERT INTO clips (kind, preview, text, hash, created_at, saved, searchable)
+			VALUES ('text', 'old clip', 'old clip body', 'h-legacy', 1700000000, 1, 'old clip body'),
+			       ('url',  'example.com', 'https://example.com/', 'h-legacy-url', 1700000001, 0, 'example.com');
+		SQL
+		check 'a v1 database has no html column' '0' "$(column_count html)"
+		check 'a v1 database reports user_version 1' '1' \
+			"$(printf 'PRAGMA user_version;\n' | run_raw)"
+
+		ensure_schema
+
+		check 'migration adds html to the existing table' '1' "$(column_count html)"
+		check 'migration stamps the new schema version' "$SCHEMA_VERSION" \
+			"$(printf 'PRAGMA user_version;\n' | run_raw)"
+		check 'migration keeps every existing row' '2' "$(run_sql 'SELECT count(*) FROM clips;')"
+		check 'migration keeps the row contents byte for byte' 'old clip body' \
+			"$(run_sql "SELECT text FROM clips WHERE hash = 'h-legacy';")"
+		check 'migration keeps the saved flag' '1' \
+			"$(run_sql "SELECT saved FROM clips WHERE hash = 'h-legacy';")"
+		check 'migration keeps the id sequence' '2' \
+			"$(run_sql "SELECT id FROM clips WHERE hash = 'h-legacy-url';")"
+		out=$(cmd_list --limit 10)
+		check_contains 'a migrated row reports has_html false' '"has_html":false' "$out"
+
+		# Re-running the migration must be a no-op, not a duplicate-column error.
+		rm -f -- "$STATE_DIR"/.schema-v*
+		ensure_schema
+		check 'migrating an already-migrated database is a no-op' '1' "$(column_count html)"
+
+		printf '{"kind":"text","text":"after","hash":"h-legacy-new","html":"<p>after</p>"}\n' |
+			cmd_insert >/dev/null
+		out=$(cmd_list --limit 10 --query after)
+		check_contains 'a migrated database accepts html on new clips' '"has_html":true' "$out"
+
+		STATE_DIR="$keep_state"
+		DB_PATH="$keep_db"
+		IMAGE_DIR="$keep_img"
+		THUMB_DIR="$keep_thumb"
+		FTS_ENABLED="$keep_fts"
+	}
+
 	printf 'clipbasket-db selftest\n'
 	printf '  sqlite3: %s\n' "$("$SQLITE_BIN" --version 2>/dev/null | cut -d' ' -f1)"
 	printf '  fts5:    %s\n' "$([ "$FTS_ENABLED" = 1 ] && printf yes || printf 'no (LIKE fallback)')"
+	printf '  html2md: %s\n' "$([ -x "$HTML2MD" ] && printf '%s' "$HTML2MD" || printf 'missing!')"
 	printf '  db:      %s\n\n' "$DB_PATH"
+
+	selftest_migration
 
 	local nasty="line one
 line 'two' with \"quotes\" and a backslash \\ and 100% of _underscores_
@@ -949,7 +1189,7 @@ tab	here"
 	check 'suppress writes a token' '{"ok":true}' "$out"
 	check 'suppress token is readable by the watcher' 'deadbeef' "$(cat "$SUPPRESS_FILE")"
 	out=$(cmd_info)
-	check_contains 'info reports the schema version' '"schema_version":1' "$out"
+	check_contains 'info reports the schema version' '"schema_version":2' "$out"
 
 	# --- error handling ---------------------------------------------------
 	out=$(cmd_get abc 2>/dev/null) || true
@@ -960,6 +1200,114 @@ tab	here"
 	check_contains 'an unknown filter is a JSON error' '"error"' "$out"
 	out=$(cmd_flag pinned 1 --maybe 2>/dev/null) || true
 	check_contains 'pin without --on/--off is a JSON error' '"error"' "$out"
+
+	# --- the html flavour and the markdown pipeline -----------------------
+	local html_payload id_html
+	html_payload=$(mktempfile)
+	cat >"$html_payload" <<-'JSON'
+		{"kind":"text","preview":"Heading","hash":"h-html",
+		 "text":"Heading\none\nlink",
+		 "html":"<h1>Heading</h1><ul><li>one</li></ul><table><thead><tr><th>K</th></tr></thead><tbody><tr><td>v</td></tr></tbody></table><p><a href=\"/rel\">link</a></p>"}
+	JSON
+	cmd_insert <"$html_payload" >/dev/null
+	id_html=$(run_sql "SELECT id FROM clips WHERE hash = 'h-html';")
+
+	out=$(cmd_list --limit 10 --filter text)
+	check_contains 'list flags a clip that carries html' '"has_html":true' "$out"
+	check 'list never ships the html itself' '0' \
+		"$(printf '%s' "$out" | grep -o '"html":' | wc -l | tr -d ' ')"
+	out=$(cmd_list --limit 10 --query 'touch me')
+	check_contains 'a clip without html reports has_html false' '"has_html":false' "$out"
+
+	out=$(cmd_get "$id_html")
+	check_contains 'get reports has_html' '"has_html":true' "$out"
+	check_contains 'get returns the html flavour verbatim' '<h1>Heading</h1>' "$out"
+	check_contains 'the plain text is still the clip text' '"text":"Heading' "$out"
+
+	out=$(cmd_markdown "$id_html")
+	check_contains 'markdown returns a single markdown field' '{"markdown":"' "$out"
+	check_contains 'markdown converts headings' '# Heading' "$out"
+	check_contains 'markdown converts lists' '- one' "$out"
+	# Loose on cell padding: pandoc pads its columns and the built-in converter
+	# does not, and this command has to pass with either one behind it.
+	check_contains 'markdown converts tables' '| K' "$out"
+	check_contains 'markdown converts links' '[link](/rel)' "$out"
+
+	# A link clip's own URL becomes the base for the page's relative hrefs.
+	printf '{"kind":"url","text":"https://example.com/docs/page","hash":"h-html-url","url_domain":"example.com","html":"<p><a href=\\"../img/a.png\\">rel</a></p>"}\n' |
+		cmd_insert >/dev/null
+	out=$(cmd_markdown "$(run_sql "SELECT id FROM clips WHERE hash = 'h-html-url';")")
+	check_contains 'markdown resolves relative links against a url clip' \
+		'(https://example.com/img/a.png)' "$out"
+
+	out=$(cmd_markdown "$id1" 2>/dev/null) || true
+	check_contains 'markdown on a clip without html is a JSON error' '"ok":false' "$out"
+	check_contains 'markdown error names the clip' 'no HTML flavour' "$out"
+	out=$(cmd_markdown 999999 2>/dev/null) || true
+	check_contains 'markdown on a missing clip is a JSON error' '"error"' "$out"
+	out=$(cmd_markdown abc 2>/dev/null) || true
+	check_contains 'markdown with a bad id is a JSON error' '"error"' "$out"
+
+	# Re-copying the same text from a source that offers no HTML clears it.
+	run_sql "UPDATE clips SET created_at = created_at - 100000;" >/dev/null
+	printf '{"kind":"text","text":"Heading\\none\\nlink","preview":"Heading","hash":"h-html"}\n' |
+		cmd_insert >/dev/null
+	check 'a plain re-copy clears a stale html flavour' '0' \
+		"$(run_sql "SELECT CASE WHEN html IS NULL THEN 0 ELSE 1 END FROM clips WHERE hash = 'h-html';")"
+
+	# --- copy dispatches on kind ------------------------------------------
+	# wl-copy needs a Wayland session, so the selftest injects a stub and reads
+	# back exactly what the real binary would have been handed. This is the
+	# assertion that was missing while `copy` silently put an image clip's
+	# preview string on the clipboard as text.
+	local stub="$SELFTEST_ROOT/wl-copy-stub" args_file="$SELFTEST_ROOT/wl-copy.args"
+	local stdin_file="$SELFTEST_ROOT/wl-copy.stdin" keep_copy="$WL_COPY_BIN"
+	cat >"$stub" <<-STUB
+		#!/bin/sh
+		printf '%s\n' "\$*" >"$args_file"
+		cat >"$stdin_file"
+	STUB
+	chmod +x "$stub"
+	WL_COPY_BIN="$stub"
+
+	local id_copy
+	printf '{"kind":"text","text":"plain payload","hash":"h-copy-text"}\n' | cmd_insert >/dev/null
+	id_copy=$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-text';")
+	out=$(cmd_copy "$id_copy")
+	check 'copy a text clip' '{"ok":true}' "$out"
+	check 'copy text uses the text/plain flavour' '--type text/plain;charset=utf-8' "$(cat "$args_file")"
+	check 'copy text sends the text, not the preview' 'plain payload' "$(cat "$stdin_file")"
+	check 'copy arms self-capture suppression' 'h-copy-text' "$(cat "$SUPPRESS_FILE")"
+
+	printf '{"kind":"url","text":"https://example.com/a","hash":"h-copy-url","url_domain":"example.com"}\n' |
+		cmd_insert >/dev/null
+	cmd_copy "$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-url';")" >/dev/null
+	check 'copy a url clip uses the text/plain flavour' '--type text/plain;charset=utf-8' \
+		"$(cat "$args_file")"
+	check 'copy url sends the url' 'https://example.com/a' "$(cat "$stdin_file")"
+
+	printf 'PNGBYTES' >"$IMAGE_DIR/h-copy-img.png"
+	printf '{"kind":"image","preview":"Image 300x300","hash":"h-copy-img","image_path":"%s/h-copy-img.png","mime":"image/png","image_width":300,"image_height":300}\n' \
+		"$IMAGE_DIR" | cmd_insert >/dev/null
+	out=$(cmd_copy "$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-img';")")
+	check 'copy an image clip' '{"ok":true}' "$out"
+	check 'copy image uses the image mime type' '--type image/png' "$(cat "$args_file")"
+	check 'copy image sends the file bytes, not the preview' 'PNGBYTES' "$(cat "$stdin_file")"
+
+	printf '{"kind":"files","preview":"a.txt, b.txt","hash":"h-copy-files","files":[{"path":"/tmp/a.txt","name":"a.txt"},{"path":"/tmp/b.txt","name":"b.txt"}]}\n' |
+		cmd_insert >/dev/null
+	out=$(cmd_copy "$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-files';")")
+	check 'copy a file list clip' '{"ok":true}' "$out"
+	check 'copy files uses the uri-list flavour' '--type text/uri-list' "$(cat "$args_file")"
+	check 'copy files sends real file:// URIs' 'file:///tmp/a.txt
+file:///tmp/b.txt' "$(cat "$stdin_file")"
+
+	out=$(cmd_copy 999999 2>/dev/null) || true
+	check_contains 'copy on a missing id is a JSON error' '"error"' "$out"
+
+	run_sql "DELETE FROM clips WHERE hash LIKE 'h-copy-%' OR hash LIKE 'h-html%';" >/dev/null
+	rm -f -- "$IMAGE_DIR/h-copy-img.png"
+	WL_COPY_BIN="$keep_copy"
 
 	# --- performance ------------------------------------------------------
 	printf '\nPopulating 10000 clips to check latency...\n'
@@ -1010,6 +1358,8 @@ usage() {
 		  clear  [--all]
 		  count  [--filter F] [--query STR]
 		  prune  --max N
+		  markdown <id> [--base-url URL]
+		                             (HTML flavour -> GitHub-Flavored Markdown)
 		  copy   <id>                (extension: re-copy via wl-copy)
 		  touch  <id>                (extension: bump to top)
 		  suppress <hash>            (extension: arm self-capture suppression)
@@ -1043,6 +1393,7 @@ main() {
 	clear) cmd_clear "$@" ;;
 	count) cmd_count "$@" ;;
 	prune) cmd_prune "$@" ;;
+	markdown) cmd_markdown "$@" ;;
 	copy) cmd_copy "$@" ;;
 	touch) cmd_touch "$@" ;;
 	suppress) cmd_suppress "$@" ;;

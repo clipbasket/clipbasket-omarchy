@@ -1,0 +1,316 @@
+# Data
+
+Everything Clipbasket stores lives in one SQLite database and two asset
+directories, and `bin/clipbasket-db` is the only thing that touches them. The
+QML panel, the capture watchers and the CLI all go through its subcommands, so
+this file is the contract between them.
+
+```
+$XDG_STATE_HOME/clipbasket/          (default ~/.local/state/clipbasket)
+├── clips.db          the history
+├── images/           full-size clipboard images, content-addressed
+├── thumbs/           their thumbnails
+├── suppress          one-shot self-capture token
+├── .fts              1 if this sqlite3 has FTS5, 0 if search falls back to LIKE
+└── .schema-vN        fast-path stamp: the schema is known to be at version N
+```
+
+Override the directory with `CLIPBASKET_STATE_DIR`, or the database file alone
+with `CLIPBASKET_DB`.
+
+---
+
+## The `clips` table
+
+| column | type | notes |
+| --- | --- | --- |
+| `id` | INTEGER PK | autoincrement; stable for the life of the row |
+| `kind` | TEXT | `text`, `url`, `image` or `files` |
+| `preview` | TEXT | one line, at most 180 characters, derived on insert |
+| `text` | TEXT | the plain-text payload — what a normal paste produces |
+| `html` | TEXT | the `text/html` clipboard flavour, when the source offered one |
+| `hash` | TEXT UNIQUE | the dedupe key |
+| `source_app` | TEXT | focused window's class at the moment of the copy |
+| `created_at` | INTEGER | unix seconds; also the sort key |
+| `pinned` | INTEGER | 0/1 — floats to the top, exempt from pruning |
+| `saved` | INTEGER | 0/1 — exempt from pruning and from `clear` |
+| `image_path` | TEXT | absolute path under `images/` |
+| `thumb_path` | TEXT | absolute path under `thumbs/`, or the original |
+| `image_width` / `image_height` | INTEGER | pixels, when they could be read |
+| `url_domain` | TEXT | pretty domain for a `url` clip |
+| `url_title` | TEXT | reserved; nothing writes it yet |
+| `file_count` | INTEGER | number of entries in `files_json` |
+| `files_json` | TEXT | JSON array of `{path, name, extension, is_directory}` |
+| `mime` | TEXT | the offer's MIME type, for images and file lists |
+| `size_bytes` | INTEGER | payload size for images |
+| `searchable` | TEXT | the concatenation search runs over |
+
+Search uses an FTS5 external-content table (`clips_fts`) kept in sync by three
+triggers. FTS5 is not compiled into every sqlite3 build, so it is created
+opportunistically; when it is missing, search degrades to `LIKE` over
+`searchable` and `clipbasket-db info` reports `"fts5": false`.
+
+### Schema versions
+
+`SCHEMA_VERSION` in `bin/clipbasket-db` is the current version, and it is
+written to `PRAGMA user_version` on the database file. `clipbasket-db info`
+reports it.
+
+| version | change |
+| --- | --- |
+| 1 | initial schema |
+| 2 | added `clips.html` |
+
+Migrations are **additive and in place**. A user's history is already on disk,
+so no step may drop or rebuild the `clips` table. The sequence on every run is:
+
+1. **Fast path.** If `clips.db` and `$STATE_DIR/.schema-vN` both exist, the
+   schema is known to be current and nothing is checked. This costs no forks,
+   which matters because `list` is on the panel's keystroke path.
+2. Otherwise `migrate_schema` reads `PRAGMA user_version` from the *existing*
+   file — before anything stamps a new one — and applies each step below that
+   version. It does nothing at all if the file is new or has no `clips` table,
+   because `base_schema` is about to create it complete.
+3. Each step goes through `add_column`, which checks `pragma_table_info` rather
+   than trusting `user_version`. A database that was restored from a backup,
+   hand-edited, or half-migrated by an interrupted run converges anyway, and
+   re-running a migration is a no-op rather than a duplicate-column error.
+4. `base_schema` runs (`CREATE TABLE IF NOT EXISTS`, indexes, and
+   `PRAGMA user_version=N`), then the FTS table and triggers are recreated and
+   the index rebuilt.
+5. Old `.schema-v*` stamps are removed and the new one is written.
+
+An upgraded binary therefore takes the slow path exactly once. Older binaries
+keep working against a newer database: an unknown column is simply not selected.
+
+`clipbasket-db selftest` builds a real v1 database with rows, pinned and saved
+flags, and an id sequence, migrates it, and asserts all of them survive.
+
+---
+
+## JSON contract
+
+Every subcommand prints exactly one JSON document on stdout and never prompts.
+Diagnostics go to stderr. Errors are `{"ok":false,"error":"…"}` with a non-zero
+exit status.
+
+### `list --limit N [--offset N] [--filter F] [--query STR]`
+
+A JSON array of clip objects:
+
+```json
+{
+  "id": 12, "kind": "text", "preview": "…", "text": "…",
+  "text_truncated": false, "hash": "…", "source_app": "firefox",
+  "created_at": 1787433886, "pinned": false, "saved": false,
+  "image_path": null, "thumb_path": null,
+  "image_width": null, "image_height": null,
+  "url_domain": null, "url_title": null,
+  "file_count": 0, "files": null,
+  "mime": null, "size_bytes": null,
+  "has_html": true
+}
+```
+
+`text` is truncated to 2000 characters in a listing and `text_truncated` says
+whether it was. **`list` never returns `html`** — one copied web page is larger
+than a whole page of clips, and every listing would carry it. It returns
+`has_html` instead, so the panel can decide whether to offer "Copy as Markdown"
+without paying for the payload.
+
+### `get <id>`
+
+The same object with the full `text`, `text_truncated` always `false`, and one
+extra field:
+
+```json
+{ "…": "…", "has_html": true, "html": "<h1>Wikipedia</h1>…" }
+```
+
+`null` for an id that does not exist.
+
+### `markdown <id> [--base-url URL]`
+
+```json
+{ "markdown": "# Wikipedia\n\nLa **enciclopedia** [libre](/wiki/Libre)\n" }
+```
+
+Errors, in the CLI's usual shape:
+
+| condition | output |
+| --- | --- |
+| clip has no HTML | `{"ok":false,"error":"clip 12 has no HTML flavour to convert"}` |
+| no such clip | `{"ok":false,"error":"no clip with id 12"}` |
+| id is not numeric | `{"ok":false,"error":"expected a numeric clip id, got: abc"}` |
+| converter missing | `{"ok":false,"error":"clipbasket-html2md is not executable at …"}` |
+
+Callers should gate on `has_html` rather than calling `markdown` speculatively.
+
+When `--base-url` is not given and the clip is a `url` clip whose text is a
+single-line URL, that URL becomes the base, so the relative `href`s a real page
+is full of come out absolute. The Markdown comes back through the database
+(`json_object` over `readfile`) rather than through a hand-rolled encoder, so
+quotes, newlines and control characters are escaped by SQLite.
+
+### `insert` (JSON clip on stdin)
+
+`{"id":12,"deduped":false}`. `deduped` is true when the same hash was recorded
+less than `CLIPBASKET_DEDUPE_WINDOW` seconds ago, in which case nothing was
+written. Recognised input fields: `kind`, `text`, `html`, `preview`, `hash`,
+`source_app`, `created_at`, `image_path`, `thumb_path`, `image_width`,
+`image_height`, `url_domain`, `url_title`, `files`, `file_count`, `mime`,
+`size_bytes`. Everything else is ignored, and an unknown `kind` becomes `text`.
+
+On a hash conflict outside the dedupe window the row is updated. `html` is
+overwritten, not coalesced: the dedupe hash covers the plain text only, so a
+re-copy of the same words from a source that offers no markup must clear the
+stale flavour rather than keep it attached to different provenance.
+
+### Others
+
+`pin`/`save` → `{"ok":true}` · `delete` → `{"ok":true}` ·
+`clear` → `{"ok":true,"deleted":N}` · `count` → `{"total":N,"filtered":N}` ·
+`prune --max N` → `{"deleted":N}` · `copy`/`touch`/`suppress` → `{"ok":true}` ·
+`info` → app name, paths, `schema_version`, `fts5`, clip count, sqlite version.
+
+---
+
+## The HTML flavour
+
+A Wayland clipboard offer is a list of MIME types, and a copy out of a browser
+advertises several renderings of the same selection: `text/html`,
+`text/plain;charset=utf-8`, `TEXT`, and so on. Before this, `clipbasket-capture`
+read only the plain text, so copying a Wikipedia page stored the flattened
+`WikipediaLa enciclopedia libre Buscar e…` and there was nothing left to
+convert.
+
+`clipbasket-capture` now also reads `text/html` when the offer advertises it and
+stores it in `clips.html`. Three rules, matching `captured_text_like_clip()` in
+the macOS/Windows app, where `html_content` rides alongside `text_content`:
+
+* **HTML is a flavour, not a kind.** A clip that carries HTML is still `text`
+  (or `url`). The classification priority is unchanged — files beat image beats
+  text — and a copy that carries an image is still recorded by the image
+  watcher, HTML or not.
+* **The plain text stays the clip's `text`.** An ordinary paste must produce
+  exactly what it produced before. Only an explicit "Copy as Markdown" reaches
+  for `html`.
+* **The dedupe hash covers the plain text only.** Two copies of the same words
+  are one clip whether or not the second carried markup.
+
+The HTML is normalised like the plain text (CRLF stripped, invalid UTF-8
+dropped) and capped at `CLIPBASKET_MAX_HTML_BYTES` (8 MiB, the Tauri app's
+`CLIPBOARD_HTML_MAX_BYTES`). Over the cap the HTML is dropped and the clip is
+still recorded with its plain text.
+
+---
+
+## HTML → Markdown
+
+`bin/clipbasket-html2md` reads HTML on stdin and writes GitHub-Flavored
+Markdown on stdout. It is **Python 3, standard library only** — no pip install,
+no new pacman dependency, because the product promise is "git clone and run"
+and Omarchy already ships python3.
+
+```
+wl-paste --type text/html | clipbasket-html2md --base-url https://example.com/
+clipbasket-html2md --selftest        # every supported element, ~55 cases
+clipbasket-html2md --builtin         # ignore pandoc even when it is installed
+```
+
+If `pandoc` is on `PATH` it is used (`pandoc -f html -t gfm --wrap=none`), since
+it is strictly better than anything that fits in one file. It is never required,
+and it is never installed on the user's behalf; the built-in converter is what
+the tests pin down, and it is what runs on a stock Omarchy box. Set
+`CLIPBASKET_HTML2MD_PANDOC=0` to force the built-in path.
+
+The output rules mirror the turndown + turndown-plugin-gfm configuration the
+macOS/Windows app runs in its webview (`src/markdown/htmlToMarkdown.ts`): ATX
+headings, `-` bullets, fenced code blocks, `*` for emphasis.
+
+### Handled
+
+| | |
+| --- | --- |
+| headings | `<h1>`–`<h6>` → `#`–`######` |
+| emphasis | `<strong>`/`<b>` → `**`, `<em>`/`<i>`/`<cite>`/`<var>` → `*`, `<del>`/`<s>`/`<strike>` → `~~` |
+| code | `<code>`/`<kbd>`/`<samp>` inline, with the backtick fence widened when the content contains backticks |
+| code blocks | `<pre>` fenced, language taken from a `language-`/`lang-`/`highlight-source-` class |
+| links | `[text](href "title")`; `javascript:` targets dropped; an `<a>` with no `href` keeps its text |
+| images | `![alt](src "title")`, including an image inside a link |
+| lists | `<ul>`, `<ol start=N>`, arbitrarily nested, multi-paragraph items |
+| task lists | `<li><input type=checkbox>` → `- [ ]` / `- [x]` |
+| tables | GFM, with `align`/`text-align` alignment, `|` escaped in cells, `<caption>` lifted to a paragraph above, and an empty header row synthesised for a headerless table |
+| quotes | `<blockquote>`, nested |
+| rules | `<hr>` → `---` |
+| breaks | `<br>` → two trailing spaces |
+| entities | decoded (`&amp;`, `&nbsp;`, `&#233;`, …) |
+| relative URLs | resolved against `--base-url`, or a `<base href>` in the document |
+
+`<script>`, `<style>`, `<head>`, `<title>`, `<noscript>`, `<template>`, `<svg>`,
+`<iframe>` and friends are dropped subtree and all. Markdown metacharacters in
+text are backslash-escaped, following turndown's list, and a paragraph that
+would otherwise start like a heading, a quote or a list item is escaped too.
+
+Whitespace is where real pages go wrong, so: text nodes are collapsed to single
+spaces, an element that renders as nothing produces no block at all, runs of
+blank lines collapse to one, and trailing whitespace is stripped — except inside
+code blocks and inline code, which are protected byte for byte, and except the
+two spaces of a hard break.
+
+`html.parser` is a tokenizer rather than a tree builder, so the parser adds the
+implicit end tags a browser would have inserted: `<li>` closes an open `<li>`
+but not one across a nested `<ul>` boundary, `<td>`/`<tr>` close their siblings,
+and a block-level start tag closes an open `<p>`. Unclosed and stray tags never
+lose content.
+
+### Not handled
+
+* **`rowspan`.** `colspan` pads the row with empty cells so columns line up;
+  `rowspan` is ignored and the row will be short. Wikipedia infoboxes are built
+  out of both and come out as lopsided tables.
+* **Nested tables.** An inner table is flattened to one line of text inside its
+  cell.
+* **Definition lists.** `<dt>` becomes a paragraph and `<dd>` an indented one;
+  GFM has no definition list syntax.
+* **CSS.** `display:none`, `visibility:hidden` and `hidden` are not honoured, so
+  markup a page hides is still converted. Only `text-align` is read, and only
+  for table cells.
+* **Character-set declarations.** Input is decoded as UTF-8 (with a BOM sniff
+  for UTF-8/UTF-16); a `<meta charset>` naming something else is ignored. Every
+  Wayland `text/html` offer in practice is UTF-8, and `clipbasket-capture` has
+  already forced the stored HTML to valid UTF-8.
+
+---
+
+## Testing
+
+```
+bin/clipbasket-db selftest        # 103 cases, incl. migration, has_html, markdown, copy
+bin/clipbasket-html2md --selftest # ~55 cases, one per supported element
+```
+
+`clipbasket-db selftest` runs entirely in a temp directory and never touches the
+real history. It needs no Wayland session: `copy` is exercised through a stub
+injected with `CLIPBASKET_WL_COPY`, and the test asserts on the arguments and
+the stdin bytes the real `wl-copy` would have received — that a `files` clip
+sends `file://` URIs on `--type text/uri-list`, and that an `image` clip sends
+the image's **file bytes** on `--type image/png` rather than its preview string.
+
+### Environment overrides
+
+| variable | default |
+| --- | --- |
+| `CLIPBASKET_STATE_DIR` | `$XDG_STATE_HOME/clipbasket` |
+| `CLIPBASKET_DB` | `$STATE_DIR/clips.db` |
+| `CLIPBASKET_SQLITE` | `sqlite3` |
+| `CLIPBASKET_WL_COPY` | `wl-copy` |
+| `CLIPBASKET_HTML2MD` | `bin/clipbasket-html2md` next to `clipbasket-db` |
+| `CLIPBASKET_HTML2MD_PANDOC` | unset; `0` forces the built-in converter |
+| `CLIPBASKET_DEDUPE_WINDOW` | 300 (seconds) |
+| `CLIPBASKET_LIST_TEXT_CHARS` | 2000 |
+| `CLIPBASKET_MAX_TEXT_BYTES` | 8388608 |
+| `CLIPBASKET_MAX_HTML_BYTES` | 8388608 |
+| `CLIPBASKET_MAX_IMAGE_BYTES` | 67108864 |
+| `CLIPBASKET_MAX_FILE_ITEMS` | 1024 |
+| `CLIPBASKET_MAX_CLIPS` | 1000 |

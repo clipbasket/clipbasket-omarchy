@@ -1,0 +1,1174 @@
+#!/usr/bin/env python3
+"""clipbasket-html2md — turn the clipboard's text/html flavour into GFM Markdown.
+
+Reads HTML on stdin, writes GitHub-Flavored Markdown on stdout.
+
+    wl-paste --type text/html | clipbasket-html2md --base-url https://example.com/
+
+This is the Linux stand-in for the turndown + turndown-plugin-gfm pipeline the
+macOS/Windows app runs in the webview (see src/markdown/htmlToMarkdown.ts in the
+Tauri repo). The rules are deliberately the same ones: ATX headings, `-` bullets,
+fenced code, `*` emphasis, GFM tables, strikethrough and task list items.
+
+Constraints that shape the implementation:
+
+  * Python 3 standard library only. The product promise is "git clone and run",
+    so a pip install or a new pacman dependency is not available -- but Omarchy
+    ships python3, and html.parser is in it.
+  * pandoc is strictly better at this than anything that fits in one file, so it
+    is used when it happens to be installed. It is never required, and the
+    built-in converter is what the tests pin down.
+  * Real pages are mostly whitespace. Anything that renders as nothing (script,
+    style, head, empty wrappers) has to disappear rather than leave blank lines
+    behind, or the paste is unreadable.
+
+Exit status is 0 whenever some Markdown could be produced (including the empty
+string for empty input); 2 for a usage error.
+"""
+
+import html
+import os
+import re
+import shutil
+import subprocess
+import sys
+from html.parser import HTMLParser
+from urllib.parse import urljoin
+
+# --- the shape of HTML -----------------------------------------------------
+
+VOID_TAGS = frozenset(
+    """area base br col embed hr img input link meta param source track wbr""".split()
+)
+
+# Content that renders as nothing at all. Dropped subtree and all, so a page's
+# inline <script> never reaches the output as a wall of JavaScript.
+SKIPPED_TAGS = frozenset(
+    """script style head title meta link base noscript template svg math
+       object applet iframe frameset""".split()
+)
+
+# Everything that starts a new line in the output. Anything not listed here is
+# treated as inline, which is the right default for the long tail of custom
+# elements a real page carries.
+BLOCK_TAGS = frozenset(
+    """address article aside blockquote body caption center dd details dialog
+       div dl dt fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header
+       hgroup hr html li main menu nav ol p pre section summary table tbody td
+       tfoot th thead tr ul""".split()
+)
+
+HEADING_TAGS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
+
+# Emphasis that maps onto a Markdown delimiter pair.
+EMPHASIS = {
+    "strong": "**",
+    "b": "**",
+    "em": "*",
+    "i": "*",
+    "cite": "*",
+    "dfn": "*",
+    "var": "*",
+    "s": "~~",
+    "del": "~~",
+    "strike": "~~",
+}
+
+# Inline elements whose own markup is dropped but whose text is kept.
+TRANSPARENT_INLINE = frozenset(
+    """span font a-ignored small big u ins mark abbr acronym time data output
+       bdi bdo ruby rt rp label legend sup sub nobr wbr-text""".split()
+)
+
+# Rendered as nothing, but their presence still matters (br, checkbox inputs).
+NO_OUTPUT_INLINE = frozenset("""input select textarea option optgroup""".split())
+
+# Marks a hard line break through normalisation, which strips trailing spaces
+# and would otherwise eat the two spaces that make one.
+HARD_BREAK = "\x00"
+# Wraps a run of text that must survive normalisation byte for byte: code spans,
+# fenced code bodies, and every URL.
+LIT_OPEN, LIT_CLOSE = "\x01", "\x02"
+LIT_RE = re.compile(LIT_OPEN + r"(\d+)" + LIT_CLOSE)
+
+
+class Element(object):
+    __slots__ = ("tag", "attrs", "children")
+
+    def __init__(self, tag, attrs=None):
+        self.tag = tag
+        self.attrs = attrs or {}
+        self.children = []
+
+    def get(self, name, default=None):
+        return self.attrs.get(name, default)
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return "<%s %d children>" % (self.tag, len(self.children))
+
+
+class TreeBuilder(HTMLParser):
+    """html.parser, plus the implicit end tags a browser would have inserted.
+
+    html.parser is a tokenizer, not a tree builder: it will happily hand back
+    `<li>a<li>b` as two nested list items. The auto-closing rules below are the
+    subset of the HTML5 "in body" insertion modes that matters for clipboard
+    HTML -- lists, definition lists, tables and paragraphs.
+    """
+
+    def __init__(self):
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.root = Element("#root")
+        self.stack = [self.root]
+        self.skipping = []
+
+    # -- tree helpers --
+    def _current(self):
+        return self.stack[-1]
+
+    def _append(self, node):
+        self._current().children.append(node)
+
+    def _pop_to(self, index):
+        while len(self.stack) > index:
+            self.stack.pop()
+
+    def _close_until(self, targets, boundaries):
+        """Close the nearest open `targets` element, unless a `boundaries`
+        element is open more recently -- that is what keeps a nested <ul>'s
+        first <li> from closing the <li> that contains the list."""
+        for index in range(len(self.stack) - 1, 0, -1):
+            tag = self.stack[index].tag
+            if tag in targets:
+                self._pop_to(index)
+                return
+            if tag in boundaries:
+                return
+
+    def _implicit_close(self, tag):
+        if tag == "li":
+            self._close_until({"li"}, {"ul", "ol", "menu"})
+        elif tag in ("dt", "dd"):
+            self._close_until({"dt", "dd"}, {"dl"})
+        elif tag in ("td", "th"):
+            self._close_until({"td", "th"}, {"tr", "table"})
+        elif tag == "tr":
+            self._close_until({"tr", "td", "th"}, {"table", "thead", "tbody", "tfoot"})
+        elif tag in ("thead", "tbody", "tfoot"):
+            self._close_until(
+                {"tr", "td", "th", "thead", "tbody", "tfoot"}, {"table"}
+            )
+        elif tag in BLOCK_TAGS and self._current().tag == "p":
+            self.stack.pop()
+
+    # -- parser callbacks --
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if self.skipping:
+            if tag == self.skipping[-1]:
+                self.skipping.append(tag)
+            return
+        if tag in SKIPPED_TAGS:
+            if tag not in VOID_TAGS:
+                self.skipping.append(tag)
+            return
+
+        self._implicit_close(tag)
+        node = Element(tag, {k.lower(): (v if v is not None else "") for k, v in attrs})
+        self._append(node)
+        if tag not in VOID_TAGS:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        tag = tag.lower()
+        if self.skipping:
+            return
+        if tag in SKIPPED_TAGS:
+            return
+        self._implicit_close(tag)
+        self._append(
+            Element(tag, {k.lower(): (v if v is not None else "") for k, v in attrs})
+        )
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if self.skipping:
+            if tag == self.skipping[-1]:
+                self.skipping.pop()
+            return
+        if tag in VOID_TAGS:
+            return
+        for index in range(len(self.stack) - 1, 0, -1):
+            if self.stack[index].tag == tag:
+                self._pop_to(index)
+                return
+        # Stray close tag: browsers ignore it, and so do we.
+
+    def handle_data(self, data):
+        if self.skipping or not data:
+            return
+        self._append(data)
+
+    def handle_entityref(self, name):  # convert_charrefs handles the common path
+        if not self.skipping:
+            self._append(html.unescape("&%s;" % name))
+
+    def handle_charref(self, name):
+        if not self.skipping:
+            self._append(html.unescape("&#%s;" % name))
+
+
+def parse(source):
+    builder = TreeBuilder()
+    builder.feed(source)
+    builder.close()
+    return builder.root
+
+
+# --- rendering -------------------------------------------------------------
+
+WS_RE = re.compile(r"[\s ]+")
+# Turndown's escape list, minus the ones that only make sense at a line start
+# (those are applied per block instead).
+INLINE_ESCAPES = ("\\", "`", "*", "_", "[", "]")
+LINE_START_RE = re.compile(r"^(\s*)(#{1,6} |>|\+ |- |\* |=+$)")
+LINE_START_NUMBER_RE = re.compile(r"^(\s*\d+)(\. )")
+
+
+def is_ws(node):
+    return isinstance(node, str) and not node.strip()
+
+
+def first_element(node):
+    for child in node.children:
+        if isinstance(child, Element):
+            return child
+        if child.strip():
+            return None
+    return None
+
+
+class Block(object):
+    """A rendered block plus the tag that produced it, so a list can be joined
+    tightly to the paragraph above it inside a list item."""
+
+    __slots__ = ("text", "tag")
+
+    def __init__(self, text, tag):
+        self.text = text
+        self.tag = tag
+
+
+class Renderer(object):
+    def __init__(self, base_url=None):
+        self.base_url = base_url or None
+        self.literals = []
+
+    # -- literal protection --
+    def lit(self, text):
+        self.literals.append(text)
+        return "%s%d%s" % (LIT_OPEN, len(self.literals) - 1, LIT_CLOSE)
+
+    def restore(self, text):
+        return LIT_RE.sub(lambda m: self.literals[int(m.group(1))], text)
+
+    # -- urls --
+    def url(self, value):
+        value = (value or "").strip()
+        if not value:
+            return ""
+        value = WS_RE.sub("", value)
+        if value.lower().startswith("javascript:"):
+            return ""
+        if self.base_url:
+            try:
+                value = urljoin(self.base_url, value)
+            except ValueError:
+                pass
+        return value
+
+    def link_target(self, url, title):
+        target = self.lit(url.replace("(", "%28").replace(")", "%29"))
+        if title:
+            return '%s "%s"' % (target, WS_RE.sub(" ", title).replace('"', "'").strip())
+        return target
+
+    # -- inline --
+    def inline(self, nodes):
+        return "".join(self.inline_one(node) for node in nodes)
+
+    def inline_one(self, node):
+        if isinstance(node, str):
+            return escape_inline(WS_RE.sub(" ", node))
+
+        tag = node.tag
+        if tag == "br":
+            return HARD_BREAK
+        if tag in NO_OUTPUT_INLINE:
+            return ""
+        if tag == "img":
+            return self.image(node)
+        if tag == "a":
+            return self.anchor(node)
+        if tag == "code" or tag == "kbd" or tag == "samp" or tag == "tt":
+            return self.code_span(node)
+        if tag == "q":
+            return "“" + self.inline(node.children) + "”"
+        if tag in EMPHASIS:
+            return self.emphasis(node, EMPHASIS[tag])
+        if tag == "wbr":
+            return ""
+        return self.inline(node.children)
+
+    def emphasis(self, node, delimiter):
+        inner = self.inline(node.children)
+        stripped = inner.strip()
+        if not stripped:
+            return " " if inner else ""
+        lead = " " if inner[:1].isspace() else ""
+        trail = " " if inner[-1:].isspace() else ""
+        return "%s%s%s%s%s" % (lead, delimiter, stripped, delimiter, trail)
+
+    def code_span(self, node):
+        text = WS_RE.sub(" ", raw_text(node)).strip()
+        if not text:
+            return ""
+        longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+        fence = "`" * (longest + 1)
+        pad = " " if text.startswith("`") or text.endswith("`") else ""
+        return self.lit("%s%s%s%s%s" % (fence, pad, text, pad, fence))
+
+    def image(self, node):
+        src = self.url(node.get("src") or node.get("data-src") or "")
+        if not src:
+            return ""
+        alt = WS_RE.sub(" ", node.get("alt", "")).strip()
+        alt = alt.replace("[", "\\[").replace("]", "\\]")
+        return "![%s](%s)" % (alt, self.link_target(src, node.get("title")))
+
+    def anchor(self, node):
+        label = self.inline(node.children).strip()
+        href = self.url(node.get("href") or "")
+        if not href:
+            return label
+        if not label:
+            return ""
+        return "[%s](%s)" % (label, self.link_target(href, node.get("title")))
+
+    # -- blocks --
+    def blocks(self, node):
+        out = []
+        run = []
+        for child in node.children:
+            if isinstance(child, str):
+                run.append(child)
+            elif child.tag in BLOCK_TAGS:
+                self.flush(run, out)
+                out.extend(self.block(child))
+            else:
+                run.append(child)
+        self.flush(run, out)
+        return out
+
+    def flush(self, run, out):
+        if not run:
+            return
+        text = tidy_inline(self.inline(run))
+        run[:] = []
+        if text:
+            out.append(Block(escape_line_start(text), "p"))
+
+    def block(self, node):
+        tag = node.tag
+
+        if tag in HEADING_TAGS:
+            text = tidy_inline(self.inline(node.children)).replace(HARD_BREAK, " ")
+            text = WS_RE.sub(" ", text).strip()
+            return [Block("#" * HEADING_TAGS[tag] + " " + text, tag)] if text else []
+
+        if tag == "hr":
+            return [Block("---", tag)]
+
+        if tag == "pre":
+            return self.pre(node)
+
+        if tag in ("ul", "ol", "menu"):
+            return self.list(node)
+
+        if tag == "blockquote":
+            inner = join_blocks(self.blocks(node))
+            if not inner:
+                return []
+            quoted = "\n".join(
+                ("> " + line).rstrip() if line else ">" for line in inner.split("\n")
+            )
+            return [Block(quoted, tag)]
+
+        if tag == "table":
+            return self.table(node)
+
+        if tag in ("td", "th", "tr", "thead", "tbody", "tfoot", "caption"):
+            # Only reachable for stray table parts outside a <table>.
+            return self.blocks(node)
+
+        if tag == "dl":
+            out = []
+            for child in node.children:
+                if isinstance(child, Element) and child.tag in ("dt", "dd"):
+                    inner = join_blocks(self.blocks(child))
+                    if not inner:
+                        continue
+                    if child.tag == "dd":
+                        inner = "\n".join(
+                            ("    " + line).rstrip() for line in inner.split("\n")
+                        )
+                    out.append(Block(inner, child.tag))
+            return out
+
+        if tag == "li":
+            # A stray <li> outside a list still deserves a bullet.
+            wrapper = Element("ul")
+            wrapper.children.append(node)
+            return self.list(wrapper)
+
+        # div, section, figure, details, body, ... are pure containers.
+        return self.blocks(node)
+
+    def pre(self, node):
+        body = raw_text(node)
+        body = body.replace("\r\n", "\n").replace("\r", "\n")
+        body = body.strip("\n")
+        if not body.strip():
+            return []
+        language = code_language(node)
+        longest = max((len(run) for run in re.findall(r"^`+", body, re.M)), default=0)
+        fence = "`" * max(3, longest + 1)
+        return [
+            Block(self.lit("%s%s\n%s\n%s" % (fence, language, body, fence)), "pre")
+        ]
+
+    def list(self, node):
+        ordered = node.tag == "ol"
+        try:
+            number = int(node.get("start", "1"))
+        except ValueError:
+            number = 1
+
+        lines = []
+        for child in node.children:
+            if not isinstance(child, Element) or child.tag != "li":
+                continue
+            marker = ("%d. " % number) if ordered else "- "
+            item = self.list_item(child)
+            if item is None:
+                continue
+            if ordered:
+                try:
+                    number = int(child.get("value", number))
+                except ValueError:
+                    pass
+                number += 1
+            indent = " " * len(marker)
+            item_lines = item.split("\n")
+            lines.append((marker + item_lines[0]).rstrip())
+            for line in item_lines[1:]:
+                lines.append((indent + line).rstrip() if line else "")
+        if not lines:
+            return []
+        return [Block("\n".join(lines), node.tag)]
+
+    def list_item(self, node):
+        checkbox = find_checkbox(node)
+        blocks = self.blocks(node)
+        text = join_blocks(blocks, tight_lists=True)
+        if checkbox is None and not text:
+            return None
+        if checkbox is not None:
+            mark = "[x] " if checkbox else "[ ] "
+            text = mark + text if text else mark.rstrip()
+        return text
+
+    def table(self, node):
+        rows, header = collect_rows(self, node)
+        if not rows and not header:
+            return []
+        width = max(len(row) for row in ([header] if header else []) + rows)
+        if not width:
+            return []
+
+        alignments = ["" for _ in range(width)]
+        if header:
+            for index, cell in enumerate(header):
+                alignments[index] = cell[1]
+            head_cells = [cell[0] for cell in header]
+        else:
+            # GFM has no headerless table; turndown-plugin-gfm emits an empty
+            # header row for one, and so do we.
+            head_cells = ["" for _ in range(width)]
+
+        out = [render_row(head_cells, width), render_divider(alignments, width)]
+        for row in rows:
+            out.append(render_row([cell[0] for cell in row], width))
+
+        blocks = []
+        caption = find_child(node, "caption")
+        if caption is not None:
+            text = tidy_inline(self.inline(caption.children))
+            if text:
+                blocks.append(Block(escape_line_start(text), "p"))
+        blocks.append(Block("\n".join(out), "table"))
+        return blocks
+
+    def cell_text(self, node):
+        text = tidy_inline(self.inline_or_blocks(node))
+        text = text.replace(HARD_BREAK, " ").replace("\n", " ")
+        text = re.sub(r"(?<!\\)\|", r"\\|", text)
+        return WS_RE.sub(" ", text).strip()
+
+    def inline_or_blocks(self, node):
+        """Cells usually hold inline content; when they hold blocks, flatten
+        them to one line rather than dropping them."""
+        if any(
+            isinstance(child, Element) and child.tag in BLOCK_TAGS
+            for child in node.children
+        ):
+            return join_blocks(self.blocks(node)).replace("\n\n", " ").replace("\n", " ")
+        return self.inline(node.children)
+
+    # -- entry point --
+    def convert(self, source):
+        root = parse(source)
+        if self.base_url is None:
+            self.base_url = document_base(root)
+        text = join_blocks(self.blocks(root))
+        return self.normalise(text)
+
+    def normalise(self, text):
+        # Runs of spaces are collapsed only *after* a non-space, so list and
+        # blockquote indentation survives while a page's inter-tag padding does
+        # not.
+        text = re.sub(r"(?<=\S)[ \t]{2,}", " ", text)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = text.strip("\n")
+        text = text.replace(HARD_BREAK, "  \n")
+        text = self.restore(text)
+        return text + "\n" if text else ""
+
+
+# --- small helpers ---------------------------------------------------------
+
+
+def escape_inline(text):
+    for char in INLINE_ESCAPES:
+        text = text.replace(char, "\\" + char)
+    return text
+
+
+def escape_line_start(text):
+    out = []
+    for line in text.split("\n"):
+        match = LINE_START_RE.match(line)
+        if match:
+            line = line[: match.end(1)] + "\\" + line[match.end(1) :]
+        else:
+            # "1. " has to keep its digits and take the backslash before the
+            # dot, or the escape reads as part of the number.
+            line = LINE_START_NUMBER_RE.sub(r"\1\\\2", line, count=1)
+        out.append(line)
+    return "\n".join(out)
+
+
+def tidy_inline(text):
+    text = re.sub(r"[ \t]*%s[ \t]*" % HARD_BREAK, HARD_BREAK, text)
+    return text.strip(" \t\n")
+
+
+def join_blocks(blocks, tight_lists=False):
+    out = ""
+    for index, block in enumerate(blocks):
+        if not block.text:
+            continue
+        if not out:
+            out = block.text
+            continue
+        tight = tight_lists and block.tag in ("ul", "ol", "menu")
+        out += ("\n" if tight else "\n\n") + block.text
+    return out
+
+
+def raw_text(node):
+    if isinstance(node, str):
+        return node
+    if node.tag == "br":
+        return "\n"
+    if node.tag in NO_OUTPUT_INLINE:
+        return ""
+    return "".join(raw_text(child) for child in node.children)
+
+
+def find_child(node, tag):
+    for child in node.children:
+        if isinstance(child, Element) and child.tag == tag:
+            return child
+    return None
+
+
+def document_base(root):
+    """<base href> only reaches us when the source kept it outside <head>;
+    harmless when it does not."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        for child in node.children:
+            if isinstance(child, Element):
+                if child.tag == "base" and child.get("href"):
+                    return child.get("href")
+                stack.append(child)
+    return None
+
+
+def code_language(node):
+    for candidate in (find_child(node, "code"), node):
+        if candidate is None:
+            continue
+        classes = (candidate.get("class") or "").split()
+        for name in classes:
+            for prefix in ("language-", "lang-", "highlight-source-", "brush:"):
+                if name.startswith(prefix) and len(name) > len(prefix):
+                    return name[len(prefix) :]
+    return ""
+
+
+def find_checkbox(node):
+    """True/False when the list item starts with a checkbox, else None."""
+    stack = list(node.children)
+    while stack:
+        child = stack.pop(0)
+        if isinstance(child, str):
+            if child.strip():
+                return None
+            continue
+        if child.tag == "input":
+            if (child.get("type", "") or "").lower() == "checkbox":
+                return "checked" in child.attrs
+            return None
+        if child.tag in ("p", "label", "span", "div"):
+            stack = list(child.children) + stack
+            continue
+        return None
+    return None
+
+
+def cell_alignment(node):
+    align = (node.get("align") or "").strip().lower()
+    if not align:
+        style = (node.get("style") or "").lower()
+        match = re.search(r"text-align\s*:\s*(left|center|right)", style)
+        align = match.group(1) if match else ""
+    return align if align in ("left", "center", "right") else ""
+
+
+def collect_rows(renderer, table):
+    """Returns (body_rows, header_row). Cells are (text, alignment) pairs, so
+    the structure walk and the content render happen in one pass."""
+    sections = {"thead": [], "tbody": [], "tfoot": []}
+    loose = []
+
+    def walk(node, bucket):
+        for child in node.children:
+            if not isinstance(child, Element):
+                continue
+            if child.tag in ("thead", "tbody", "tfoot"):
+                walk(child, sections[child.tag])
+            elif child.tag == "tr":
+                bucket.append(child)
+
+    walk(table, loose)
+    ordered = sections["thead"] + sections["tbody"] + loose + sections["tfoot"]
+    if not ordered:
+        return [], None
+
+    def cells(row):
+        out = []
+        for child in row.children:
+            if not isinstance(child, Element) or child.tag not in ("td", "th"):
+                continue
+            text = renderer.cell_text(child)
+            align = cell_alignment(child)
+            out.append((text, align))
+            try:
+                span = int(child.get("colspan", "1"))
+            except ValueError:
+                span = 1
+            for _ in range(max(0, min(span, 32) - 1)):
+                out.append(("", align))
+        return out
+
+    header = None
+    body = ordered
+    if sections["thead"]:
+        header = cells(sections["thead"][0])
+        body = [row for row in ordered if row is not sections["thead"][0]]
+    else:
+        first = ordered[0]
+        if first.children and all(
+            child.tag == "th"
+            for child in first.children
+            if isinstance(child, Element) and child.tag in ("td", "th")
+        ) and any(
+            isinstance(child, Element) and child.tag == "th" for child in first.children
+        ):
+            header = cells(first)
+            body = ordered[1:]
+    return [cells(row) for row in body], header
+
+
+def render_row(cells, width):
+    padded = list(cells) + ["" for _ in range(width - len(cells))]
+    return "| " + " | ".join(padded[:width]) + " |"
+
+
+def render_divider(alignments, width):
+    parts = []
+    for index in range(width):
+        align = alignments[index] if index < len(alignments) else ""
+        if align == "left":
+            parts.append(":---")
+        elif align == "center":
+            parts.append(":---:")
+        elif align == "right":
+            parts.append("---:")
+        else:
+            parts.append("---")
+    return "| " + " | ".join(parts) + " |"
+
+
+# --- top level -------------------------------------------------------------
+
+
+def convert(source, base_url=None):
+    if not source or not source.strip():
+        return ""
+    return Renderer(base_url).convert(source)
+
+
+def pandoc_convert(source, base_url=None):
+    """pandoc is strictly better at this than one file of html.parser, so it
+    wins when it is installed. Never required."""
+    binary = shutil.which("pandoc")
+    if not binary:
+        return None
+    command = [binary, "-f", "html", "-t", "gfm", "--wrap=none"]
+    try:
+        result = subprocess.run(
+            command,
+            input=source.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    text = result.stdout.decode("utf-8", "replace")
+    if base_url:
+        text = absolutise_markdown_links(text, base_url)
+    return re.sub(r"\n{3,}", "\n\n", text).strip("\n")
+
+
+def absolutise_markdown_links(text, base_url):
+    def fix(match):
+        target = match.group(2).strip()
+        if not target or target.startswith("#") or re.match(r"^[a-zA-Z][\w+.-]*:", target):
+            return match.group(0)
+        return "%s(%s%s)" % (match.group(1), urljoin(base_url, target), match.group(3))
+
+    return re.sub(r"(!?\[[^\]]*\])\(([^()\s]*)((?:\s+\"[^\"]*\")?)\)", fix, text)
+
+
+def decode(data):
+    for bom, encoding in (
+        (b"\xef\xbb\xbf", "utf-8-sig"),
+        (b"\xff\xfe", "utf-16"),
+        (b"\xfe\xff", "utf-16"),
+    ):
+        if data.startswith(bom):
+            return data.decode(encoding, "replace")
+    return data.decode("utf-8", "replace")
+
+
+def usage(stream=sys.stderr, status=2):
+    stream.write(
+        "usage: clipbasket-html2md [--base-url URL] [--builtin] [--selftest]\n"
+        "       HTML on stdin, GitHub-Flavored Markdown on stdout.\n"
+    )
+    return status
+
+
+def main(argv):
+    base_url = None
+    builtin = os.environ.get("CLIPBASKET_HTML2MD_PANDOC") == "0"
+    args = list(argv)
+    while args:
+        arg = args.pop(0)
+        if arg == "--base-url":
+            if not args:
+                return usage()
+            base_url = args.pop(0)
+        elif arg.startswith("--base-url="):
+            base_url = arg.split("=", 1)[1]
+        elif arg in ("--builtin", "--no-pandoc"):
+            builtin = True
+        elif arg == "--selftest":
+            return selftest()
+        elif arg in ("-h", "--help"):
+            return usage(sys.stdout, 0)
+        else:
+            sys.stderr.write("clipbasket-html2md: unknown option %s\n" % arg)
+            return usage()
+
+    source = decode(sys.stdin.buffer.read())
+    markdown = None
+    if not builtin and source.strip():
+        markdown = pandoc_convert(source, base_url)
+    if markdown is None:
+        markdown = convert(source, base_url)
+    out = markdown.rstrip("\n")
+    sys.stdout.write(out + "\n" if out else "")
+    return 0
+
+
+# --- selftest --------------------------------------------------------------
+
+CASES = [
+    (
+        "headings",
+        "<h1>Title</h1><h2>Sub <em>title</em></h2><h6>Deep</h6>",
+        "# Title\n\n## Sub *title*\n\n###### Deep",
+    ),
+    (
+        "paragraphs collapse whitespace",
+        "<p>  one   two\n\n   three  </p>\n\n\n<p>\n</p><p>four</p>",
+        "one two three\n\nfour",
+    ),
+    (
+        "bold and italic",
+        "<p><strong>bold</strong> and <b>b</b>, <em>it</em> and <i>i</i></p>",
+        "**bold** and **b**, *it* and *i*",
+    ),
+    (
+        "emphasis hoists its padding out",
+        "<p>a<strong> spaced </strong>b</p>",
+        "a **spaced** b",
+    ),
+    ("strikethrough", "<p><del>gone</del> <s>also</s></p>", "~~gone~~ ~~also~~"),
+    (
+        "inline code is not escaped",
+        "<p>Run <code>a_b *c* [d]</code> now</p>",
+        "Run `a_b *c* [d]` now",
+    ),
+    (
+        "inline code containing a backtick",
+        "<p><code>a ` b</code></p>",
+        "``a ` b``",
+    ),
+    (
+        "fenced code block",
+        "<pre><code class=\"language-python\">def f():\n    return 1\n</code></pre>",
+        "```python\ndef f():\n    return 1\n```",
+    ),
+    (
+        "fenced code block without a language",
+        "<pre>plain\n  text</pre>",
+        "```\nplain\n  text\n```",
+    ),
+    (
+        "links",
+        '<p><a href="https://example.com/x?a=1">text</a></p>',
+        "[text](https://example.com/x?a=1)",
+    ),
+    (
+        "link titles",
+        '<p><a href="/x" title="A title">text</a></p>',
+        '[text](/x "A title")',
+    ),
+    (
+        "images",
+        '<p><img src="/logo.png" alt="Logo"></p>',
+        "![Logo](/logo.png)",
+    ),
+    (
+        "an image inside a link",
+        '<a href="/home"><img src="/logo.png" alt="Logo"></a>',
+        "[![Logo](/logo.png)](/home)",
+    ),
+    (
+        "an anchor without href keeps its text",
+        "<p><a>bare</a> text</p>",
+        "bare text",
+    ),
+    ("javascript: links are dropped", '<p><a href="javascript:evil()">x</a></p>', "x"),
+    (
+        "unordered list",
+        "<ul><li>one</li><li>two</li></ul>",
+        "- one\n- two",
+    ),
+    (
+        "ordered list honours start",
+        '<ol start="3"><li>three</li><li>four</li></ol>',
+        "3. three\n4. four",
+    ),
+    (
+        "nested list",
+        "<ul><li>one<ul><li>inner<ul><li>deep</li></ul></li></ul></li><li>two</li></ul>",
+        "- one\n  - inner\n    - deep\n- two",
+    ),
+    (
+        "unclosed list items still nest",
+        "<ul><li>one<li>two<ul><li>inner</ul><li>three</ul>",
+        "- one\n- two\n  - inner\n- three",
+    ),
+    (
+        "a list item with two paragraphs",
+        "<ul><li><p>one</p><p>two</p></li></ul>",
+        "- one\n\n  two",
+    ),
+    (
+        "task list items",
+        '<ul><li><input type="checkbox" checked> done</li>'
+        '<li><input type="checkbox"> todo</li></ul>',
+        "- [x] done\n- [ ] todo",
+    ),
+    (
+        "blockquote",
+        "<blockquote><p>quoted</p><p>twice</p></blockquote>",
+        "> quoted\n>\n> twice",
+    ),
+    (
+        "nested blockquote",
+        "<blockquote><p>outer</p><blockquote><p>inner</p></blockquote></blockquote>",
+        "> outer\n>\n> > inner",
+    ),
+    ("horizontal rule", "<p>a</p><hr><p>b</p>", "a\n\n---\n\nb"),
+    (
+        "line break",
+        "<p>one<br>two</p>",
+        "one  \ntwo",
+    ),
+    (
+        "table with a header row",
+        "<table><thead><tr><th>Name</th><th>Qty</th></tr></thead>"
+        "<tbody><tr><td>Apple</td><td>3</td></tr>"
+        "<tr><td>Pear</td><td>12</td></tr></tbody></table>",
+        "| Name | Qty |\n| --- | --- |\n| Apple | 3 |\n| Pear | 12 |",
+    ),
+    (
+        "table alignment",
+        '<table><tr><th align="left">L</th><th align="center">C</th>'
+        '<th style="text-align: right">R</th></tr>'
+        "<tr><td>1</td><td>2</td><td>3</td></tr></table>",
+        "| L | C | R |\n| :--- | :---: | ---: |\n| 1 | 2 | 3 |",
+    ),
+    (
+        "headerless table gets an empty header",
+        "<table><tr><td>a</td><td>b</td></tr></table>",
+        "| | |\n| --- | --- |\n| a | b |",
+    ),
+    (
+        "a pipe inside a cell is escaped",
+        "<table><tr><th>h</th></tr><tr><td>a|b</td></tr></table>",
+        "| h |\n| --- |\n| a\\|b |",
+    ),
+    (
+        "table cells keep inline markup",
+        "<table><tr><th>h</th></tr><tr><td><a href=\"/x\"><b>y</b></a></td></tr></table>",
+        "| h |\n| --- |\n| [**y**](/x) |",
+    ),
+    (
+        "script and style are dropped",
+        "<p>keep</p><script>var x = '<p>no</p>';</script><style>p{color:red}</style>",
+        "keep",
+    ),
+    (
+        "head content is dropped",
+        "<html><head><title>T</title><meta charset='utf-8'></head>"
+        "<body><p>body</p></body></html>",
+        "body",
+    ),
+    (
+        "entities are decoded",
+        "<p>a &amp; b &lt;c&gt; &nbsp;d &#233;</p>",
+        "a & b <c> d é",
+    ),
+    (
+        "markdown characters in text are escaped",
+        "<p>a_b *c* [d] `e` back\\slash</p>",
+        "a\\_b \\*c\\* \\[d\\] \\`e\\` back\\\\slash",
+    ),
+    (
+        "a paragraph that starts like a heading is escaped",
+        "<p># not a heading</p><p>1. not a list</p>",
+        "\\# not a heading\n\n1\\. not a list",
+    ),
+    (
+        "empty wrappers leave no blank lines",
+        "<div><div></div><p>a</p><div>   </div><span></span><p>b</p></div>",
+        "a\n\nb",
+    ),
+    (
+        "definition list",
+        "<dl><dt>Term</dt><dd>Meaning</dd></dl>",
+        "Term\n\n    Meaning",
+    ),
+    (
+        "figure and caption",
+        '<figure><img src="/a.png" alt="A"><figcaption>Cap</figcaption></figure>',
+        "![A](/a.png)\n\nCap",
+    ),
+    (
+        "table caption becomes a paragraph",
+        "<table><caption>Cap</caption><tr><th>h</th></tr><tr><td>v</td></tr></table>",
+        "Cap\n\n| h |\n| --- |\n| v |",
+    ),
+    (
+        "colspan pads the row",
+        "<table><tr><th>a</th><th>b</th><th>c</th></tr>"
+        '<tr><td colspan="2">wide</td><td>c</td></tr></table>',
+        "| a | b | c |\n| --- | --- | --- |\n| wide | | c |",
+    ),
+    ("empty input", "", ""),
+    ("whitespace-only input", "   \n\t ", ""),
+    (
+        "a bare text node with no tags",
+        "hello world",
+        "hello world",
+    ),
+    (
+        "unbalanced tags do not lose content",
+        "<div><p>one</p></span></div></div><p>two",
+        "one\n\ntwo",
+    ),
+]
+
+BASE_CASES = [
+    (
+        "relative link resolved against --base-url",
+        "https://example.com/docs/page.html",
+        '<p><a href="../img/a.png">x</a> <img src="/logo.png" alt="L"></p>',
+        "[x](https://example.com/img/a.png) ![L](https://example.com/logo.png)",
+    ),
+    (
+        "absolute urls are left alone",
+        "https://example.com/",
+        '<p><a href="https://other.test/x">x</a></p>',
+        "[x](https://other.test/x)",
+    ),
+    (
+        "fragment links resolve to the page",
+        "https://example.com/a",
+        '<p><a href="#top">x</a></p>',
+        "[x](https://example.com/a#top)",
+    ),
+]
+
+
+def selftest():
+    passed = failed = 0
+    sys.stdout.write("clipbasket-html2md selftest (built-in converter)\n")
+    sys.stdout.write("  python:  %s\n" % sys.version.split()[0])
+    sys.stdout.write(
+        "  pandoc:  %s\n\n" % (shutil.which("pandoc") or "not installed (built-in only)")
+    )
+
+    def check(label, expected, actual):
+        nonlocal passed, failed
+        if expected == actual:
+            passed += 1
+            sys.stdout.write("PASS  %s\n" % label)
+        else:
+            failed += 1
+            sys.stdout.write(
+                "FAIL  %s\n        expected: %r\n        actual:   %r\n"
+                % (label, expected, actual)
+            )
+
+    for label, source, expected in CASES:
+        check(label, expected, convert(source).rstrip("\n"))
+    for label, base, source, expected in BASE_CASES:
+        check(label, expected, convert(source, base).rstrip("\n"))
+
+    # A page-shaped document: every construct at once, with the noise a real
+    # page carries between the tags.
+    page = """
+    <html><head><title>Doc</title><style>body{}</style></head>
+    <body>
+      <script>window.x = 1;</script>
+      <div class="wrap">
+        <h1>Report</h1>
+        <p>Intro with a <a href="/a">link</a>, <strong>bold</strong> and
+           <code>code()</code>.</p>
+        <ul>
+          <li>first</li>
+          <li>second
+            <ol><li>nested</li></ol>
+          </li>
+        </ul>
+        <table>
+          <thead><tr><th>K</th><th>V</th></tr></thead>
+          <tbody><tr><td>a</td><td>1</td></tr></tbody>
+        </table>
+        <blockquote><p>quote</p></blockquote>
+        <pre><code>x = 1</code></pre>
+        <hr>
+      </div>
+    </body></html>
+    """
+    expected_page = (
+        "# Report\n\n"
+        "Intro with a [link](/a), **bold** and `code()`.\n\n"
+        "- first\n- second\n  1. nested\n\n"
+        "| K | V |\n| --- | --- |\n| a | 1 |\n\n"
+        "> quote\n\n"
+        "```\nx = 1\n```\n\n"
+        "---"
+    )
+    check("a whole page round-trips", expected_page, convert(page).rstrip("\n"))
+
+    # Nothing may ever crash on adversarial input.
+    for label, source in (
+        ("deeply nested divs", "<div>" * 200 + "x" + "</div>" * 200),
+        ("unterminated tag", "<p>text<"),
+        ("bare angle brackets", "a < b > c"),
+        ("null-ish control chars", "<p>a\x01b\x02c\x00d</p>"),
+        ("a table with no cells", "<table><tr></tr></table>"),
+        ("attribute with no value", "<p hidden>x</p>"),
+    ):
+        try:
+            convert(source)
+            passed += 1
+            sys.stdout.write("PASS  survives: %s\n" % label)
+        except Exception as error:  # pragma: no cover - the point of the test
+            failed += 1
+            sys.stdout.write("FAIL  survives: %s -> %r\n" % (label, error))
+
+    if shutil.which("pandoc"):
+        out = pandoc_convert("<h1>Title</h1><p><a href='/a'>x</a></p>")
+        check(
+            "pandoc path produces a heading",
+            True,
+            out is not None and out.startswith("# Title"),
+        )
+
+    sys.stdout.write("\n%d passed, %d failed\n" % (passed, failed))
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:  # pragma: no cover
+        sys.exit(0)
+    except KeyboardInterrupt:  # pragma: no cover
+        sys.exit(130)
