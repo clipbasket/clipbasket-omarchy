@@ -128,6 +128,31 @@ safe_ensure_dir() {
 # CLIPBASKET_DB is a test-only override; a database pointed somewhere else on
 # purpose is not pinned, because there is no directory we own to pin it to.
 STATE_DIR_PINNED=0
+
+# Where the stamp files (.fts, .schema-vN) are addressed from. Once pinned this
+# becomes "./", so every stamp open resolves against the held working directory
+# -- the same descriptor binding that blesses ./clips.db, and for the same
+# reason: these are predictable names in a predictable directory, read and
+# written on the keystroke path. Routing them through clipbasket-safefile would
+# cost a python fork per `list`, which is the regression the pinning exists to
+# avoid; the CWD *is* the verified descriptor, so a relative name needs nothing
+# else. Unpinned (CLIPBASKET_DB override, relative STATE_DIR, selftest) it stays
+# absolute and behaves exactly as before.
+STAMP_PREFIX="$STATE_DIR/"
+
+# Recomputed rather than trusted: STATE_DIR is reassigned after this file is
+# sourced -- the selftest points it at a scratch directory -- so a prefix
+# captured at load time would send the stamps somewhere else entirely. It is
+# refreshed at the top of ensure_schema, which is the only thing that reads or
+# writes them, and stays fork-free.
+set_stamp_prefix() {
+	if [ "$STATE_DIR_PINNED" = "1" ]; then
+		STAMP_PREFIX="./"
+	else
+		STAMP_PREFIX="$STATE_DIR/"
+	fi
+}
+
 pin_state_dir() {
 	[ "$STATE_DIR_PINNED" = "1" ] && return 0
 	[ -z "${CLIPBASKET_DB:-}" ] || return 0
@@ -479,7 +504,7 @@ probe_fts() {
 		FTS_ENABLED=0
 		drop_fts_triggers >/dev/null 2>&1 || true
 	fi
-	printf '%s\n' "$FTS_ENABLED" >"$STATE_DIR/.fts" 2>/dev/null || true
+	printf '%s\n' "$FTS_ENABLED" >"${STAMP_PREFIX}.fts" 2>/dev/null || true
 }
 
 # True when the cached "no FTS5" answer is still trustworthy: the sqlite3 that
@@ -488,7 +513,7 @@ fts_answer_is_current() {
 	local bin
 	bin=$(command -v "$SQLITE_BIN" 2>/dev/null) || return 1
 	[ -n "$bin" ] || return 1
-	[ ! "$bin" -nt "$STATE_DIR/.fts" ]
+	[ ! "$bin" -nt "${STAMP_PREFIX}.fts" ]
 }
 
 ensure_schema() {
@@ -497,8 +522,11 @@ ensure_schema() {
 	# failure here just means the directory does not exist yet; the slow path
 	# creates it and pins afterwards.
 	pin_state_dir || true
+	set_stamp_prefix
 
-	local stamp="$STATE_DIR/.schema-v$SCHEMA_VERSION"
+	# Relative once pinned -- see STAMP_PREFIX. pin_state_dir has already run
+	# above, so this is resolved the same way whichever path is taken below.
+	local stamp="${STAMP_PREFIX}.schema-v$SCHEMA_VERSION"
 
 	build_projections
 
@@ -506,8 +534,8 @@ ensure_schema() {
 	# because reading the pragma would itself cost a whole sqlite3 process on
 	# every keystroke.
 	if [ -f "$DB_PATH" ] && [ -f "$stamp" ]; then
-		if [ -r "$STATE_DIR/.fts" ]; then
-			read -r FTS_ENABLED <"$STATE_DIR/.fts" || FTS_ENABLED=0
+		if [ -r "${STAMP_PREFIX}.fts" ]; then
+			read -r FTS_ENABLED <"${STAMP_PREFIX}.fts" || FTS_ENABLED=0
 		fi
 		[ "$FTS_ENABLED" = "1" ] || FTS_ENABLED=0
 		# A cached yes is final. A cached no is re-probed once the sqlite3
@@ -525,6 +553,10 @@ ensure_schema() {
 	safe_ensure_dir "$THUMB_DIR" 755
 	refuse_symlink "$DB_PATH"
 	pin_state_dir || die "could not enter $STATE_DIR"
+	# Pinning may have just succeeded for the first time; the stamps written
+	# below must use the form that reflects that.
+	set_stamp_prefix
+	stamp="${STAMP_PREFIX}.schema-v$SCHEMA_VERSION"
 
 	migrate_schema
 	base_schema | run_raw >/dev/null || die "could not open or create $DB_PATH"
@@ -532,7 +564,7 @@ ensure_schema() {
 	probe_fts
 	# The stamp is per-version, so an upgraded binary always takes the slow
 	# path once and runs its migrations. Older stamps are dead weight.
-	rm -f -- "$STATE_DIR"/.schema-v*
+	rm -f -- "${STAMP_PREFIX}".schema-v*
 	: >"$stamp"
 }
 

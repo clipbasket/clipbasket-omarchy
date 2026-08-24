@@ -74,6 +74,11 @@ class Refused(Exception):
     """A path was not what it must be. Never retried, never worked around."""
 
 
+class Missing(Exception):
+    """A component of the path does not exist. For read/unlink this is the
+    same 'no such token' outcome as a missing file, not an error."""
+
+
 class Failed(Exception):
     """Anything else: permission, I/O, usage."""
 
@@ -167,7 +172,10 @@ def open_dir(path, create=False, mode=DEFAULT_DIR_MODE):
                 if exc.errno != errno.ENOENT:
                     raise Failed("cannot open %s: %s" % (walked, exc.strerror))
                 if not create:
-                    raise Failed("%s does not exist" % walked)
+                    # Absent, not malformed: read maps this to EXIT_MISSING and
+                    # unlink to EXIT_OK, so a token whose directory does not
+                    # exist yet reads as "no token" rather than an error.
+                    raise Missing("%s does not exist" % walked)
                 try:
                     os.mkdir(component, mode, dir_fd=fd)
                 except FileExistsError:
@@ -295,7 +303,11 @@ def cmd_write(dirpath, name, mode):
 
 def cmd_read(dirpath, name):
     _check_name(name)
-    dfd = open_dir(dirpath, create=False)
+    try:
+        dfd = open_dir(dirpath, create=False)
+    except Missing:
+        return EXIT_MISSING
+
     try:
         try:
             fd = os.open(name, OPEN_FILE_FLAGS, dir_fd=dfd)
@@ -323,7 +335,11 @@ def cmd_read(dirpath, name):
 
 def cmd_unlink(dirpath, name):
     _check_name(name)
-    dfd = open_dir(dirpath, create=False)
+    try:
+        dfd = open_dir(dirpath, create=False)
+    except Missing:
+        return EXIT_OK
+
     try:
         try:
             fd = os.open(name, OPEN_FILE_FLAGS, dir_fd=dfd)
@@ -448,6 +464,18 @@ def _selftest():
         check("read reports missing silently",
               rc == EXIT_MISSING and out == b"" and err == b"")
 
+        # 14: read/unlink on a directory that does not exist yet is "absent",
+        # not an error — a fresh install consumes the suppression token before
+        # the state directory exists, and that must be silent.
+        gone = os.path.join(root, "nodir")
+        rc, out, err = run(["read", gone, "token"])
+        check("read of an absent directory is EXIT_MISSING and silent",
+              rc == EXIT_MISSING and out == b"" and err == b"")
+        rc, _, err = run(["unlink", gone, "token"])
+        check("unlink in an absent directory is EXIT_OK and silent",
+              rc == EXIT_OK and err == b"")
+
+
         # 14: read refuses a symlink
         rc, out, _ = run(["read", target, "planted"])
         check("read refuses a symlink", rc == EXIT_REFUSED and out == b"")
@@ -566,6 +594,11 @@ def main(argv):
                 raise Failed("unlink takes a directory and a name")
             return cmd_unlink(args[0], args[1])
         raise Failed("unknown command: %s" % command)
+    except Missing as exc:
+        # Only read/unlink expect this and they catch it themselves; anything
+        # that reaches here treated a missing path as fatal, which it is.
+        _warn(str(exc))
+        return EXIT_ERROR
     except Refused as exc:
         _warn(str(exc))
         return EXIT_REFUSED

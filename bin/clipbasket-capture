@@ -37,6 +37,9 @@ MAX_TEXT_BYTES="${CLIPBASKET_MAX_TEXT_BYTES:-8388608}"    # 8 MiB, as in the Tau
 MAX_HTML_BYTES="${CLIPBASKET_MAX_HTML_BYTES:-8388608}"    # CLIPBOARD_HTML_MAX_BYTES
 MAX_IMAGE_BYTES="${CLIPBASKET_MAX_IMAGE_BYTES:-67108864}" # 64 MiB
 MAX_FILE_ITEMS="${CLIPBASKET_MAX_FILE_ITEMS:-1024}"
+# A URI is a path plus a scheme and percent-encoding; 4 KiB each is far more
+# than any real one and keeps a full MAX_FILE_ITEMS list well inside the bound.
+MAX_URI_LIST_BYTES="${CLIPBASKET_MAX_URI_LIST_BYTES:-$((MAX_FILE_ITEMS * 4096 + 1))}"
 MAX_CLIPS="${CLIPBASKET_MAX_CLIPS:-1000}"
 THUMB_SIZE="${CLIPBASKET_THUMB_SIZE:-224}"
 # CLIPBOARD_IMAGE_MAX_DIMENSION in the desktop app. A guard on *decoded* pixels
@@ -264,6 +267,29 @@ consume_suppression() {
 	token=${token%$'\n'}
 	safe_unlink "$STATE_DIR" suppress
 	[ "$token" = "$want" ]
+}
+
+# --- bounded reads ---------------------------------------------------------
+
+# Reads at most $1 bytes of stdin to stdout.
+#
+# Every size limit in this file used to be checked *after* the whole producer
+# stream had been buffered to a temp file, which means the limit protected the
+# database and not us: a clipboard owner offering a gigabyte, or one that never
+# closes the pipe at all, was read in full before being rejected. wl-paste hands
+# us whatever the owning application decides to send, and that application is
+# not ours.
+#
+# Callers pass limit+1, so the existing `-gt LIMIT` tests keep their exact
+# meaning: content of exactly LIMIT bytes reads LIMIT and is accepted, content
+# larger reads LIMIT+1 and is rejected. Nothing bigger than that is ever in
+# memory or on disk.
+#
+# `head -c` also closes its input once satisfied, so the producer gets SIGPIPE
+# and stops rather than being left to stream into a discarded pipe -- which is
+# what makes the never-terminating case terminate.
+bounded_cat() {
+	head -c "$1"
 }
 
 # --- source app ------------------------------------------------------------
@@ -549,7 +575,8 @@ read_html_flavor() {
 
 	mktempfile
 	file="$REPLY_TMPFILE"
-	"$WL_PASTE_BIN" --no-newline --type "$mime" >"$file" 2>/dev/null || return 0
+	"$WL_PASTE_BIN" --no-newline --type "$mime" 2>/dev/null |
+		bounded_cat $((MAX_HTML_BYTES + 1)) >"$file" || return 0
 	size=$(file_size "$file")
 	[ "$size" -gt 0 ] || return 0
 	if [ "$size" -gt "$MAX_HTML_BYTES" ]; then
@@ -586,7 +613,8 @@ offer_is_local_file_list() {
 	local probe
 	mktempfile
 	probe="$REPLY_TMPFILE"
-	"$WL_PASTE_BIN" --no-newline --type text/uri-list 2>/dev/null | uri_list_paths >"$probe" || true
+	"$WL_PASTE_BIN" --no-newline --type text/uri-list 2>/dev/null |
+		bounded_cat $((MAX_URI_LIST_BYTES)) | uri_list_paths >"$probe" || true
 	[ -s "$probe" ]
 }
 
@@ -602,7 +630,11 @@ capture_files() {
 	local paths count hash payload preview app mime='' first=''
 	mktempfile
 	paths="$REPLY_TMPFILE"
-	"$WL_PASTE_BIN" --no-newline --type text/uri-list 2>/dev/null | uri_list_paths >"$paths" || true
+	# Bounded before the parse, not after: a hostile uri-list is a stream like
+	# any other. The generous per-path ceiling means a list under the item limit
+	# is never truncated, and one over it is rejected by the count check below.
+	"$WL_PASTE_BIN" --no-newline --type text/uri-list 2>/dev/null |
+		bounded_cat $((MAX_URI_LIST_BYTES)) | uri_list_paths >"$paths" || true
 	count_paths "$paths"
 	count="$REPLY_COUNT"
 	[ "$count" -gt 0 ] || return 1
@@ -1136,6 +1168,90 @@ cmd_selftest() {
 	check 'and the file behind the link is untouched' 'original' "$(cat "$state/victim.png")"
 	rm -f "$state/images/$sym_hash.png" "$state/victim.png"
 
+	# --- bounded producer reads (marketplace review, third round) -----------
+	# Each limit used to be checked after the whole producer stream had been
+	# buffered. These assert that the read itself is bounded: the producer is
+	# cut off, the clip is still rejected by the existing check, and a producer
+	# that never closes the pipe does not hang the watcher.
+	reset_db
+	printf 'text/plain\n' >"$fix/types"
+
+	# A producer that keeps writing 4 KiB chunks and records how many it has
+	# managed to write. If the read were unbounded it would write all 512;
+	# `head -c` closing the pipe kills it with SIGPIPE almost immediately.
+	local greedy="$SELFTEST_ROOT/greedy" chunks="$SELFTEST_ROOT/chunks"
+	cat >"$greedy" <<-STUB
+		#!/bin/sh
+		i=0
+		while [ \$i -lt 512 ]; do
+			dd if=/dev/zero bs=4096 count=1 2>/dev/null | tr '\\0' 'a' || exit 0
+			i=\$((i + 1))
+			printf '%s' "\$i" >"$chunks"
+		done
+	STUB
+	chmod +x "$greedy"
+
+	printf '0' >"$chunks"
+	out=$(CLIPBASKET_MAX_TEXT_BYTES=4096 "$greedy" |
+		CLIPBASKET_MAX_TEXT_BYTES=4096 "$SCRIPT_DIR/clipbasket-capture" text 2>&1 || true)
+	check_contains 'an over-limit text stream is rejected' 'skipping' "$out"
+	check_contains 'and the limit it names is the configured one' 'limit 4096' "$out"
+	# The read wants 4097 bytes; anything past that is the kernel pipe buffer
+	# and scheduling slack before SIGPIPE lands, which is tens of KiB at most.
+	# 64 chunks is 256 KiB -- an eighth of the stream, and unmistakably not the
+	# 512 an unbounded read would have drained.
+	check 'and the producer was cut off rather than drained' 'bounded' \
+		"$( [ "$(cat "$chunks")" -le 64 ] && echo bounded || echo "drained:$(cat "$chunks")" )"
+	check 'and nothing was recorded' '0' "$(clip_count)"
+
+	# The same for the image watcher, which has its own limit and its own
+	# ingest branch.
+	reset_db
+	printf 'image/png\n' >"$fix/types"
+	printf '0' >"$chunks"
+	out=$("$greedy" |
+		CLIPBASKET_MAX_IMAGE_BYTES=4096 "$SCRIPT_DIR/clipbasket-capture" image 2>&1 || true)
+	check_contains 'an over-limit image stream is rejected' 'skipping' "$out"
+	check 'and that producer was cut off too' 'bounded' \
+		"$( [ "$(cat "$chunks")" -le 64 ] && echo bounded || echo "drained:$(cat "$chunks")" )"
+
+	# The html flavour reads a second producer of its own, so it is bounded
+	# separately from the payload on stdin.
+	reset_db
+	printf 'text/plain\ntext/html\n' >"$fix/types"
+	dd if=/dev/zero bs=1024 count=64 2>/dev/null | tr '\0' 'h' >"$fix/type.text_html"
+	out=$(printf 'plain text here' |
+		CLIPBASKET_MAX_HTML_BYTES=1024 "$SCRIPT_DIR/clipbasket-capture" text 2>&1 || true)
+	check_contains 'an over-limit html flavour is dropped' 'dropping' "$out"
+	check_contains 'and it says the plain text is kept' 'keeping the plain text' "$out"
+	check 'and the text clip is still recorded without it' '1' "$(clip_count)"
+	rm -f "$fix/type.text_html"
+
+	# A producer that never closes the pipe. Without a bounded read this hangs
+	# forever, which is the failure this whole section exists to prevent --
+	# so it is run under `timeout` and skipped where that is unavailable
+	# rather than risking a suite that never returns.
+	if command -v timeout >/dev/null 2>&1; then
+		reset_db
+		printf 'text/plain\n' >"$fix/types"
+		local endless="$SELFTEST_ROOT/endless"
+		cat >"$endless" <<-'STUB'
+			#!/bin/sh
+			dd if=/dev/zero bs=4096 count=2 2>/dev/null | tr '\0' 'a'
+			sleep 60
+		STUB
+		chmod +x "$endless"
+		out=$("$endless" |
+			timeout 10 env CLIPBASKET_MAX_TEXT_BYTES=1024 \
+				"$SCRIPT_DIR/clipbasket-capture" text 2>&1
+			printf 'rc=%s' "$?")
+		check_contains 'a never-closing producer does not hang the watcher' 'rc=0' "$out"
+		check_contains 'and its stream is rejected by the size limit' 'skipping' "$out"
+	else
+		pass=$((pass + 1))
+		printf 'PASS  %s\n' 'a never-closing producer does not hang the watcher (skipped: no timeout)'
+	fi
+
 	unset CLIPBASKET_SELFTEST_FIXTURE CLIPBASKET_WL_PASTE CLIPBASKET_WL_COPY
 	unset CLIPBASKET_STATE_DIR CLIPBASKET_DB CLIPBASKET_DB_CLI
 
@@ -1183,7 +1299,14 @@ main() {
 
 	mktempfile
 	stdin_file="$REPLY_TMPFILE"
-	cat >"$stdin_file"
+	# Bounded at ingest, by the limit that applies to whichever watcher this is.
+	# The per-kind checks further down are unchanged; they now examine a file
+	# that cannot have grown past limit+1 bytes.
+	if [ "$mode" = "image" ]; then
+		bounded_cat $((MAX_IMAGE_BYTES + 1)) >"$stdin_file"
+	else
+		bounded_cat $((MAX_TEXT_BYTES + 1)) >"$stdin_file"
+	fi
 
 	if [ "$has_files" = 1 ]; then
 		# text/uri-list is also how some apps advertise a plain list of links,

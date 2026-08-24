@@ -90,6 +90,18 @@ safe_write() {
   (( rc == 0 )) || die "Refusing to write $1/$2 (clipbasket-safefile exit $rc)."
 }
 
+# The best-effort variant: a refusal warns and returns 0. Used where failing
+# the whole command would be worse than not writing -- mirroring the shortcut
+# into settings.json must never fail a keybinding change, because the file in
+# ~/.config/hypr is the one that actually decides the binding.
+safe_write_soft() {
+  local rc=0
+  "$SAFEFILE" write "$1" "$2" --mode "${3:-600}" || rc=$?
+  (( rc == 0 )) && return 0
+  warn "Could not write $1/$2 (clipbasket-safefile exit $rc)."
+  return 0
+}
+
 safe_ensure_dir() {
   local rc=0
   "$SAFEFILE" ensure-dir "$1" --mode "${2:-700}" || rc=$?
@@ -468,14 +480,20 @@ mirror_shortcut_setting() {
   fi
   have jq || return 0
   [[ -f "$SETTINGS_FILE" ]] || return 0
-  local tmp
-  tmp="$(mktemp -- "${SETTINGS_FILE}.clipbasket.XXXXXX")" || return 0
-  if jq --arg key "$value" '.globalShortcut = $key' <"$SETTINGS_FILE" >"$tmp" 2>/dev/null; then
-    mv -f -- "$tmp" "$SETTINGS_FILE"
-  else
-    rm -f -- "$tmp"
+
+  # jq runs to completion into a shell variable BEFORE anything is written.
+  # Piping it straight into the writer would truncate a settings file whose
+  # JSON turned out to be invalid: the writer would already have committed an
+  # empty document by the time jq's failure was visible.
+  local patched
+  if ! patched="$(jq --arg key "$value" '.globalShortcut = $key' <"$SETTINGS_FILE" 2>/dev/null)"; then
     warn "Could not update globalShortcut in $SETTINGS_FILE (invalid JSON?)."
+    return 0
   fi
+  # And the write itself is descriptor-bound like every other one, but soft:
+  # a refusal here must not fail the keybinding change that prompted it.
+  printf '%s\n' "$patched" |
+    safe_write_soft "$(dirname -- "$SETTINGS_FILE")" "$(basename -- "$SETTINGS_FILE")" 600
 }
 
 json_string() {

@@ -424,10 +424,12 @@ means the attacker owns a directory nobody is writing to.
 | Write | Bound by |
 | --- | --- |
 | `clips.db`, and its `-wal` / `-shm` | **CWD pinning**: `clipbasket-db` `cd -P`s into the state directory once, confirms `$PWD` came back equal to the path it asked for (so no component was a symlink) and that `.` is owned by us, then opens the database as `./clips.db`. sqlite3 resolves against the held working directory, and the journal files follow the database into it. |
+| `.fts` and `.schema-vN` stamps | **CWD pinning**, same as the database. These are read on every `list` and `count`, so a helper call would be a python fork per keystroke; once pinned they are addressed by relative name and resolve against the same held descriptor |
 | `suppress` (write and consume) | `safefile write` / `read` / `unlink` |
 | `images/<hash>.<ext>`, `thumbs/<hash>.png` | Staged in `$TMPDIR`, published with `safefile write` |
 | `settings.json` (CLI and panel) | `safefile write`, with jq still doing the merge |
 | `make-default.json`, `backups/bindings.lua.*` | `safefile write` |
+| `globalShortcut` mirrored into `settings.json` | `safefile write`, best-effort: a refusal warns rather than failing the keybinding change it followed |
 | `bindings.lua` | Resolved **once** with `readlink -f` — this is the one path that may legitimately be a symlink, because dotfile repos do that — then replaced with `safefile write` against the resolved directory |
 
 The pathname checks (`ensure_private_dir`, `refuse_symlink`) are still there
@@ -442,6 +444,27 @@ refusing nothing and logging nothing. Those tests now ask `[ -L ]` as well, so
 anything that is not a real file goes down the write path where the helper
 refuses it.
 
+### Bounded reads
+
+A size limit that is checked after the whole stream has been buffered protects
+the database and not the process. `wl-paste` hands over whatever the owning
+application chooses to send, and that application is not ours: an owner offering
+a gigabyte, or one that simply never closes the pipe, used to be read to
+completion before being rejected.
+
+Every producer read is now bounded at ingest by `bounded_cat`, which is
+`head -c` with the limit **plus one**. The extra byte preserves each existing
+`-gt LIMIT` test exactly: content of exactly the limit reads the limit and is
+accepted, anything larger reads limit+1 and is rejected. `head` closing its
+input also sends the producer `SIGPIPE`, which is what makes a non-terminating
+one terminate rather than stream into a pipe nobody is draining.
+
+| Read | Bound |
+| --- | --- |
+| the payload on stdin | `CLIPBASKET_MAX_TEXT_BYTES` or `CLIPBASKET_MAX_IMAGE_BYTES`, by watcher |
+| the `text/html` flavour | `CLIPBASKET_MAX_HTML_BYTES` |
+| `text/uri-list`, both readers | `CLIPBASKET_MAX_URI_LIST_BYTES`, default `MAX_FILE_ITEMS * 4096 + 1` — generous per URI, so a list inside the item limit is never truncated and one past it is rejected by the count check |
+
 ### The boundary, stated plainly
 
 This defends against a same-user process substituting a directory or a file at
@@ -453,7 +476,12 @@ already got inside your data directory has won before any of this starts. The
 threat this closes is the race, and the race is closed by binding to
 descriptors rather than by checking names more times.
 
-`clipbasket-safefile --selftest` covers it: 21 cases including planted symlinks
+The capture suite covers the bounds with a producer that keeps writing and
+records how far it got: it is cut off within a pipe buffer of the limit rather
+than draining, the clip is rejected by the existing check, and a producer that
+never closes is shown to return rather than hang.
+
+`clipbasket-safefile --selftest` covers the descriptor binding: 21 cases including planted symlinks
 at a directory component, at a write destination and at an unlink target,
 wrong-owner refusal, temp-file cleanup on both the success and the refusal
 path, and an assertion that nothing appears behind any planted link. Each of
