@@ -13,7 +13,7 @@ fenced code, `*` emphasis, GFM tables, strikethrough and task list items.
 Constraints that shape the implementation:
 
   * Python 3 standard library only. The product promise is "git clone and run",
-    so a pip install or a new pacman dependency is not available -- but Omarchy
+    so a pip install or a new system package is not available -- but Omarchy
     ships python3, and html.parser is in it.
   * pandoc is strictly better at this than anything that fits in one file, so it
     is used when it happens to be installed. It is never required, and the

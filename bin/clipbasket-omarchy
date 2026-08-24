@@ -644,7 +644,7 @@ check_binary() {
   if have "$bin"; then
     check_pass "$label" "$(command -v "$bin")"
   else
-    check_fail "$label" "not found — install it: pacman -S $package"
+    check_fail "$label" "not found — install the $package package"
   fi
 }
 
@@ -829,7 +829,7 @@ cmd_settings_init() {
     schema="$here/settings.schema.json"
   fi
   [[ -f "$schema" ]] || die "settings.schema.json not found (looked in $PLUGIN_DIR)."
-  have jq || die "jq is required to seed settings. Install it: pacman -S jq"
+  have jq || die "jq is required to seed settings. Install the jq package."
 
   if [[ -f "$SETTINGS_FILE" && $force -eq 0 ]]; then
     info "$SETTINGS_FILE already exists. Pass --force to overwrite it with defaults."
