@@ -42,6 +42,10 @@ Item {
   readonly property string settingsPath:
     (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")) + "/clipbasket/settings.json"
 
+  // Retention and the confidential-copy skip. Both reach clipbasket-capture as
+  // environment variables, and Process.environment is read once at spawn, so a
+  // change to either is only picked up by restarting the watchers.
+  //
   // Retention. clipbasket-capture prunes to CLIPBASKET_MAX_CLIPS after every
   // insert and defaults to 1000 when it is unset, which is why this has to be
   // passed through: without it the setting renders in the panel and does
@@ -49,6 +53,11 @@ Item {
   // only picked up by restarting the watchers.
   readonly property int defaultMaxClips: 1000
   property int maxClips: root.defaultMaxClips
+
+  // Whether capture skips offers a password manager marked confidential.
+  // Defaults on: a privacy default should never need to be discovered, and an
+  // unreadable settings file must not quietly start recording passwords.
+  property bool ignoreConfidentialCopies: true
 
   // A watcher that comes back up faster than this did not run, it failed.
   // Mirrors MIN_HEALTHY_SECONDS in the daemon this replaced.
@@ -123,20 +132,31 @@ Item {
 
   function applySettings(raw) {
     var next = root.defaultMaxClips;
+    var nextConfidential = true;
     try {
       var parsed = JSON.parse(String(raw));
-      if (parsed && typeof parsed === "object" && "maxClips" in parsed) {
-        var n = Number(parsed.maxClips);
-        // Clamped, not rejected, to match settings.schema.json.
-        if (isFinite(n) && n > 0) next = Math.max(50, Math.min(100000, Math.round(n)));
+      if (parsed && typeof parsed === "object") {
+        if ("maxClips" in parsed) {
+          var n = Number(parsed.maxClips);
+          // Clamped, not rejected, to match settings.schema.json.
+          if (isFinite(n) && n > 0) next = Math.max(50, Math.min(100000, Math.round(n)));
+        }
+        // Anything other than an explicit false leaves the privacy default on,
+        // so a typo in the settings file cannot silently start recording
+        // passwords.
+        if ("ignoreConfidentialCopies" in parsed) {
+          nextConfidential = parsed.ignoreConfidentialCopies !== false;
+        }
       }
     } catch (e) {
       // A half-written or hand-broken settings file must not take capture down
-      // with it; the default is a working retention, not a failure.
+      // with it; the defaults are working retention and privacy on, not a
+      // failure.
     }
 
-    var changed = next !== root.maxClips;
+    var changed = next !== root.maxClips || nextConfidential !== root.ignoreConfidentialCopies;
     root.maxClips = next;
+    root.ignoreConfidentialCopies = nextConfidential;
     root.settingsResolved = true;
 
     if (!root.watchersStarted) root.startWatchers();
@@ -165,18 +185,36 @@ Item {
     id: textWatcher
     property double startedAt: 0
     command: root.watcherCommand("text")
-    environment: ({ "CLIPBASKET_MAX_CLIPS": String(root.maxClips) })
-    onRunningChanged: if (running) startedAt = Date.now()
-    onExited: if (root.watchersStarted) root.noteWatcherExit(startedAt)
+    // Quickshell declares `environment` as a QVariantHash, and a QML object
+    // literal can only ever produce a QVariantMap, so qmllint flags an
+    // assignment that is correct and works at runtime. No QML expression yields
+    // a QVariantHash, so the warning is suppressed rather than worked around.
+    // qmllint disable incompatible-type
+    environment: ({
+      "CLIPBASKET_MAX_CLIPS": String(root.maxClips),
+      "CLIPBASKET_IGNORE_CONFIDENTIAL": root.ignoreConfidentialCopies ? "1" : "0"
+    })
+    // qmllint enable incompatible-type
+    onRunningChanged: if (textWatcher.running) textWatcher.startedAt = Date.now()
+    onExited: if (root.watchersStarted) root.noteWatcherExit(textWatcher.startedAt)
   }
 
   Process {
     id: imageWatcher
     property double startedAt: 0
     command: root.watcherCommand("image")
-    environment: ({ "CLIPBASKET_MAX_CLIPS": String(root.maxClips) })
-    onRunningChanged: if (running) startedAt = Date.now()
-    onExited: if (root.watchersStarted) root.noteWatcherExit(startedAt)
+    // Quickshell declares `environment` as a QVariantHash, and a QML object
+    // literal can only ever produce a QVariantMap, so qmllint flags an
+    // assignment that is correct and works at runtime. No QML expression yields
+    // a QVariantHash, so the warning is suppressed rather than worked around.
+    // qmllint disable incompatible-type
+    environment: ({
+      "CLIPBASKET_MAX_CLIPS": String(root.maxClips),
+      "CLIPBASKET_IGNORE_CONFIDENTIAL": root.ignoreConfidentialCopies ? "1" : "0"
+    })
+    // qmllint enable incompatible-type
+    onRunningChanged: if (imageWatcher.running) imageWatcher.startedAt = Date.now()
+    onExited: if (root.watchersStarted) root.noteWatcherExit(imageWatcher.startedAt)
   }
 
   // A watcher that dies takes the history with it silently -- copying still

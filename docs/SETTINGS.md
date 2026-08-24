@@ -40,7 +40,6 @@ downgrading never destroys a newer install's settings.
   "globalShortcut": "",
   "ignoreConfidentialCopies": true,
   "maxClips": 1000,
-  "openAtCursorOnShortcut": false,
   "pasteSelectedClipImmediately": false
 }
 ```
@@ -120,15 +119,6 @@ by an older build.
 Turning this off disables auto-paste, which cannot work while the panel still
 holds keyboard focus.
 
-### `openAtCursorOnShortcut` — boolean, default `false`
-
-Show the popup near the pointer instead of anchored under the bar pill when it is
-opened by keyboard.
-
-Requires a Hyprland window rule using `cursor_x` / `cursor_y`. With this off, the
-panel anchors to the bar widget the way every other Omarchy popout does, which is
-why it is off by default.
-
 ### `pasteSelectedClipImmediately` — boolean, default `false`
 
 After picking a clip, paste it into the focused window rather than only copying
@@ -156,6 +146,14 @@ would fight the desktop and produce a widget that does not match the bar it sits
 in.
 
 Change your theme in Omarchy; Clipbasket follows.
+
+### Open at cursor on shortcut
+
+Nothing could consume it. The popup is a layer-shell surface anchored to the bar
+pill by Omarchy's own `Panel` chrome, which positions it relative to the widget,
+not the pointer — the plugin has no supported way to place it at the cursor. The
+toggle described an intention rather than a behaviour, so it was removed instead
+of left in place looking adjustable.
 
 ### Launch at login
 

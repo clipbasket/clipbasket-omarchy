@@ -12,7 +12,7 @@
     "groups": [
       { "id": "general",  "title": "General",  "properties": ["globalShortcut"] },
       { "id": "history",  "title": "History",  "properties": ["maxClips", "ignoreConfidentialCopies"] },
-      { "id": "behavior", "title": "Behavior", "properties": ["closePanelAfterAction", "openAtCursorOnShortcut", "pasteSelectedClipImmediately"] }
+      { "id": "behavior", "title": "Behavior", "properties": ["closePanelAfterAction", "pasteSelectedClipImmediately"] }
     ],
     "notInThisPort": [
       {
@@ -26,6 +26,10 @@
       {
         "name": "pastePermission (macOS Accessibility)",
         "reason": "Wayland has no equivalent grant. Synthetic input goes through wtype/ydotool, which either work or are not installed."
+      },
+      {
+        "name": "openAtCursorOnShortcut",
+        "reason": "Nothing could consume it. The popup is a layer-shell surface anchored to the bar pill by Omarchy’s own Panel chrome, which positions it relative to the widget rather than the pointer; there is no supported way for the plugin to place it at the cursor, so the setting only ever described an intention."
       },
       {
         "name": "launchAtLogin",
@@ -97,18 +101,6 @@
         "group": "behavior",
         "aliases": ["closeAfterAction", "closePanelAfterSelection", "closePanelAfterCopy"],
         "help": "Turning this off disables auto-paste, which cannot work while the panel still holds focus."
-      }
-    },
-
-    "openAtCursorOnShortcut": {
-      "type": "boolean",
-      "default": false,
-      "title": "Open at cursor on shortcut",
-      "description": "Show the popup near the pointer instead of under the bar widget when opened by keyboard.",
-      "x-clipbasket": {
-        "group": "behavior",
-        "aliases": ["openAtCursor"],
-        "help": "Needs a Hyprland window rule using cursor_x / cursor_y. With this off, the panel anchors to the bar pill the way every other Omarchy popout does."
       }
     },
 

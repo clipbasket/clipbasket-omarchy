@@ -62,8 +62,13 @@ Panel {
   property bool detailPinned: false
   property bool detailSaved: false
 
-  // ---- Copy-variant menu (panel-level overlay so the ListView cannot clip it)
-  property int menuClipRow: -1
+  // ---- Copy-variant menu (panel-level overlay so the ListView cannot clip it).
+  // Keyed by clip id, not row index: a search debounce or a post-mutation
+  // reload re-sorts the model while the menu is open, and an index captured at
+  // open time would then point at whatever row had moved into that slot -- so
+  // "Copy as Markdown" would run against a different clip than the one the
+  // user opened the menu on.
+  property int menuClipId: -1
   property real menuX: 0
   property real menuY: 0
   property var menuActions: []
@@ -74,8 +79,10 @@ Panel {
   property int maxClips: 1000
   property bool ignoreConfidentialCopies: true
   property bool closePanelAfterAction: true
-  property bool openAtCursorOnShortcut: false
   property bool pasteSelectedClipImmediately: false
+  // Assumed present until the probe says otherwise, so the row does not flash
+  // "install wtype" on every open for the people who have it.
+  property bool wtypeAvailable: true
 
   // Chip label -> backend `--filter` value. Order and wording mirror
   // PopupHeader.tsx exactly; there is deliberately no "Pinned" chip because
@@ -94,11 +101,6 @@ Panel {
   readonly property string cliPath: root.pluginDir + "/bin/clipbasket-omarchy"
   property bool isDefaultShortcut: false
   property bool shortcutBusy: false
-  // Bumped on every probe result, including one that changes nothing. Toggle
-  // re-syncs off this rather than off isDefaultShortcut: a click breaks the
-  // Toggle's own `checked` binding, and a refused make-default leaves the value
-  // unchanged -- so "nothing changed" is exactly the case that has to re-assert.
-  property int shortcutProbeRevision: 0
   // Empty means "no compositor binding recorded yet"; the compositor owns it.
   readonly property string shortcutLabelText: root.globalShortcut.length > 0 ? root.globalShortcut : "Unbound"
 
@@ -122,9 +124,22 @@ Panel {
   readonly property string glyphUnsaved:  "\uf097"  // bookmark-o
   readonly property string glyphTrash:    "\uf014"  // trash-o
 
-  // Armed-delete tint. Omarchy's palette exposes no danger role, so the one
-  // literal lives here instead of being repeated at every call site.
-  readonly property color dangerTint: "#ff9b90"
+  // Every subtle surface in this panel was white at a low alpha, which is an
+  // invisible no-op on Omarchy's light themes -- the Toggle's off state
+  // disappeared completely, and the search field lost its border. Derived from
+  // the theme's own foreground instead, so an overlay is always the opposite of
+  // whatever it sits on.
+  function fg(a) {
+    return Qt.rgba(root.barForeground.r, root.barForeground.g, root.barForeground.b, a);
+  }
+
+  // Armed-delete tint. Omarchy's palette exposes no danger role, so this is
+  // derived rather than named: a light foreground means a dark theme and wants
+  // the light red, while a dark foreground means a light theme, where #ff9b90
+  // is a pale wash nobody would read as a warning.
+  readonly property color dangerTint: root.barForeground.hslLightness > 0.5
+    ? "#ff9b90"
+    : "#b3261e"
 
   // Style carries no documented monospace token; probing for one keeps us on a
   // token if the theme grows it, and otherwise falls back to Fontconfig's
@@ -144,18 +159,37 @@ Panel {
     return decodeURIComponent(u);
   }
 
-  // Every invocation is wrapped so a missing binary degrades to a usable empty
-  // state instead of throwing: stderr is dropped and `fallback` is echoed.
-  function dbCmd(args, fallback) {
-    return "export PATH=" + shq(root.pluginDir + "/bin") + ":$PATH; "
-         + "clipbasket-db " + args + " 2>/dev/null || printf %s " + shq(fallback);
+  // A failing invocation prints this instead of the data it could not fetch.
+  // It has to be valid JSON -- every caller parses -- and it must not be
+  // mistakable for a legitimate result, which is why it is not `[]`: an empty
+  // array from a missing clipbasket-db, a missing sqlite3 or an unreadable
+  // database renders as "Ready when you are", telling the user their history is
+  // empty when the truth is that nothing could be read.
+  readonly property string dbErrorSentinel: '{"clipbasketError":"unavailable"}'
+
+  function isDbError(parsed) {
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        && parsed.clipbasketError === "unavailable";
   }
 
+  // Every invocation is wrapped so a missing binary degrades to a reported
+  // failure instead of throwing: stderr is dropped and the sentinel is echoed.
+  function dbCmd(args) {
+    return "export PATH=" + shq(root.pluginDir + "/bin") + ":$PATH; "
+         + "clipbasket-db " + args + " 2>/dev/null || printf %s " + shq(root.dbErrorSentinel);
+  }
+
+  // encodeURI leaves #, ? and + alone because they are legal URI syntax, which
+  // is exactly wrong for a filename: a thumbnail of "Screenshot #3.png" becomes
+  // a URL with a fragment and silently renders nothing. Each segment is encoded
+  // separately so the separators survive and everything else is escaped.
   function fileUrl(path) {
     if (!path) return "";
     var p = String(path);
     if (p.indexOf("file://") === 0) return p;
-    return "file://" + encodeURI(p);
+    var parts = p.split("/");
+    for (var i = 0; i < parts.length; i++) parts[i] = encodeURIComponent(parts[i]);
+    return "file://" + parts.join("/");
   }
 
   function num(value, fallback) {
@@ -324,7 +358,7 @@ Panel {
     };
   }
 
-  function appendPage(clips, replace) {
+  function appendPage(clips, replace, requestedLimit) {
     if (replace) {
       clipModel.clear();
       root.loadedCount = 0;
@@ -332,12 +366,23 @@ Panel {
     }
     var sorted = root.sortPage(clips);
     for (var i = 0; i < sorted.length; i++) {
-      var row = root.toRow(sorted[i]);
-      if (row.section === "Pinned") root.pinnedCount += 1;
-      clipModel.append(row);
+      clipModel.append(root.toRow(sorted[i]));
     }
     root.loadedCount += clips.length;
-    root.hasMore = clips.length >= root.pageSize;
+    root.hasMore = clips.length >= requestedLimit;
+    root.recomputePinnedCount();
+  }
+
+  // ---- item 15: pinned rows are counted from the model, never accumulated.
+  // Incrementing on append alone went stale the moment a row was deleted or
+  // unpinned, and the count pill is the only thing telling the user how many
+  // pins the section holds.
+  function recomputePinnedCount() {
+    var n = 0;
+    for (var i = 0; i < clipModel.count; i++) {
+      if (clipModel.get(i).section === "Pinned") n += 1;
+    }
+    root.pinnedCount = n;
   }
 
   property int pinnedCount: 0
@@ -346,8 +391,8 @@ Panel {
 
   property bool replaceOnNextPage: true
 
-  function listArgs(offset) {
-    var args = "list --limit " + root.pageSize + " --offset " + offset + " --filter " + root.filter;
+  function listArgs(offset, limit) {
+    var args = "list --limit " + limit + " --offset " + offset + " --filter " + root.filter;
     if (root.query.length > 0) args += " --query " + root.shq(root.query);
     return args;
   }
@@ -361,13 +406,39 @@ Panel {
     return args;
   }
 
-  function reload() {
+  // Every list request carries a sequence number that the shell echoes back on
+  // its own first line, and a response whose sequence is not the current one is
+  // dropped. Killing a Process does not cancel the StdioCollector that is
+  // already collecting for it, so without this a page-2 response could arrive
+  // after a new search had reset the query and be applied as if it were page 1
+  // of the new one.
+  property int listSeq: 0
+  property var listRequest: null
+
+  function sendList(replace, offset, limit, keepScroll) {
+    root.listSeq += 1;
+    root.listRequest = {
+      seq: root.listSeq,
+      replace: replace === true,
+      limit: limit,
+      keepScroll: keepScroll === true ? clipList.contentY : -1
+    };
     if (listProc.running) listProc.running = false;
+    listProc.command = ["sh", "-c",
+      "printf '%s\\n' " + root.listSeq + "; " + root.dbCmd(root.listArgs(offset, limit))];
+    listProc.running = true;
+  }
+
+  // `keepDepth` is for the reload that follows a mutation: pin, save and delete
+  // all re-sort the list underneath us, and re-reading only the first page
+  // would throw away every row the user had scrolled to and send them back to
+  // the top. Ask for as many rows as are already on screen instead.
+  function reload(keepDepth) {
+    var deep = keepDepth === true && root.loadedCount > root.pageSize;
     root.replaceOnNextPage = true;
     root.loading = true;
-    listProc.command = ["sh", "-c", root.dbCmd(root.listArgs(0), "[]")];
-    listProc.running = true;
-    countProc.command = ["sh", "-c", root.dbCmd(root.countArgs(), "{}")];
+    root.sendList(true, 0, deep ? root.loadedCount : root.pageSize, deep);
+    countProc.command = ["sh", "-c", root.dbCmd(root.countArgs())];
     countProc.running = true;
   }
 
@@ -375,11 +446,15 @@ Panel {
     if (root.loadingMore || root.loading || !root.hasMore || listProc.running) return;
     root.loadingMore = true;
     root.replaceOnNextPage = false;
-    listProc.command = ["sh", "-c", root.dbCmd(root.listArgs(root.loadedCount), "[]")];
-    listProc.running = true;
+    root.sendList(false, root.loadedCount, root.pageSize, false);
   }
 
-  function refresh() { root.reload(); settingsProbe.running = true; root.probeDefaultShortcut(); }
+  function refresh() {
+    root.reload();
+    settingsProbe.running = true;
+    root.probeDefaultShortcut();
+    if (!wtypeProbe.running) wtypeProbe.running = true;
+  }
   function openFromHotkey() { root.controller.show(); }
 
   onOpenedChanged: {
@@ -424,19 +499,37 @@ Panel {
     running: false
     stdout: StdioCollector {
       onStreamFinished: {
-        var wasReplace = root.replaceOnNextPage;
+        // First line is the sequence number this request was sent with; the
+        // rest is the payload.
+        var raw = String(text);
+        var nl = raw.indexOf("\n");
+        var seq = nl >= 0 ? parseInt(raw.substring(0, nl), 10) : NaN;
+        var body = nl >= 0 ? raw.substring(nl + 1) : raw;
+        var req = root.listRequest;
+        // A response for a request that has already been superseded describes a
+        // query, filter or offset that is no longer on screen. Drop it whole:
+        // applying it would replace the current results with stale rows.
+        if (!req || !isFinite(seq) || seq !== req.seq) return;
+
         root.loading = false;
         root.loadingMore = false;
+        var wasReplace = req.replace;
         var parsed = null;
-        try { parsed = JSON.parse(String(text).trim()); } catch (e) { parsed = null; }
+        try { parsed = JSON.parse(String(body).trim()); } catch (e) { parsed = null; }
         if (parsed === null || !Array.isArray(parsed)) {
-          if (wasReplace) { clipModel.clear(); root.loadedCount = 0; root.pinnedCount = 0; root.hasMore = false; }
-          root.warning = "Unable to load clips";
+          if (wasReplace) { clipModel.clear(); root.loadedCount = 0; root.pinnedCount = 0; }
+          // Unconditional: a failed page-2 fetch that leaves hasMore true is
+          // retried on every scroll delta for as long as the user keeps
+          // scrolling.
+          root.hasMore = false;
+          root.warning = root.isDbError(parsed)
+            ? "Clipbasket can't read your history"
+            : "Unable to load clips";
           root.loaded = true;
           return;
         }
         root.warning = "";
-        root.appendPage(parsed, wasReplace);
+        root.appendPage(parsed, wasReplace, req.limit);
         root.loaded = true;
         if (wasReplace) {
           // Pin toggles and copies both re-sort the model, so an open detail
@@ -452,6 +545,15 @@ Panel {
             root.detailSaved = kept.saved === true;
             clipList.currentIndex = keep;
             clipList.positionViewAtIndex(keep, ListView.Contain);
+          } else if (req.keepScroll >= 0) {
+            // A reload after pin/save/delete re-read everything the user had
+            // scrolled to, so put them back where they were rather than at the
+            // top of a list they have to scroll through again.
+            clipList.currentIndex = clipModel.count > 0
+              ? Math.min(clipList.currentIndex < 0 ? 0 : clipList.currentIndex, clipModel.count - 1)
+              : -1;
+            clipList.contentY = Math.max(0,
+              Math.min(req.keepScroll, Math.max(0, clipList.contentHeight - clipList.height)));
           } else {
             clipList.currentIndex = clipModel.count > 0 ? 0 : -1;
             clipList.positionViewAtBeginning();
@@ -468,6 +570,10 @@ Panel {
       onStreamFinished: {
         try {
           var c = JSON.parse(String(text).trim());
+          // A failed count must not read as "0 clips"; keeping the last known
+          // numbers is the honest degradation, and the warning line above
+          // already says the history could not be read.
+          if (root.isDbError(c)) return;
           root.totalCount = root.num(c.total, 0);
           root.matchingCount = root.num(c.filtered, root.totalCount);
         } catch (e) { /* leave the previous counts alone */ }
@@ -485,10 +591,12 @@ Panel {
         if (!root.detailOpen) return;
         var parsed = null;
         try { parsed = JSON.parse(String(text).trim()); } catch (e) { parsed = null; }
-        if (!parsed || typeof parsed !== "object") {
+        if (!parsed || typeof parsed !== "object" || root.isDbError(parsed)) {
           root.detailLoading = false;
           root.detailClip = null;
-          root.detailError = "Unable to load this clip.";
+          root.detailError = root.isDbError(parsed)
+            ? "Clipbasket can't read your history."
+            : "Unable to load this clip.";
           return;
         }
         // A fast Enter-Escape-Enter run can land an older response after the
@@ -566,8 +674,10 @@ Panel {
       } else if (root.actionRefreshPending) {
         root.actionRefreshPending = false;
         // Counts and pin ordering both change under us; a full reload keeps
-        // the sections contiguous instead of patching rows in place.
-        if (root.opened) root.reload();
+        // the sections contiguous instead of patching rows in place. `true`
+        // re-reads to the depth already on screen and restores the scroll
+        // position, so pinning row 80 does not collapse the list to 50 rows.
+        if (root.opened) root.reload(true);
       }
     }
   }
@@ -611,13 +721,14 @@ Panel {
     if (!row) return;
     root.clearTransientState();
     // `copy` also bumps created_at, so an open panel has to re-read.
-    root.runAction(root.dbCmd("copy " + row.clipId, ""), !root.closePanelAfterAction);
+    root.runAction(root.dbCmd("copy " + row.clipId), !root.closePanelAfterAction);
     if (root.closePanelAfterAction) {
       root.close();
       // Auto-paste only ever runs after the panel is gone, otherwise the
       // synthetic Ctrl+V lands in the panel instead of the focused window.
-      // No-ops silently when wtype is not installed.
-      if (root.pasteSelectedClipImmediately) {
+      // The wtype guard stays in the command as well as in the setting: the
+      // binary can be uninstalled between the probe and the keystroke.
+      if (root.pasteSelectedClipImmediately && root.wtypeAvailable) {
         root.runAction("command -v wtype >/dev/null 2>&1 && sleep 0.12 && wtype -M ctrl -P v -p v -m ctrl", false);
       }
     } else {
@@ -653,7 +764,7 @@ Panel {
     if (row.hasHtml === true) {
       root.markdownClipId = row.clipId;
       if (markdownProc.running) markdownProc.running = false;
-      markdownProc.command = ["sh", "-c", root.dbCmd("markdown " + row.clipId, "{}")];
+      markdownProc.command = ["sh", "-c", root.dbCmd("markdown " + row.clipId)];
       markdownProc.running = true;
       return;
     }
@@ -714,8 +825,15 @@ Panel {
     var next = !row.pinned;
     root.clearTransientState();
     clipModel.setProperty(index, "pinned", next);
+    // The section role decides which header the row sits under and feeds the
+    // pinned count pill, so it has to move with the pin rather than wait for
+    // the reload -- otherwise the row stays visually in "Now" until the
+    // response lands, and the pill is wrong in the meantime.
+    clipModel.setProperty(index, "section",
+      next ? "Pinned" : root.sectionFor({ pinned: false, created_at: row.createdAt }));
+    root.recomputePinnedCount();
     if (root.detailOpen && row.clipId === root.detailClipId) root.detailPinned = next;
-    root.runAction(root.dbCmd("pin " + row.clipId + (next ? " --on" : " --off"), ""), true);
+    root.runAction(root.dbCmd("pin " + row.clipId + (next ? " --on" : " --off")), true);
   }
 
   function toggleSaved(index) {
@@ -725,7 +843,7 @@ Panel {
     root.clearTransientState();
     clipModel.setProperty(index, "saved", next);
     if (root.detailOpen && row.clipId === root.detailClipId) root.detailSaved = next;
-    root.runAction(root.dbCmd("save " + row.clipId + (next ? " --on" : " --off"), ""), true);
+    root.runAction(root.dbCmd("save " + row.clipId + (next ? " --on" : " --off")), true);
   }
 
   // Two-step confirmation only for protected clips (saved or pinned), exactly
@@ -749,9 +867,10 @@ Panel {
     var id = row.clipId;
     clipModel.remove(index);
     root.loadedCount = Math.max(0, root.loadedCount - 1);
+    root.recomputePinnedCount();
     // Selection takes over the removed row's index, clamped to the last row.
     clipList.currentIndex = clipModel.count === 0 ? -1 : Math.min(index, clipModel.count - 1);
-    root.runAction(root.dbCmd("delete " + id, ""), true);
+    root.runAction(root.dbCmd("delete " + id), true);
   }
 
   // ----------------------------------------------------------- copy variants
@@ -774,15 +893,17 @@ Panel {
     if (actions.length === 0) return;
     var point = item.mapToItem(keyCatcher, 0, item.height);
     root.menuActions = actions;
-    root.menuClipRow = index;
+    root.menuClipId = row.clipId;
     root.menuX = point.x;
     root.menuY = point.y + Style.space(4);
   }
 
-  function closeMenu() { root.menuClipRow = -1; root.menuActions = []; }
+  function closeMenu() { root.menuClipId = -1; root.menuActions = []; }
 
   function invokeMenuAction(actionId) {
-    var index = root.menuClipRow;
+    // Re-resolved at invoke time, so the action lands on the clip the menu was
+    // opened for even if the list has re-sorted since.
+    var index = root.indexOfClipId(root.menuClipId);
     root.closeMenu();
     if (index < 0) return;
     if (actionId === "markdown") root.copyMarkdown(index);
@@ -867,10 +988,17 @@ Panel {
     // for the selection the user comes back to.
     clipList.currentIndex = index;
     if (detailProc.running) detailProc.running = false;
-    detailProc.command = ["sh", "-c", root.dbCmd("get " + row.clipId, "null")];
+    detailProc.command = ["sh", "-c", root.dbCmd("get " + row.clipId)];
     detailProc.running = true;
-    // The view has to exist before it can hold focus.
-    Qt.callLater(function () { detailBody.contentY = 0; detailView.forceActiveFocus(); });
+    // The view has to exist before it can hold focus -- and by the time this
+    // runs the panel may have been closed, or the detail view already left,
+    // in which case forcing focus into a hidden view steals it from whatever
+    // has it now.
+    Qt.callLater(function () {
+      if (!root.detailOpen) return;
+      detailBody.contentY = 0;
+      detailView.forceActiveFocus();
+    });
   }
 
   function resetDetail() {
@@ -899,6 +1027,11 @@ Panel {
     if (root.indexOfClipId(id) < 0) root.closeDetail();
   }
 
+  function scrollSettings(delta) {
+    var max = Math.max(0, settingsView.contentHeight - settingsView.height);
+    settingsView.contentY = Math.min(max, Math.max(0, settingsView.contentY + delta));
+  }
+
   function scrollDetail(delta) {
     var max = Math.max(0, detailBody.contentHeight - detailBody.height);
     detailBody.contentY = Math.min(max, Math.max(0, detailBody.contentY + delta));
@@ -924,9 +1057,16 @@ Panel {
   // Shared by the search field and the key catcher so navigation works no
   // matter which of the two currently owns focus. Returns true when handled.
   function handleNavKey(event) {
-    if (root.settingsOpen) return false;
+    // Escape and Tab belong to PanelKeyCatcher (close, and switch panels). They
+    // are never accepted here, at any depth, so they keep bubbling to it.
+    if (event.key === Qt.Key_Escape || event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+      // The one exception: an open copy-variant menu swallows Escape to close
+      // itself rather than the whole panel.
+      if (root.menuClipId >= 0 && event.key === Qt.Key_Escape) { root.closeMenu(); return true; }
+      return false;
+    }
+    if (root.settingsOpen) return root.handleSettingsKey(event);
     if (root.detailOpen) return root.handleDetailKey(event);
-    if (root.menuClipRow >= 0 && event.key === Qt.Key_Escape) { root.closeMenu(); return true; }
     switch (event.key) {
       case Qt.Key_Down:     root.moveSelection(1); return true;
       case Qt.Key_Up:       root.moveSelection(-1); return true;
@@ -940,12 +1080,9 @@ Panel {
         root.selectAbsolute(clipModel.count - 1); return true;
       case Qt.Key_Return:
       case Qt.Key_Enter:
-        // Enter inspects, the way the desktop popup's row body does. Ctrl+Enter
-        // keeps the one-keystroke copy for anyone who lived on plain Enter.
-        if (clipModel.count > 0) {
-          if (event.modifiers & Qt.ControlModifier) root.copyClip(clipList.currentIndex);
-          else root.openDetail(clipList.currentIndex);
-        }
+        // Enter copies -- this is the product's primary keystroke, and it is
+        // what the desktop app binds it to. Inspecting a clip is Right or `i`.
+        if (clipModel.count > 0) root.copyClip(clipList.currentIndex);
         return true;
       case Qt.Key_Right:
         // Same guard as Home/End: the search field's own cursor keys win while
@@ -953,15 +1090,44 @@ Panel {
         if (searchInput.activeFocus && searchInput.text.length > 0) return false;
         if (clipModel.count > 0) root.openDetail(clipList.currentIndex);
         return true;
+      case Qt.Key_I:
+        // The desktop app's second inspect key. Only reachable when the search
+        // field does not have focus, because there it is just the letter i --
+        // a shortcut that eats typing is worse than one nobody finds.
+        if (searchInput.activeFocus) return false;
+        if (event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) return false;
+        if (clipModel.count > 0) root.openDetail(clipList.currentIndex);
+        return true;
       case Qt.Key_Delete:
       case Qt.Key_Backspace:
         // Plain Delete/Backspace must still edit the search text. Deleting a
         // clip needs either an empty search box or an explicit Ctrl.
         if ((event.modifiers & Qt.ControlModifier) || searchInput.text.length === 0) {
+          // Auto-repeat is never a considered decision to delete. Held down,
+          // the key destroys roughly fifteen clips a second and there is no
+          // undo; the repeats are swallowed rather than passed on so they
+          // cannot fall through to the search field either.
+          if (event.isAutoRepeat) return true;
           if (clipModel.count > 0) root.deleteClip(clipList.currentIndex);
           return true;
         }
         return false;
+    }
+    return false;
+  }
+
+  // Settings-page keys. The page is a Flickable with no focusable rows, so the
+  // navigation keys scroll it; without this they fall through to the list
+  // behind and move a selection the user cannot see.
+  function handleSettingsKey(event) {
+    switch (event.key) {
+      case Qt.Key_Left:     root.settingsOpen = false; return true;
+      case Qt.Key_Down:     root.scrollSettings(Style.space(48)); return true;
+      case Qt.Key_Up:       root.scrollSettings(-Style.space(48)); return true;
+      case Qt.Key_PageDown: root.scrollSettings(settingsView.height * 0.9); return true;
+      case Qt.Key_PageUp:   root.scrollSettings(-settingsView.height * 0.9); return true;
+      case Qt.Key_Home:     settingsView.contentY = 0; return true;
+      case Qt.Key_End:      root.scrollSettings(settingsView.contentHeight); return true;
     }
     return false;
   }
@@ -984,11 +1150,17 @@ Panel {
       case Qt.Key_Home:     detailBody.contentY = 0; return true;
       case Qt.Key_End:      root.scrollDetail(detailBody.contentHeight); return true;
       case Qt.Key_Delete:
+        // See handleNavKey: a held Delete must not walk the whole history.
+        if (event.isAutoRepeat) return true;
         root.deleteFromDetail(); return true;
       case Qt.Key_Backspace:
         // Backspace is a reading-position key inside the selectable text
         // blocks, so deleting from here needs the explicit modifier.
-        if (event.modifiers & Qt.ControlModifier) { root.deleteFromDetail(); return true; }
+        if (event.modifiers & Qt.ControlModifier) {
+          if (event.isAutoRepeat) return true;
+          root.deleteFromDetail();
+          return true;
+        }
         return false;
     }
     return false;
@@ -1003,23 +1175,48 @@ Panel {
       maxClips: root.maxClips,
       ignoreConfidentialCopies: root.ignoreConfidentialCopies,
       closePanelAfterAction: root.closePanelAfterAction,
-      openAtCursorOnShortcut: root.openAtCursorOnShortcut,
       pasteSelectedClipImmediately: root.pasteSelectedClipImmediately
     });
     var dir = "\"" + root.settingsDir + "\"";
     var file = "\"" + root.settingsPath + "\"";
+    // The temporary file has to live in the same directory as the target.
+    // mktemp's default is /tmp, which is a tmpfs on Arch, so the mv was a
+    // cross-filesystem copy-and-unlink rather than an atomic rename -- and a
+    // crash partway through left a truncated settings.json that the next write
+    // read as invalid and silently replaced with `{}`, taking every setting
+    // with it.
+    var tmpl = "\"" + root.settingsDir + "/.settings.XXXXXX\"";
     root.runAction(
-      "mkdir -p " + dir + " && tmp=$(mktemp) && "
-      + "{ jq -e . " + file + " 2>/dev/null || printf '{}'; } "
+      "mkdir -p " + dir + " && tmp=$(mktemp " + tmpl + ") && "
+      + "{ { jq -e . " + file + " 2>/dev/null || printf '{}'; } "
       + "| jq --argjson patch " + root.shq(payload) + " '. * $patch' > \"$tmp\" "
-      + "&& mv \"$tmp\" " + file, false);
+      + "&& mv \"$tmp\" " + file + "; } || rm -f \"$tmp\"", false);
   }
 
   // pasteSelectedClipImmediately requires closePanelAfterAction: pasting into
   // the focused window while the panel still holds focus pastes into the panel.
+  // It also requires wtype, which is what actually performs the keystroke --
+  // without it the setting can only ever describe something that will not
+  // happen, so it is turned off rather than left on and silently inert.
   function normalizeSettings() {
-    if (root.pasteSelectedClipImmediately && !root.closePanelAfterAction) {
+    if (root.pasteSelectedClipImmediately
+        && (!root.closePanelAfterAction || !root.wtypeAvailable)) {
       root.pasteSelectedClipImmediately = false;
+    }
+  }
+
+  // Wayland has no system-wide synthetic-input API, so auto-paste is only as
+  // real as wtype. Probed rather than assumed: the setting has to be able to
+  // say "unavailable", which is a different statement from "off".
+  Process {
+    id: wtypeProbe
+    command: ["sh", "-c", "command -v wtype >/dev/null 2>&1 && printf 1 || printf 0"]
+    running: false
+    stdout: StdioCollector {
+      onStreamFinished: {
+        root.wtypeAvailable = String(text).trim() === "1";
+        root.normalizeSettings();
+      }
     }
   }
 
@@ -1032,10 +1229,11 @@ Panel {
         try {
           var s = JSON.parse(String(text).trim());
           if ("globalShortcut" in s) root.globalShortcut = String(s.globalShortcut || "");
-          if ("maxClips" in s) root.maxClips = root.num(s.maxClips, root.maxClips);
+          // Clamped on the way in too, so a hand-edited file out of range is
+          // corrected rather than carried around.
+          if ("maxClips" in s) root.maxClips = Math.max(50, Math.min(100000, Math.round(root.num(s.maxClips, root.maxClips))));
           if ("ignoreConfidentialCopies" in s) root.ignoreConfidentialCopies = s.ignoreConfidentialCopies === true;
           if ("closePanelAfterAction" in s) root.closePanelAfterAction = s.closePanelAfterAction === true;
-          if ("openAtCursorOnShortcut" in s) root.openAtCursorOnShortcut = s.openAtCursorOnShortcut === true;
           if ("pasteSelectedClipImmediately" in s) root.pasteSelectedClipImmediately = s.pasteSelectedClipImmediately === true;
           root.normalizeSettings();
         } catch (e) {}
@@ -1066,10 +1264,7 @@ Panel {
     command: ["sh", "-c", "[ -f \"" + root.defaultStatePath + "\" ] && printf 1 || printf 0"]
     running: false
     stdout: StdioCollector {
-      onStreamFinished: {
-        root.isDefaultShortcut = String(text).trim() === "1";
-        root.shortcutProbeRevision++;
-      }
+      onStreamFinished: root.isDefaultShortcut = String(text).trim() === "1"
     }
   }
 
@@ -1089,7 +1284,7 @@ Panel {
   // ------------------------------------------------------------ empty states
 
   readonly property string emptyTitle: {
-    if (root.warning.length > 0) return "Unable to load clips";
+    if (root.warning.length > 0) return root.warning;
     if (root.query.length > 0) return "No matching clips";
     switch (root.filter) {
       case "saved": return "You don't have any saved clips";
@@ -1102,7 +1297,7 @@ Panel {
   }
 
   readonly property string emptyDetail: {
-    if (root.warning.length > 0) return "Is clipbasket-db installed and on PATH?";
+    if (root.warning.length > 0) return "clipbasket-db could not be run, or the database could not be opened. Run clipbasket-omarchy doctor.";
     if (root.query.length > 0) return "";
     if (root.filter === "saved") return "Save clips to keep them handy here.";
     if (root.filter === "all") return "Copy anything — text, links, images and files land here automatically.";
@@ -1120,14 +1315,21 @@ Panel {
   }
 
   // ---- Reusable toggle, styled after the macOS switches in the real product.
+  // `checked` is a one-way binding onto the state that owns it, and the
+  // control never assigns to it. Flipping it here would overwrite the binding
+  // -- permanently, since a QML binding is destroyed by an assignment -- and
+  // the switch would then be unable to reflect a change it did not make: a
+  // rejected write, a settings file edited in a terminal, a value clamped on
+  // the way in. The handler receives what was asked for and the owner decides.
   component Toggle: Rectangle {
     id: sw
     property bool checked: false
-    signal toggled
+    property bool interactive: true
+    signal toggled(bool next)
     width: Style.space(38)
     height: Style.space(20)
     radius: height / 2
-    color: checked ? root.barForeground : Qt.rgba(1, 1, 1, 0.14)
+    color: checked ? root.barForeground : root.fg(0.14)
     Behavior on color { ColorAnimation { duration: 120 } }
 
     Rectangle {
@@ -1136,13 +1338,16 @@ Panel {
       radius: width / 2
       y: 2
       x: sw.checked ? parent.width - width - 2 : 2
-      color: sw.checked ? Color.background : Qt.rgba(1, 1, 1, 0.75)
+      color: sw.checked ? Color.background : root.fg(0.75)
       Behavior on x { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
     }
 
+    opacity: sw.interactive ? 1 : 0.4
+
     MouseArea {
       anchors.fill: parent
-      onClicked: { sw.checked = !sw.checked; sw.toggled(); }
+      enabled: sw.interactive
+      onClicked: sw.toggled(!sw.checked)
     }
   }
 
@@ -1206,9 +1411,9 @@ Panel {
     Rectangle {
       anchors.fill: parent
       radius: 8
-      color: Qt.rgba(1, 1, 1, 0.05)
+      color: root.fg(0.05)
       border.width: 1
-      border.color: Qt.rgba(1, 1, 1, 0.10)
+      border.color: root.fg(0.10)
     }
 
     Column {
@@ -1265,7 +1470,7 @@ Panel {
     Rectangle {
       anchors.fill: parent
       radius: 6
-      color: actArea.containsMouse ? Qt.rgba(1, 1, 1, 0.10) : "transparent"
+      color: actArea.containsMouse ? root.fg(0.10) : "transparent"
     }
 
     Text {
@@ -1303,23 +1508,23 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
       onCloseRequested: {
-        if (root.menuClipRow >= 0) root.closeMenu();
+        if (root.menuClipId >= 0) root.closeMenu();
         else if (root.detailOpen) root.closeDetail();
         else if (root.settingsOpen) root.settingsOpen = false;
         else root.close();
       }
       onTabRequested: function (direction) { root.switchPanel(direction); }
 
-      // Fallback navigation for the case where the key catcher, rather than
-      // the search field, owns active focus. These are distinct signals from
-      // Keys.onPressed, so PanelKeyCatcher's own Esc/Tab handling is untouched.
-      Keys.onUpPressed: function (event) { event.accepted = root.handleNavKey(event); }
-      Keys.onDownPressed: function (event) { event.accepted = root.handleNavKey(event); }
-      Keys.onLeftPressed: function (event) { event.accepted = root.handleNavKey(event); }
-      Keys.onRightPressed: function (event) { event.accepted = root.handleNavKey(event); }
-      Keys.onReturnPressed: function (event) { event.accepted = root.handleNavKey(event); }
-      Keys.onEnterPressed: function (event) { event.accepted = root.handleNavKey(event); }
-      Keys.onDeletePressed: function (event) { event.accepted = root.handleNavKey(event); }
+      // Navigation for the case where the key catcher, rather than the search
+      // field, owns active focus. One handler rather than a signal per key:
+      // PageUp, PageDown, Home, End and Backspace have no dedicated attached
+      // signal, so with the per-key form they only ever worked while the search
+      // field held focus -- which is not where focus is once the settings page
+      // or the detail view is open.
+      //
+      // handleNavKey never accepts Escape, Tab or Backtab, so PanelKeyCatcher's
+      // own close and panel-switch handling still sees them.
+      Keys.onPressed: function (event) { event.accepted = root.handleNavKey(event); }
 
       // ================= CLIP LIST =================
       Item {
@@ -1395,9 +1600,9 @@ Panel {
             x: Style.space(14)
             height: Style.space(30)
             radius: height / 2
-            color: Qt.rgba(1, 1, 1, 0.05)
+            color: root.fg(0.05)
             border.width: 1
-            border.color: Qt.rgba(1, 1, 1, searchInput.activeFocus ? 0.22 : 0.10)
+            border.color: root.fg(searchInput.activeFocus ? 0.22 : 0.10)
 
             Row {
               anchors.fill: parent
@@ -1459,9 +1664,9 @@ Panel {
                 height: Style.space(22)
                 width: chipText.implicitWidth + Style.space(18)
                 radius: height / 2
-                color: selected ? root.barForeground : Qt.rgba(1, 1, 1, 0.05)
+                color: selected ? root.barForeground : root.fg(0.05)
                 border.width: 1
-                border.color: Qt.rgba(1, 1, 1, selected ? 0 : 0.12)
+                border.color: root.fg(selected ? 0 : 0.12)
 
                 Text {
                   id: chipText
@@ -1532,7 +1737,7 @@ Panel {
                 width: pinCount.implicitWidth + Style.space(10)
                 height: Style.space(15)
                 radius: height / 2
-                color: Qt.rgba(1, 1, 1, 0.08)
+                color: root.fg(0.08)
                 Text {
                   id: pinCount
                   anchors.centerIn: parent
@@ -1584,7 +1789,7 @@ Panel {
             // from contentHeight. A varying row height turns that into a
             // feedback loop that visibly jitters the popup.
             height: Style.space(62)
-            color: selected ? Qt.rgba(1, 1, 1, 0.07) : "transparent"
+            color: selected ? root.fg(0.07) : "transparent"
 
             // Row body opens the detail view, as the desktop app's row does.
             // Copying stays an explicit act: the Copy button in the rail, or
@@ -1614,9 +1819,9 @@ Panel {
                 width: thumbImage.visible ? clipRow.visual.width : Style.space(40)
                 height: thumbImage.visible ? clipRow.visual.height : Style.space(40)
                 radius: 8
-                color: Qt.rgba(1, 1, 1, 0.06)
+                color: root.fg(0.06)
                 border.width: 1
-                border.color: Qt.rgba(1, 1, 1, 0.10)
+                border.color: root.fg(0.10)
                 clip: true
 
                 Image {
@@ -1696,7 +1901,7 @@ Panel {
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
                   spacing: Style.space(2)
-                  visible: clipRow.selected || root.menuClipRow === clipRow.rowIndex
+                  visible: clipRow.selected || root.menuClipId === clipRow.clipId
 
                   // Explicit "open the detail view" affordance. The row body
                   // does the same thing, but a chevron is the only visible
@@ -1800,7 +2005,7 @@ Panel {
                         anchors.fill: parent
                         hoverEnabled: true
                         onClicked: {
-                          if (root.menuClipRow === clipRow.rowIndex) root.closeMenu();
+                          if (root.menuClipId === clipRow.clipId) root.closeMenu();
                           else root.openMenu(clipRow.rowIndex, copySplit);
                         }
                       }
@@ -1900,13 +2105,13 @@ Panel {
       // rectangle cannot cut it off.
       MouseArea {
         anchors.fill: parent
-        visible: root.menuClipRow >= 0
+        visible: root.menuClipId >= 0
         onClicked: root.closeMenu()
         z: 50
       }
 
       Rectangle {
-        visible: root.menuClipRow >= 0
+        visible: root.menuClipId >= 0
         z: 51
         x: Math.max(Style.space(8), Math.min(root.menuX - width + Style.space(24), keyCatcher.width - width - Style.space(8)))
         y: Math.min(root.menuY, keyCatcher.height - height - Style.space(8))
@@ -1915,7 +2120,7 @@ Panel {
         radius: 8
         color: Color.background
         border.width: 1
-        border.color: Qt.rgba(1, 1, 1, 0.16)
+        border.color: root.fg(0.16)
 
         Column {
           id: menuColumn
@@ -1930,7 +2135,7 @@ Panel {
               width: parent.width
               height: Style.space(26)
               radius: 6
-              color: itemArea.containsMouse ? Qt.rgba(1, 1, 1, 0.10) : "transparent"
+              color: itemArea.containsMouse ? root.fg(0.10) : "transparent"
 
               Text {
                 anchors.left: parent.left
@@ -2041,9 +2246,9 @@ Panel {
               width: kindLabel.implicitWidth + Style.space(14)
               height: Style.space(18)
               radius: 4
-              color: Qt.rgba(1, 1, 1, 0.06)
+              color: root.fg(0.06)
               border.width: 1
-              border.color: Qt.rgba(1, 1, 1, 0.12)
+              border.color: root.fg(0.12)
 
               Text {
                 id: kindLabel
@@ -2121,9 +2326,9 @@ Panel {
               Rectangle {
                 anchors.fill: parent
                 radius: 8
-                color: Qt.rgba(1, 1, 1, 0.05)
+                color: root.fg(0.05)
                 border.width: 1
-                border.color: Qt.rgba(1, 1, 1, 0.10)
+                border.color: root.fg(0.10)
                 clip: true
 
                 Image {
@@ -2254,9 +2459,9 @@ Panel {
                 width: mdLabel.implicitWidth + Style.space(20)
                 height: Style.space(24)
                 radius: height / 2
-                color: mdArea.containsMouse ? Qt.rgba(1, 1, 1, 0.10) : "transparent"
+                color: mdArea.containsMouse ? root.fg(0.10) : "transparent"
                 border.width: 1
-                border.color: Qt.rgba(1, 1, 1, 0.16)
+                border.color: root.fg(0.16)
 
                 Text {
                   id: mdLabel
@@ -2372,9 +2577,9 @@ Panel {
             width: shortcutText.implicitWidth + Style.space(16)
             height: Style.space(22)
             radius: 4
-            color: Qt.rgba(1, 1, 1, 0.06)
+            color: root.fg(0.06)
             border.width: 1
-            border.color: Qt.rgba(1, 1, 1, 0.12)
+            border.color: root.fg(0.12)
             Text {
               id: shortcutText
               anchors.centerIn: parent
@@ -2393,19 +2598,9 @@ Panel {
             ? "Clipbasket owns the key. Turning this off gives it back to Omarchy's clipboard, exactly as it was."
             : "Omarchy's clipboard owns the key. Turning this on hands it to Clipbasket and steps Omarchy's overlay aside."
           Toggle {
-            id: defaultShortcutToggle
             checked: root.isDefaultShortcut
-            opacity: root.shortcutBusy ? 0.4 : 1
-            onToggled: {
-              if (root.shortcutBusy) { checked = root.isDefaultShortcut; return; }
-              root.setDefaultShortcut(checked);
-            }
-            Connections {
-              target: root
-              function onShortcutProbeRevisionChanged() {
-                defaultShortcutToggle.checked = root.isDefaultShortcut;
-              }
-            }
+            interactive: !root.shortcutBusy
+            onToggled: function (next) { root.setDefaultShortcut(next); }
           }
         }
 
@@ -2418,9 +2613,9 @@ Panel {
             width: Style.space(76)
             height: Style.space(24)
             radius: 4
-            color: Qt.rgba(1, 1, 1, 0.06)
+            color: root.fg(0.06)
             border.width: 1
-            border.color: Qt.rgba(1, 1, 1, maxInput.activeFocus ? 0.25 : 0.12)
+            border.color: root.fg(maxInput.activeFocus ? 0.25 : 0.12)
             TextInput {
               id: maxInput
               anchors.fill: parent
@@ -2428,11 +2623,28 @@ Panel {
               text: String(root.maxClips)
               color: root.barForeground
               horizontalAlignment: Text.AlignRight
-              validator: IntValidator { bottom: 50; top: 100000 }
+              // Digits only, but no range validator: IntValidator rejects an
+              // out-of-range value instead of clamping it, so typing 5 left the
+              // field showing 5 while the model kept 1000. The schema promises
+              // clamping, so the clamp happens on commit and the field is told
+              // what it actually became.
+              validator: RegularExpressionValidator { regularExpression: /[0-9]{0,6}/ }
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
               selectByMouse: true
-              onEditingFinished: { root.maxClips = parseInt(text) || root.maxClips; root.persist(); }
+              onEditingFinished: {
+                var n = parseInt(maxInput.text, 10);
+                if (!isFinite(n)) n = root.maxClips;
+                root.maxClips = Math.max(50, Math.min(100000, n));
+                maxInput.text = String(root.maxClips);
+                root.persist();
+              }
+              // The `text:` binding above dies on the first keystroke, so the
+              // field cannot follow root.maxClips on its own afterwards.
+              Connections {
+                target: root
+                function onMaxClipsChanged() { maxInput.text = String(root.maxClips); }
+              }
             }
           }
         }
@@ -2442,7 +2654,7 @@ Panel {
           subtitle: "Skip x-kde-passwordManagerHint and CLIPBOARD_STATE=sensitive"
           Toggle {
             checked: root.ignoreConfidentialCopies
-            onToggled: { root.ignoreConfidentialCopies = checked; root.persist(); }
+            onToggled: function (next) { root.ignoreConfidentialCopies = next; root.persist(); }
           }
         }
 
@@ -2453,8 +2665,8 @@ Panel {
           subtitle: "Hide the popup after selecting or copying a clip"
           Toggle {
             checked: root.closePanelAfterAction
-            onToggled: {
-              root.closePanelAfterAction = checked;
+            onToggled: function (next) {
+              root.closePanelAfterAction = next;
               root.normalizeSettings();
               root.persist();
             }
@@ -2462,25 +2674,17 @@ Panel {
         }
 
         SettingRow {
-          title: "Open at cursor on shortcut"
-          subtitle: "Show the popup near the pointer instead of under the bar widget"
-          Toggle {
-            checked: root.openAtCursorOnShortcut
-            onToggled: { root.openAtCursorOnShortcut = checked; root.persist(); }
-          }
-        }
-
-        SettingRow {
           title: "Paste immediately"
-          subtitle: root.closePanelAfterAction
-            ? "After picking a clip, paste it into the focused window (needs wtype)"
-            : "Auto-paste requires closing the popup first."
+          subtitle: !root.wtypeAvailable
+            ? "Install wtype to enable automatic paste"
+            : root.closePanelAfterAction
+              ? "After picking a clip, paste it into the focused window"
+              : "Auto-paste requires closing the popup first."
           Toggle {
             checked: root.pasteSelectedClipImmediately
-            opacity: root.closePanelAfterAction ? 1 : 0.4
-            onToggled: {
-              if (!root.closePanelAfterAction) { checked = false; return; }
-              root.pasteSelectedClipImmediately = checked;
+            interactive: root.closePanelAfterAction && root.wtypeAvailable
+            onToggled: function (next) {
+              root.pasteSelectedClipImmediately = next;
               root.persist();
             }
           }
@@ -2495,7 +2699,7 @@ Panel {
             width: verText.implicitWidth + Style.space(14)
             height: Style.space(20)
             radius: 4
-            color: Qt.rgba(1, 1, 1, 0.06)
+            color: root.fg(0.06)
             Text {
               id: verText
               anchors.centerIn: parent
