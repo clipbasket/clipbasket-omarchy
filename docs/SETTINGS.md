@@ -133,6 +133,17 @@ Requires `closePanelAfterAction` to be on. This constraint is ported verbatim
 from the macOS app: pasting while the panel still has focus pastes into the
 panel.
 
+**Known gap: a paste that fails at runtime is silent.** The panel reports
+`wtype` being *absent* — the setting reads "Install wtype to enable automatic
+paste" and cannot be switched on. But if `wtype` is installed and the keystroke
+itself fails, nothing is shown. By the time the paste runs the panel has closed,
+which is a precondition of pasting at all, so there is no surface left to render
+a warning on; the macOS app shows one because it owns a window that is still
+there. Reporting it properly needs a desktop notification, which would mean a
+new dependency for one error path, so it is deliberately not done rather than
+overlooked. The clip is still on the clipboard in every case — a failed
+auto-paste costs a Ctrl+V, not the copy.
+
 ## Settings that are not here
 
 These exist in the macOS and Windows apps and are absent on purpose. They are not

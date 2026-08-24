@@ -19,6 +19,12 @@ Panel {
   moduleName: "clipbasket.clipboard"
   manageIpc: false
 
+  // The one place the version is written in this file. It has to match
+  // manifest.json's "version" -- there is no way for QML to read the manifest,
+  // so this is a copy by necessity and the only defence is that it is a single
+  // copy.
+  readonly property string pluginVersion: "1.0.0"
+
   property var anchorItem: null
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
@@ -83,6 +89,9 @@ Panel {
   // Assumed present until the probe says otherwise, so the row does not flash
   // "install wtype" on every open for the people who have it.
   property bool wtypeAvailable: true
+  // The opposite default: an Open action that does nothing is worse than one
+  // that appears a frame late, so it stays hidden until the probe confirms it.
+  property bool xdgOpenAvailable: false
 
   // Chip label -> backend `--filter` value. Order and wording mirror
   // PopupHeader.tsx exactly; there is deliberately no "Pinned" chip because
@@ -123,6 +132,9 @@ Panel {
   readonly property string glyphSaved:    "\uf02e"  // bookmark (solid)
   readonly property string glyphUnsaved:  "\uf097"  // bookmark-o
   readonly property string glyphTrash:    "\uf014"  // trash-o
+  readonly property string glyphOpen:     "\uf08e"  // external-link
+  readonly property string glyphReveal:   "\uf07c"  // folder-open-o
+  readonly property string glyphExpand:   "\uf065"  // expand
 
   // Every subtle surface in this panel was white at a low alpha, which is an
   // invisible no-op on Omarchy's light themes -- the Toggle's off state
@@ -453,7 +465,7 @@ Panel {
     root.reload();
     settingsProbe.running = true;
     root.probeDefaultShortcut();
-    if (!wtypeProbe.running) wtypeProbe.running = true;
+    if (!toolProbe.running) toolProbe.running = true;
   }
   function openFromHotkey() { root.controller.show(); }
 
@@ -712,6 +724,85 @@ Panel {
     return -1;
   }
 
+  // A clip is openable if it is a link, or a text clip whose entire payload is
+  // one bare URL -- the capture classifier is deliberately conservative, so a
+  // copied address with an unusual scheme or a trailing character lands as
+  // text, and refusing to open it would be a distinction only the database
+  // cares about.
+  //
+  // Matched with indexOf rather than a regular expression on purpose: Qt
+  // 6.9's qmllint allocates without bound on a regex literal reached from a
+  // loop body, and this file is linted. There is no reason to hand it one.
+  readonly property var openableSchemes: ["https://", "http://", "ftp://"]
+
+  function urlForRow(row) {
+    if (!row) return "";
+    var t = String(row.payload || "").trim();
+    if (t.length === 0 || t.length > 2048) return "";
+    // A URL with whitespace in it is a sentence that begins with a URL.
+    if (t.indexOf(" ") >= 0 || t.indexOf("\n") >= 0 || t.indexOf("\t") >= 0) return "";
+    if (row.kind === "url") return t;
+    if (row.kind !== "text") return "";
+    var lower = t.toLowerCase();
+    for (var i = 0; i < root.openableSchemes.length; i++) {
+      var scheme = root.openableSchemes[i];
+      if (lower.indexOf(scheme) === 0 && t.length > scheme.length) return t;
+    }
+    return "";
+  }
+
+  function canOpenUrl(row) {
+    return root.xdgOpenAvailable && root.urlForRow(row).length > 0;
+  }
+
+  // Detached, and never waited on: xdg-open blocks for as long as the handler
+  // takes to start, which for a cold browser is seconds, and actionProc is a
+  // serialised queue that everything else is behind. The `command -v` guard
+  // stays in the command as well as in the caller, because the binary can be
+  // removed between the probe and the click.
+  function openExternally(target) {
+    if (!target) return;
+    root.runAction("command -v xdg-open >/dev/null 2>&1 && "
+                   + "setsid xdg-open " + root.shq(target) + " >/dev/null 2>&1 &", false);
+  }
+
+  function openUrl(index) {
+    var url = root.urlForRow(root.rowAt(index));
+    if (url.length === 0 || !root.xdgOpenAvailable) return;
+    root.clearTransientState();
+    root.openExternally(url);
+    if (root.closePanelAfterAction) root.close();
+    else root.showNotice("Opening link…");
+  }
+
+  // Reveal is Open pointed at the parent directory -- there is no portable
+  // "select this file in the file manager" on Linux, and opening the folder is
+  // what every desktop actually does with the request.
+  function openFilePath(path, reveal) {
+    if (!path || !root.xdgOpenAvailable) return;
+    var target = String(path);
+    if (reveal) {
+      var trimmed = target;
+      while (trimmed.length > 1 && trimmed.charAt(trimmed.length - 1) === "/") {
+        trimmed = trimmed.substring(0, trimmed.length - 1);
+      }
+      var cut = trimmed.lastIndexOf("/");
+      target = cut > 0 ? trimmed.substring(0, cut) : "/";
+    }
+    root.clearTransientState();
+    root.openExternally(target);
+    if (root.closePanelAfterAction) root.close();
+    else root.showNotice(reveal ? "Opening folder…" : "Opening file…");
+  }
+
+  function copyOneFilePath(path) {
+    if (!path) return;
+    root.clearTransientState();
+    root.runAction(root.copyTextCommand(String(path)), false);
+    if (root.closePanelAfterAction) root.close();
+    else root.showNotice("Full path copied.");
+  }
+
   function copyTextCommand(value) {
     return "printf %s " + root.shq(value) + " | wl-copy";
   }
@@ -878,6 +969,7 @@ Panel {
   function menuActionsFor(row) {
     var actions = [];
     if (!row) return actions;
+    if (root.canOpenUrl(row)) actions.push({ id: "open", label: "Open in browser" });
     if (root.supportsMarkdown(row)) actions.push({ id: "markdown", label: "Copy as Markdown" });
     if (row.kind === "files") {
       actions.push({ id: "file-full", label: "Copy full path" });
@@ -906,7 +998,8 @@ Panel {
     var index = root.indexOfClipId(root.menuClipId);
     root.closeMenu();
     if (index < 0) return;
-    if (actionId === "markdown") root.copyMarkdown(index);
+    if (actionId === "open") root.openUrl(index);
+    else if (actionId === "markdown") root.copyMarkdown(index);
     else if (actionId === "file-full") root.copyFileVariant(index, "full");
     else if (actionId === "file-name") root.copyFileVariant(index, "name");
     else if (actionId === "file-parent") root.copyFileVariant(index, "parent");
@@ -943,6 +1036,42 @@ Panel {
       if (p.length > 0) out.push(p);
     }
     return out;
+  }
+
+  // One entry per copied path, split into the parts the row renders. The flat
+  // `detailFiles` list above still feeds the whole-list copy variants, which
+  // are unchanged.
+  readonly property var detailFileRows: {
+    if (!root.detailRow || root.detailRow.kind !== "files") return [];
+    var items = root.fileItems(root.detailRow);
+    var out = [];
+    for (var i = 0; i < items.length; i++) {
+      var full = String(items[i].path || "");
+      if (full.length === 0) continue;
+      var trimmed = full;
+      while (trimmed.length > 1 && trimmed.charAt(trimmed.length - 1) === "/") {
+        trimmed = trimmed.substring(0, trimmed.length - 1);
+      }
+      var cut = trimmed.lastIndexOf("/");
+      out.push({
+        path: full,
+        name: String(items[i].name || (cut >= 0 ? trimmed.substring(cut + 1) : trimmed)),
+        parent: cut > 0 ? trimmed.substring(0, cut) : "/",
+        isDirectory: items[i].is_directory === true
+      });
+    }
+    return out;
+  }
+
+  // ---- Image lightbox. Detail-local: dismissing it returns to the clip, not
+  // to the list, so it is a mode of the detail view rather than a third view.
+  property bool lightboxOpen: false
+  readonly property bool detailHasImage:
+    root.detailKind === "image" && root.detailImagePath.length > 0
+
+  function toggleLightbox() {
+    if (!root.detailHasImage) return;
+    root.lightboxOpen = !root.lightboxOpen;
   }
 
   readonly property string detailSize: {
@@ -983,6 +1112,7 @@ Panel {
     root.detailClip = null;
     root.detailError = "";
     root.detailLoading = true;
+    root.lightboxOpen = false;
     root.detailOpen = true;
     // Inspecting a row is also selecting it, so leaving the list is a no-op
     // for the selection the user comes back to.
@@ -1002,6 +1132,7 @@ Panel {
   }
 
   function resetDetail() {
+    root.lightboxOpen = false;
     root.detailOpen = false;
     root.detailClip = null;
     root.detailError = "";
@@ -1060,9 +1191,13 @@ Panel {
     // Escape and Tab belong to PanelKeyCatcher (close, and switch panels). They
     // are never accepted here, at any depth, so they keep bubbling to it.
     if (event.key === Qt.Key_Escape || event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
-      // The one exception: an open copy-variant menu swallows Escape to close
-      // itself rather than the whole panel.
-      if (root.menuClipId >= 0 && event.key === Qt.Key_Escape) { root.closeMenu(); return true; }
+      // Two overlays swallow Escape to dismiss themselves rather than the whole
+      // panel. With neither of them up it is never accepted here, so the close
+      // path through PanelKeyCatcher is exactly as it was.
+      if (event.key === Qt.Key_Escape) {
+        if (root.menuClipId >= 0) { root.closeMenu(); return true; }
+        if (root.lightboxOpen) { root.lightboxOpen = false; return true; }
+      }
       return false;
     }
     if (root.settingsOpen) return root.handleSettingsKey(event);
@@ -1136,7 +1271,27 @@ Panel {
   // focus sits in one of the selectable text blocks, and both paths land on
   // closeDetail(), so the view closes either way.
   function handleDetailKey(event) {
+    // With the lightbox up, every key belongs to it. Anything not listed is
+    // swallowed rather than passed through: the detail view behind is not what
+    // the keys would appear to be acting on, and Delete in particular must not
+    // reach a clip the user cannot currently see.
+    if (root.lightboxOpen) {
+      switch (event.key) {
+        case Qt.Key_Space:
+        case Qt.Key_Left:
+        case Qt.Key_Return:
+        case Qt.Key_Enter:
+          root.lightboxOpen = false;
+          return true;
+      }
+      return true;
+    }
     switch (event.key) {
+      case Qt.Key_Space:
+        // Space is the desktop app's quick-look key. Only bound where there is
+        // something to look at.
+        if (root.detailHasImage) { root.toggleLightbox(); return true; }
+        return false;
       case Qt.Key_Escape:
       case Qt.Key_Left:
         root.closeDetail(); return true;
@@ -1206,15 +1361,22 @@ Panel {
   }
 
   // Wayland has no system-wide synthetic-input API, so auto-paste is only as
-  // real as wtype. Probed rather than assumed: the setting has to be able to
-  // say "unavailable", which is a different statement from "off".
+  // real as wtype, and opening a link or a file is only as real as xdg-open.
+  // Probed rather than assumed: a setting has to be able to say "unavailable",
+  // which is a different statement from "off", and an action that cannot work
+  // should not be offered at all. One process for both -- at ~3ms a fork this
+  // is on the panel-open path.
   Process {
-    id: wtypeProbe
-    command: ["sh", "-c", "command -v wtype >/dev/null 2>&1 && printf 1 || printf 0"]
+    id: toolProbe
+    command: ["sh", "-c",
+      "command -v wtype    >/dev/null 2>&1 && printf 1 || printf 0; "
+      + "command -v xdg-open >/dev/null 2>&1 && printf 1 || printf 0"]
     running: false
     stdout: StdioCollector {
       onStreamFinished: {
-        root.wtypeAvailable = String(text).trim() === "1";
+        var flags = String(text).trim();
+        root.wtypeAvailable = flags.charAt(0) === "1";
+        root.xdgOpenAvailable = flags.charAt(1) === "1";
         root.normalizeSettings();
       }
     }
@@ -2101,6 +2263,51 @@ Panel {
         }
       }
 
+      // ---- Image lightbox, drawn at panel level so it gets the whole surface
+      // instead of the detail body's scroll viewport. It is a mode of the
+      // detail view, not a view of its own: dismissing it returns to the clip.
+      Rectangle {
+        visible: root.lightboxOpen && root.detailHasImage
+        z: 60
+        anchors.fill: parent
+        color: Color.background
+
+        MouseArea {
+          anchors.fill: parent
+          onClicked: root.lightboxOpen = false
+        }
+
+        Image {
+          anchors.fill: parent
+          anchors.margins: Style.space(14)
+          anchors.bottomMargin: Style.space(30)
+          // Only loaded while it is up: this decodes at four times the
+          // preview's resolution and there is no reason to hold it otherwise.
+          source: root.lightboxOpen ? root.fileUrl(root.detailImagePath) : ""
+          fillMode: Image.PreserveAspectFit
+          asynchronous: true
+          cache: false
+          // Bounded: a 8000px screenshot decoded at full size to fill a 400px
+          // panel is most of a gigabyte for no visible gain.
+          sourceSize.width: 2048
+          sourceSize.height: 2048
+          smooth: true
+        }
+
+        Text {
+          anchors.horizontalCenter: parent.horizontalCenter
+          anchors.bottom: parent.bottom
+          anchors.bottomMargin: Style.space(9)
+          text: root.detailDimensions.length > 0
+            ? root.detailDimensions + "  ·  Esc or click to close"
+            : "Esc or click to close"
+          color: root.barForeground
+          opacity: 0.45
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+      }
+
       // ---- Copy-variant menu, drawn at panel level so the ListView's clip
       // rectangle cannot cut it off.
       MouseArea {
@@ -2342,6 +2549,36 @@ Panel {
                   sourceSize.height: 1024
                   smooth: true
                 }
+
+                MouseArea {
+                  id: previewArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.toggleLightbox()
+                }
+
+                // The picture is not obviously a button, so say so on hover.
+                Rectangle {
+                  anchors.right: parent.right
+                  anchors.bottom: parent.bottom
+                  anchors.margins: Style.space(6)
+                  visible: previewArea.containsMouse
+                  width: expandHint.implicitWidth + Style.space(14)
+                  height: Style.space(20)
+                  radius: height / 2
+                  color: Color.background
+                  opacity: 0.85
+
+                  Text {
+                    id: expandHint
+                    anchors.centerIn: parent
+                    text: root.glyphExpand + "  Space"
+                    color: root.barForeground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                }
               }
             }
 
@@ -2368,11 +2605,148 @@ Panel {
               value: root.detailKind === "url" && root.detailRow ? root.detailRow.urlDomain : ""
             }
 
-            // ---- files: the full list, one path per line.
-            DetailField {
-              label: root.detailFiles.length === 1 ? "File" : "Files"
-              mono: true
-              value: root.detailFiles.join("\n")
+            // ---- files: one row per entry, each carrying its own actions.
+            // The whole-list copy variants stay where they were, on the row's
+            // copy menu; these are the per-item ones, which is the only place
+            // "open this file" can sensibly live.
+            Column {
+              x: Style.space(14)
+              width: parent.width - Style.space(28)
+              spacing: Style.space(4)
+              visible: root.detailFileRows.length > 0
+
+              Text {
+                text: root.detailFileRows.length === 1 ? "FILE" : "FILES"
+                color: root.barForeground
+                opacity: 0.35
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+
+              Repeater {
+                model: root.detailFileRows
+
+                delegate: Rectangle {
+                  id: fileRow
+                  required property var modelData
+
+                  width: parent ? parent.width : 0
+                  height: Style.space(42)
+                  radius: 6
+                  color: fileHover.hovered ? root.fg(0.08) : root.fg(0.04)
+
+                  // Passive, so it keeps reporting while the pointer is over
+                  // one of the action buttons -- a child MouseArea takes the
+                  // hover grab, and a rail gated on that would vanish exactly
+                  // when it was being aimed at.
+                  HoverHandler { id: fileHover }
+
+                  MouseArea {
+                    id: fileArea
+                    anchors.fill: parent
+                    // The row itself opens the item, like the clip rows do.
+                    onClicked: root.openFilePath(fileRow.modelData.path, false)
+                    enabled: root.xdgOpenAvailable
+                  }
+
+                  Text {
+                    id: fileGlyph
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(10)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: fileRow.modelData.isDirectory ? root.glyphFolder : root.glyphFile
+                    color: root.barForeground
+                    opacity: 0.55
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.body
+                  }
+
+                  Column {
+                    anchors.left: fileGlyph.right
+                    anchors.leftMargin: Style.space(9)
+                    anchors.right: fileActions.left
+                    anchors.rightMargin: Style.space(6)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 1
+
+                    Row {
+                      width: parent.width
+                      spacing: Style.space(6)
+
+                      Text {
+                        text: fileRow.modelData.name
+                        color: root.barForeground
+                        elide: Text.ElideMiddle
+                        width: Math.min(implicitWidth, parent.width - (dirBadge.visible ? dirBadge.width + Style.space(6) : 0))
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.body
+                      }
+
+                      Rectangle {
+                        id: dirBadge
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: fileRow.modelData.isDirectory
+                        width: dirBadgeText.implicitWidth + Style.space(10)
+                        height: Style.space(15)
+                        radius: 3
+                        color: root.fg(0.10)
+
+                        Text {
+                          id: dirBadgeText
+                          anchors.centerIn: parent
+                          text: "FOLDER"
+                          color: root.barForeground
+                          opacity: 0.6
+                          font.family: Style.font.family
+                          font.pixelSize: Style.font.caption
+                        }
+                      }
+                    }
+
+                    Text {
+                      width: parent.width
+                      text: fileRow.modelData.parent
+                      color: root.barForeground
+                      opacity: 0.38
+                      elide: Text.ElideMiddle
+                      font.family: root.monoFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  Row {
+                    id: fileActions
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(2)
+                    visible: fileHover.hovered
+
+                    RowAction {
+                      anchors.verticalCenter: parent.verticalCenter
+                      visible: root.xdgOpenAvailable
+                      glyph: root.glyphOpen
+                      tip: "Open"
+                      onActivated: root.openFilePath(fileRow.modelData.path, false)
+                    }
+
+                    RowAction {
+                      anchors.verticalCenter: parent.verticalCenter
+                      visible: root.xdgOpenAvailable
+                      glyph: root.glyphReveal
+                      tip: "Reveal in folder"
+                      onActivated: root.openFilePath(fileRow.modelData.path, true)
+                    }
+
+                    RowAction {
+                      anchors.verticalCenter: parent.verticalCenter
+                      glyph: root.glyphFiles
+                      tip: "Copy path"
+                      onActivated: root.copyOneFilePath(fileRow.modelData.path)
+                    }
+                  }
+                }
+              }
             }
 
             DetailField { label: "Dimensions"; value: root.detailDimensions }
@@ -2452,6 +2826,34 @@ Panel {
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(6)
+
+              Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.canOpenUrl(root.detailRow)
+                width: openLabel.implicitWidth + Style.space(20)
+                height: Style.space(24)
+                radius: height / 2
+                color: openArea.containsMouse ? root.fg(0.10) : "transparent"
+                border.width: 1
+                border.color: root.fg(0.16)
+
+                Text {
+                  id: openLabel
+                  anchors.centerIn: parent
+                  text: root.glyphOpen + "  Open"
+                  color: root.barForeground
+                  opacity: 0.85
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+
+                MouseArea {
+                  id: openArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  onClicked: root.openUrl(root.detailIndex)
+                }
+              }
 
               Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
@@ -2703,7 +3105,7 @@ Panel {
             Text {
               id: verText
               anchors.centerIn: parent
-              text: "0.3.0"
+              text: root.pluginVersion
               color: root.barForeground
               opacity: 0.7
               font.family: Style.font.family
