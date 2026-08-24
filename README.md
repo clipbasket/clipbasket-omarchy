@@ -20,6 +20,44 @@ Check it over afterwards with:
 ~/.config/omarchy/plugins/clipbasket.clipboard/bin/clipbasket-omarchy doctor
 ```
 
+## Requirements
+
+Everything is in the Arch repositories; Omarchy already ships most of it.
+
+| Package | Why | Required |
+|---|---|---|
+| `sqlite` | The history database (`sqlite3` CLI) | yes |
+| `wl-clipboard` | `wl-paste` watches the clipboard, `wl-copy` writes it | yes |
+| `jq` | JSON in and out of the shell scripts | yes |
+| `python` | HTML → Markdown conversion (standard library only) | yes |
+| `imagemagick` | Image thumbnails; without it the full image is shown | no |
+| `wtype` | The optional "paste immediately after picking" setting | no |
+| `pandoc` | Used for HTML → Markdown when present; the built-in converter is the fallback | no |
+
+Nothing is downloaded, compiled, or run as root at any point.
+
+## Uninstall
+
+```sh
+# If you had switched SUPER + CTRL + V to Clipbasket, hand it back first:
+~/.config/omarchy/plugins/clipbasket.clipboard/bin/clipbasket-omarchy restore-default
+
+omarchy plugin remove clipbasket.clipboard
+```
+
+`omarchy plugin remove` stops the capture service, drops the bar pill and
+deletes the plugin folder (it leaves a `.clipbasket.clipboard.bak.<timestamp>`
+copy beside it, which is safe to delete). Your history and settings are kept so
+a reinstall picks them up; to erase them too:
+
+```sh
+rm -rf ~/.local/state/clipbasket ~/.config/clipbasket
+```
+
+Nothing else on the system is touched: the only file the plugin ever edits
+outside its own directories is `~/.config/hypr/bindings.lua`, and only when you
+ask it to via `make-default`.
+
 ## What this is
 
 Clipbasket for Omarchy is a **native Quickshell plugin** — a bar widget, a
@@ -109,7 +147,7 @@ intact, whether your settings file is valid JSON, whether the keybinding is in
 | Accessibility grant | Required for automatic paste | None; Wayland uses `wtype` |
 | Auto-paste | Built in | Needs `wtype` installed |
 | Launch at login | Login item / registry Run key | Not a setting — capture runs whenever the shell does |
-| Storage | App-support directory | `~/.local/share/clipbasket/clips.db` |
+| Storage | App-support directory | `~/.local/state/clipbasket/clips.db` |
 
 Settings that exist on macOS and deliberately do **not** exist here — theme,
 automatic update checks, launch-at-login, the paste-permission grant — are listed with their
