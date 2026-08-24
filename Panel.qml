@@ -70,7 +70,6 @@ Panel {
 
   // Settings state. Names, defaults and semantics come from
   // settings.schema.json; unknown keys in the file are preserved on write.
-  property bool launchAtLogin: true
   property string globalShortcut: ""
   property int maxClips: 1000
   property bool ignoreConfidentialCopies: true
@@ -86,6 +85,20 @@ Panel {
 
   readonly property string settingsDir: "${XDG_CONFIG_HOME:-$HOME/.config}/clipbasket"
   readonly property string settingsPath: root.settingsDir + "/settings.json"
+  // The compositor owns SUPER + CTRL + V, so "is Clipbasket the default?" is
+  // not a setting in settings.json -- the truth is the managed block in
+  // bindings.lua, and `clipbasket-omarchy` is the only thing allowed to write
+  // it. `make-default` leaves this marker behind; `restore-default` removes it.
+  readonly property string stateDir: "${XDG_STATE_HOME:-$HOME/.local/state}/clipbasket"
+  readonly property string defaultStatePath: root.stateDir + "/make-default.json"
+  readonly property string cliPath: root.pluginDir + "/bin/clipbasket-omarchy"
+  property bool isDefaultShortcut: false
+  property bool shortcutBusy: false
+  // Bumped on every probe result, including one that changes nothing. Toggle
+  // re-syncs off this rather than off isDefaultShortcut: a click breaks the
+  // Toggle's own `checked` binding, and a refused make-default leaves the value
+  // unchanged -- so "nothing changed" is exactly the case that has to re-assert.
+  property int shortcutProbeRevision: 0
   // Empty means "no compositor binding recorded yet"; the compositor owns it.
   readonly property string shortcutLabelText: root.globalShortcut.length > 0 ? root.globalShortcut : "Unbound"
 
@@ -366,7 +379,7 @@ Panel {
     listProc.running = true;
   }
 
-  function refresh() { root.reload(); settingsProbe.running = true; }
+  function refresh() { root.reload(); settingsProbe.running = true; root.probeDefaultShortcut(); }
   function openFromHotkey() { root.controller.show(); }
 
   onOpenedChanged: {
@@ -987,7 +1000,6 @@ Panel {
     // The schema promises unknown keys survive a write, so this merges through
     // jq rather than overwriting the document.
     var payload = JSON.stringify({
-      launchAtLogin: root.launchAtLogin,
       maxClips: root.maxClips,
       ignoreConfidentialCopies: root.ignoreConfidentialCopies,
       closePanelAfterAction: root.closePanelAfterAction,
@@ -1019,7 +1031,6 @@ Panel {
       onStreamFinished: {
         try {
           var s = JSON.parse(String(text).trim());
-          if ("launchAtLogin" in s) root.launchAtLogin = s.launchAtLogin === true;
           if ("globalShortcut" in s) root.globalShortcut = String(s.globalShortcut || "");
           if ("maxClips" in s) root.maxClips = root.num(s.maxClips, root.maxClips);
           if ("ignoreConfidentialCopies" in s) root.ignoreConfidentialCopies = s.ignoreConfidentialCopies === true;
@@ -1029,6 +1040,49 @@ Panel {
           root.normalizeSettings();
         } catch (e) {}
       }
+    }
+  }
+
+  function probeDefaultShortcut() {
+    if (!defaultStateProbe.running) defaultStateProbe.running = true;
+  }
+
+  // Both directions go through the CLI: it backs bindings.lua up, writes only
+  // between its own markers, and `restore-default` re-enables Omarchy's
+  // clipboard only if `make-default` was what disabled it. Reproducing any of
+  // that here would be a second, worse implementation of it.
+  function setDefaultShortcut(want) {
+    if (root.shortcutBusy) return;
+    root.shortcutBusy = true;
+    shortcutProc.command = ["sh", "-c",
+      root.shq(root.cliPath) + (want ? " make-default" : " restore-default")
+      + " --no-reload >/dev/null 2>&1"
+      + " && { hyprctl reload >/dev/null 2>&1 || true; }"];
+    shortcutProc.running = true;
+  }
+
+  Process {
+    id: defaultStateProbe
+    command: ["sh", "-c", "[ -f \"" + root.defaultStatePath + "\" ] && printf 1 || printf 0"]
+    running: false
+    stdout: StdioCollector {
+      onStreamFinished: {
+        root.isDefaultShortcut = String(text).trim() === "1";
+        root.shortcutProbeRevision++;
+      }
+    }
+  }
+
+  Process {
+    id: shortcutProc
+    running: false
+    onExited: function (exitCode) {
+      root.shortcutBusy = false;
+      // Re-read rather than assume: the toggle springs back on its own if the
+      // CLI refused (no bindings.lua, no hyprctl, nothing to restore).
+      root.probeDefaultShortcut();
+      settingsProbe.running = true;
+      if (exitCode !== 0) root.showNotice("Couldn't change the shortcut. Run clipbasket-omarchy doctor.");
     }
   }
 
@@ -2312,17 +2366,8 @@ Panel {
         SectionHeader { text: "GENERAL" }
 
         SettingRow {
-          title: "Launch at login"
-          subtitle: "Started by Hyprland via exec-once"
-          Toggle {
-            checked: root.launchAtLogin
-            onToggled: { root.launchAtLogin = checked; root.persist(); }
-          }
-        }
-
-        SettingRow {
           title: "Global shortcut"
-          subtitle: "Owned by the compositor on Wayland — set it in bindings.lua, or run clipbasket-omarchy make-default"
+          subtitle: "Owned by the compositor on Wayland — this mirrors the managed block in bindings.lua"
           Rectangle {
             width: shortcutText.implicitWidth + Style.space(16)
             height: Style.space(22)
@@ -2338,6 +2383,28 @@ Panel {
               opacity: 0.75
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
+            }
+          }
+        }
+
+        SettingRow {
+          title: "Use Clipbasket for Super+Ctrl+V"
+          subtitle: root.isDefaultShortcut
+            ? "Clipbasket owns the key. Turning this off gives it back to Omarchy's clipboard, exactly as it was."
+            : "Omarchy's clipboard owns the key. Turning this on hands it to Clipbasket and steps Omarchy's overlay aside."
+          Toggle {
+            id: defaultShortcutToggle
+            checked: root.isDefaultShortcut
+            opacity: root.shortcutBusy ? 0.4 : 1
+            onToggled: {
+              if (root.shortcutBusy) { checked = root.isDefaultShortcut; return; }
+              root.setDefaultShortcut(checked);
+            }
+            Connections {
+              target: root
+              function onShortcutProbeRevisionChanged() {
+                defaultShortcutToggle.checked = root.isDefaultShortcut;
+              }
             }
           }
         }

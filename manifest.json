@@ -5,8 +5,12 @@
   "version": "0.3.0",
   "author": "Clipbasket",
   "description": "Clipboard history for Omarchy — search everything you have copied",
-  "kinds": ["bar-widget"],
-  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "license": "MIT",
+  "kinds": ["bar-widget", "service"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  },
   "barWidget": {
     "displayName": "Clipbasket",
     "description": "Clipboard history: search, filter, pin and paste",

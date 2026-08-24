@@ -8,9 +8,9 @@
 
   "x-clipbasket": {
     "settingsPath": "~/.config/clipbasket/settings.json",
-    "databasePath": "~/.local/share/clipbasket/clips.db",
+    "databasePath": "~/.local/state/clipbasket/clips.db",
     "groups": [
-      { "id": "general",  "title": "General",  "properties": ["launchAtLogin", "globalShortcut"] },
+      { "id": "general",  "title": "General",  "properties": ["globalShortcut"] },
       { "id": "history",  "title": "History",  "properties": ["maxClips", "ignoreConfidentialCopies"] },
       { "id": "behavior", "title": "Behavior", "properties": ["closePanelAfterAction", "openAtCursorOnShortcut", "pasteSelectedClipImmediately"] }
     ],
@@ -28,6 +28,10 @@
         "reason": "Wayland has no equivalent grant. Synthetic input goes through wtype/ydotool, which either work or are not installed."
       },
       {
+        "name": "launchAtLogin",
+        "reason": "The shell starts capture; there is nothing to opt out of. Service.qml owns the wl-paste watchers, so capture runs exactly when omarchy-shell runs, and dies with it. The setting was inert even before that: nothing read the key it wrote."
+      },
+      {
         "name": "closePanelAfterCopy",
         "reason": "The macOS app kept this in lockstep with closePanelAfterSelection through the UI. Collapsed into the single closePanelAfterAction."
       }
@@ -42,19 +46,6 @@
   },
 
   "properties": {
-    "launchAtLogin": {
-      "type": "boolean",
-      "default": true,
-      "title": "Launch at login",
-      "description": "Start the Clipbasket capture daemon when you log in.",
-      "x-clipbasket": {
-        "group": "general",
-        "help": "A clipboard manager cannot recover history from a session it was not running for, so this defaults on. Backed by the systemd user unit, not by ~/.config/autostart (Hyprland never reads it).",
-        "appliesVia": "systemctl --user enable clipbasket-omarchy.service",
-        "divergesFromMacOS": "The macOS default is false only because its installer registers a login item separately; the effective behaviour is the same."
-      }
-    },
-
     "globalShortcut": {
       "type": "string",
       "default": "",

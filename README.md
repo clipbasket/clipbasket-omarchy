@@ -4,19 +4,26 @@ A clipboard manager that lives in your [Omarchy](https://omarchy.org) bar. Searc
 everything you have copied, filter by kind, paste it back — without leaving the
 keyboard.
 
-Free, forever, on Omarchy. Install it with a `git clone`; there is nothing to
-compile.
+Free, forever, on Omarchy. Nothing to compile, nothing to run as root.
 
 ```sh
-curl -fsSL https://clipbasket.com/omarchy/install.sh | bash
+omarchy plugin add https://github.com/clipbasket/clipbasket-omarchy --enable
 ```
 
-Then run `clipbasket-omarchy doctor` to confirm everything is wired up.
+That is the whole install: Omarchy clones the plugin, validates it, and enables
+it. The bar pill appears and clipboard capture starts with the shell â there is
+no separate daemon to install, and no install script to trust.
+
+Check it over afterwards with:
+
+```sh
+~/.config/omarchy/plugins/clipbasket.clipboard/bin/clipbasket-omarchy doctor
+```
 
 ## What this is
 
-Clipbasket for Omarchy is a **native Quickshell plugin** — a bar widget and a
-popup panel written in QML, plus a small capture daemon and a SQLite history.
+Clipbasket for Omarchy is a **native Quickshell plugin** — a bar widget, a
+popup panel and a capture service written in QML, over a SQLite history.
 
 It shares a name and a design with [Clipbasket for macOS and
 Windows](https://clipbasket.com), and nothing else. There is no shared code: the
@@ -24,7 +31,8 @@ desktop app is Rust and React in a Tauri shell, and this is QML talking to
 Omarchy's own components. Treating it as a port would mean carrying a lot of
 decisions that only make sense on a platform where the app owns its own window,
 its own theme, and its own updater. On Omarchy, the compositor owns the
-keybinding, Omarchy owns the theme, and git owns the updates — so this is built
+keybinding, Omarchy owns the theme, and the marketplace owns the updates — so
+this is built
 around that instead of fighting it.
 
 The practical consequence: **best-effort feature parity, no promises.** Features
@@ -40,8 +48,9 @@ land here when they make sense here. Some never will. See
   with copy and paste actions.
 - A settings page covering the options that mean something on Wayland, persisted to
   `~/.config/clipbasket/settings.json`.
-- A capture daemon that records clipboard history to SQLite and skips anything a
-  password manager marks confidential.
+- A capture service that records clipboard history to SQLite and skips anything a
+  password manager marks confidential. It runs inside the shell and stops with
+  it — there is no daemon of ours to install, supervise, or leave running.
 
 ## Coexisting with Omarchy's clipboard
 
@@ -50,11 +59,13 @@ Omarchy ships its own clipboard overlay, `omarchy.clipboard`, on **SUPER + CTRL 
 **Clipbasket does not take that binding when you install it.** You get a bar pill
 and nothing else changes. Try both, keep the one you like.
 
-When you decide:
+When you decide, flip **Use Clipbasket for Super+Ctrl+V** in the panel's settings
+page — or do the same thing from a terminal:
 
 ```sh
-clipbasket-omarchy make-default      # SUPER + CTRL + V opens Clipbasket
-clipbasket-omarchy restore-default   # give it back, exactly as it was
+cd ~/.config/omarchy/plugins/clipbasket.clipboard
+bin/clipbasket-omarchy make-default      # SUPER + CTRL + V opens Clipbasket
+bin/clipbasket-omarchy restore-default   # give it back, exactly as it was
 ```
 
 `make-default` edits `~/.config/hypr/bindings.lua` inside a clearly delimited
@@ -65,9 +76,13 @@ thing that disabled it. Both are safe to run repeatedly. See
 
 ## The CLI
 
+Nothing links it onto your PATH — a plugin folder may not contain symlinks, and
+the marketplace install runs no script that could make one elsewhere. Run it from
+the plugin directory, `~/.config/omarchy/plugins/clipbasket.clipboard/bin/`:
+
 ```
-clipbasket-omarchy enable              Enable the bar widget, start the daemon
-clipbasket-omarchy disable             Disable it (your history is kept)
+clipbasket-omarchy enable              Enable the bar widget and the capture service
+clipbasket-omarchy disable             Disable both (your history is kept)
 clipbasket-omarchy make-default        Take SUPER + CTRL + V
 clipbasket-omarchy restore-default     Undo make-default exactly
 clipbasket-omarchy status              What is installed and enabled
@@ -79,7 +94,7 @@ exact change first.
 
 `doctor` is the thing to run before asking for help. It checks the Omarchy CLIs,
 `sqlite3`, `wl-clipboard`, `jq`, the plugin directory, whether the widget is
-enabled, whether the daemon is running, whether the database is writable and
+enabled, whether the capture watchers are running, whether the database is writable and
 intact, whether your settings file is valid JSON, whether the keybinding is in
 `bindings.lua`, and whether Hyprland has actually loaded it.
 
@@ -90,14 +105,14 @@ intact, whether your settings file is valid JSON, whether the keybinding is in
 | Price | Paid, licensed | Free |
 | Global shortcut | Owned by the app, changed in Settings | Owned by the compositor, changed in `bindings.lua` |
 | Theme | Light / Dark / System setting | Omarchy's theme, always |
-| Updates | In-app updater, checks daily | `git pull` in the plugin directory |
+| Updates | In-app updater, checks daily | `omarchy plugin update clipbasket.clipboard` |
 | Accessibility grant | Required for automatic paste | None; Wayland uses `wtype` |
 | Auto-paste | Built in | Needs `wtype` installed |
-| Launch at login | Login item / registry Run key | systemd user unit |
+| Launch at login | Login item / registry Run key | Not a setting — capture runs whenever the shell does |
 | Storage | App-support directory | `~/.local/share/clipbasket/clips.db` |
 
 Settings that exist on macOS and deliberately do **not** exist here — theme,
-automatic update checks, the paste-permission grant — are listed with their
+automatic update checks, launch-at-login, the paste-permission grant — are listed with their
 reasons in [`settings.schema.json`](settings.schema.json) under
 `x-clipbasket.notInThisPort`, so nobody has to guess whether they were forgotten.
 
@@ -138,11 +153,11 @@ this against Omarchy 4.0.0 / Quickshell 0.3.1:
 
 | File | Purpose |
 |---|---|
-| `install.sh` | One-command install; idempotent, `--dry-run` supported |
-| `bin/clipbasket-omarchy` | The CLI: enable, disable, make-default, restore-default, status, doctor |
-| `manifest.json` | Plugin declaration (`kinds: ["bar-widget"]`, entry point, bar metadata) |
+| `manifest.json` | Plugin declaration (`kinds: ["bar-widget", "service"]`, entry points, bar metadata) |
 | `BarWidget.qml` | The bar pill; owns the panel and forwards the shape contract |
-| `Panel.qml` | The popup: clip list and settings views |
+| `Panel.qml` | The popup: clip list, clip detail and settings views |
+| `Service.qml` | The capture service: the two `wl-paste --watch` processes, owned by the shell |
+| `bin/clipbasket-omarchy` | The CLI: enable, disable, make-default, restore-default, status, doctor |
 | `settings.schema.json` | The settings contract — names, types, defaults, and what was dropped |
 | `docs/INSTALL.md` | Install, upgrade, uninstall, and exactly what touches your config |
 | `docs/SETTINGS.md` | Every setting, what it does, and why the absent ones are absent |

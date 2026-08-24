@@ -1,7 +1,7 @@
 # Installing Clipbasket for Omarchy
 
-Free, no account, no licence key, nothing to compile. The whole install is a
-`git clone` plus a few Omarchy CLI calls.
+Free, no account, no licence key, nothing to compile, and nothing to run as
+root. The whole install is one Omarchy command.
 
 ## Requirements
 
@@ -9,7 +9,7 @@ Free, no account, no licence key, nothing to compile. The whole install is a
 - `sqlite3`, `wl-clipboard`, `jq`, `git`
 
 ```sh
-sudo pacman -S --needed sqlite wl-clipboard jq git
+pacman -S --needed sqlite wl-clipboard jq git
 ```
 
 `jq` is not optional: the panel reads history through it, and the CLI derives
@@ -18,61 +18,65 @@ default settings from `settings.schema.json` with it.
 ## Install
 
 ```sh
-curl -fsSL https://clipbasket.com/omarchy/install.sh | bash
+omarchy plugin add https://github.com/clipbasket/clipbasket-omarchy --enable
 ```
 
-Or from a clone, which is the same thing:
+That is all of it. Omarchy clones the repo into
+`~/.config/omarchy/plugins/clipbasket.clipboard/`, validates the manifest, and
+enables the plugin over shell IPC. It never runs code from the plugin — there is
+no install script here, and nothing in this repository asks you to pipe a
+download into a shell.
+
+Add `--yes` to skip the confirmation prompts, which is the path for scripts:
 
 ```sh
-git clone https://github.com/Clipbasket/clipbasket-omarchy.git
-cd clipbasket-omarchy
-./install.sh
+omarchy plugin add https://github.com/clipbasket/clipbasket-omarchy --enable --yes
 ```
 
-Preview it first if you like — a dry run prints every command it would run and
-changes nothing:
+Without `--enable` the plugin lands disabled so you can read the code first —
+it is your machine and this is unsandboxed QML and bash. Enable it when you are
+ready:
 
 ```sh
-./install.sh --dry-run
+omarchy plugin enable clipbasket.clipboard right
 ```
 
-### Options
+### What you get, and what starts
 
-| Flag | Effect |
-|---|---|
-| `--dry-run` | Print every action, change nothing |
-| `--ref <git-ref>` | Install a specific branch, tag, or commit |
-| `--section <left\|center\|right>` | Bar section for the widget (default: `right`) |
-| `--no-daemon` | Install without starting the capture daemon |
-| `--no-enable` | Install without enabling the bar widget |
+1. **The bar pill**, in the `right` section unless you name another.
+2. **The capture service.** `Service.qml` starts two `wl-paste --watch`
+   processes inside `omarchy-shell` the moment the plugin loads. They record
+   every copy to SQLite and are killed by the kernel when the shell exits
+   (`setpriv --pdeathsig TERM`), so capture runs exactly as long as your shell
+   does. There is no daemon to install and no systemd unit of ours on your
+   system.
+3. **Nothing else.** No settings file is written until you change a setting —
+   the panel falls back to the defaults in `settings.schema.json`. No keybinding
+   is touched: Omarchy's own clipboard keeps `SUPER + CTRL + V` until you
+   explicitly ask otherwise.
 
-### What it does, in order
+The database, image store and settings directory are created on first use.
 
-1. Resolves `OMARCHY_PATH` (needed by `omarchy` and `omarchy-shell`, which fail
-   with a misleading `find: '/shell/plugins'` error without it) and checks the
-   dependencies above, warning rather than aborting on each.
-2. Copies or clones the plugin into
-   `~/.config/omarchy/plugins/clipbasket.clipboard/`.
-3. Creates `~/.config/clipbasket/`, `~/.local/share/clipbasket/`, and
-   `~/.local/state/clipbasket/`.
-4. Symlinks `~/.local/bin/clipbasket-omarchy` at the CLI in the plugin directory.
-5. Seeds `~/.config/clipbasket/settings.json` with the schema defaults — **only
-   if the file does not already exist.** An upgrade never touches your settings.
-6. Installs and starts the capture daemon's systemd user unit, if the build ships
-   one.
-7. Runs `omarchy-shell shell rescanPlugins`, then
-   `omarchy plugin enable clipbasket.clipboard right`.
+### The CLI
 
-It is idempotent. Re-running upgrades in place: the plugin directory is
-refreshed, the symlink is repointed, and nothing is duplicated.
+`bin/clipbasket-omarchy` ships inside the plugin and is not linked onto your
+PATH: a plugin folder may not contain symlinks (the validator refuses them), and
+the install runs no script that could make one elsewhere. Run it from the plugin
+directory:
 
-**It does not touch your keybindings.** Omarchy's own clipboard keeps
-`SUPER + CTRL + V` until you explicitly ask otherwise.
+```sh
+cd ~/.config/omarchy/plugins/clipbasket.clipboard
+bin/clipbasket-omarchy doctor
+```
+
+The rest of this document writes that as `bin/clipbasket-omarchy`, assuming you
+have `cd`'d there. If you want it on your PATH, that is your call to make in your
+own dotfiles — put a wrapper in `~/.local/bin`, not a symlink inside the plugin.
 
 ## Verify
 
 ```sh
-clipbasket-omarchy doctor
+bin/clipbasket-omarchy doctor
 ```
 
 Every line is `PASS`, `FAIL`, `WARN`, or `INFO`, and every `FAIL` names the
@@ -80,13 +84,16 @@ command that fixes it. The command exits non-zero if anything failed, so it is
 safe to use in a script. This is the first thing to run — and to paste — when
 something is not working.
 
-`clipbasket-omarchy status` is the short version: what is installed, what is
+`bin/clipbasket-omarchy status` is the short version: what is installed, what is
 running, and which key opens the panel.
 
 ## Making Clipbasket the default clipboard
 
+Flip **Use Clipbasket for Super+Ctrl+V** in the panel's settings page, or run the
+command the toggle runs:
+
 ```sh
-clipbasket-omarchy make-default
+bin/clipbasket-omarchy make-default
 ```
 
 This is the only command that edits your Hyprland config, and here is exactly
@@ -98,8 +105,8 @@ what it does:
 2. **Removes any existing Clipbasket block**, then appends exactly one:
 
    ```lua
-   -- >>> clipbasket — managed by `clipbasket-omarchy make-default`. Do not edit by
-   -- hand; `clipbasket-omarchy restore-default` deletes this block verbatim.
+   -- >>> clipbasket — managed by `bin/clipbasket-omarchy make-default`. Do not edit by
+   -- hand; `bin/clipbasket-omarchy restore-default` deletes this block verbatim.
    hl.unbind("SUPER + CTRL + V")
    o.bind("SUPER + CTRL + V", "Clipbasket", "omarchy-shell shell toggle clipbasket.clipboard")
    -- <<< clipbasket
@@ -117,7 +124,7 @@ what it does:
 Use a different key with `--key`:
 
 ```sh
-clipbasket-omarchy make-default --key "SUPER + V"
+bin/clipbasket-omarchy make-default --key "SUPER + V"
 ```
 
 Running `make-default` twice produces a byte-identical file. Running it with a
@@ -126,7 +133,7 @@ different `--key` replaces the block rather than adding a second one.
 ## Undoing it
 
 ```sh
-clipbasket-omarchy restore-default
+bin/clipbasket-omarchy restore-default
 ```
 
 1. Backs up `bindings.lua` again.
@@ -144,9 +151,12 @@ Preview either command with `--dry-run`; it prints the full file it would write.
 ## Upgrading
 
 ```sh
-git -C ~/.config/omarchy/plugins/clipbasket.clipboard pull
-omarchy-shell shell rescanPlugins
+omarchy plugin update clipbasket.clipboard
 ```
+
+It fetches, shows you a diff, and fast-forwards. An installed plugin is an
+ordinary git checkout, so `git -C ~/.config/omarchy/plugins/clipbasket.clipboard
+pull` does the same thing if you prefer.
 
 Then restart the shell — Quickshell does not reload QML that is already in
 memory, and its file watcher does not cover the plugin directory:
@@ -156,20 +166,20 @@ pkill -f "quickshell -n -p"
 setsid systemd-cat -t omarchy-shell -- quickshell -n -p "$OMARCHY_PATH/shell" &
 ```
 
-Re-running `install.sh` does the same thing and repoints the CLI symlink, which
-matters if a release moves it.
+Your settings and history are untouched by an upgrade — both live outside the
+plugin directory.
 
 ## Uninstalling
 
 ```sh
-clipbasket-omarchy restore-default          # hand SUPER + CTRL + V back first
-clipbasket-omarchy disable
-rm -rf ~/.config/omarchy/plugins/clipbasket.clipboard
-rm -f  ~/.local/bin/clipbasket-omarchy
+cd ~/.config/omarchy/plugins/clipbasket.clipboard
+bin/clipbasket-omarchy restore-default   # hand SUPER + CTRL + V back first
+omarchy plugin remove clipbasket.clipboard
 ```
 
 Order matters: `restore-default` needs the CLI, and the CLI lives in the
-directory you are about to delete.
+directory you are about to delete. The capture watchers die with the plugin —
+they are children of the shell, not of anything you have to remember to stop.
 
 Your history and settings survive on purpose. Delete them too if you want:
 
@@ -182,13 +192,12 @@ rm -rf ~/.local/share/clipbasket ~/.config/clipbasket ~/.local/state/clipbasket
 | Path | What |
 |---|---|
 | `~/.config/omarchy/plugins/clipbasket.clipboard/` | The plugin |
-| `~/.local/bin/clipbasket-omarchy` | CLI symlink |
 | `~/.config/clipbasket/settings.json` | Settings |
-| `~/.local/share/clipbasket/clips.db` | Clip history (SQLite) |
+| `~/.local/state/clipbasket/clips.db` | Clip history (SQLite) |
+| `~/.local/state/clipbasket/images/`, `thumbs/` | Copied images and their thumbnails |
 | `~/.local/state/clipbasket/backups/` | `bindings.lua` backups |
 | `~/.local/state/clipbasket/make-default.json` | What `make-default` changed |
 | `~/.config/hypr/bindings.lua` | Your keybindings — only the marked block is ours |
-| `~/.config/systemd/user/clipbasket-omarchy.service` | Capture daemon unit |
 
 Override the settings, database, and bindings paths with `CLIPBASKET_SETTINGS`,
 `CLIPBASKET_DB`, and `CLIPBASKET_BINDINGS` respectively. `XDG_CONFIG_HOME`,
@@ -201,12 +210,14 @@ Override the settings, database, and bindings paths with `CLIPBASKET_SETTINGS`,
 Upgrading.
 
 **`find: '/shell/plugins': No such file or directory`.** `OMARCHY_PATH` is unset.
-Export it, or run the command from a full desktop session. Both `install.sh` and
-the CLI resolve it themselves; a bare `omarchy plugin …` will not.
+Export it, or run the command from a full desktop session. The CLI resolves it
+itself; a bare `omarchy plugin …` will not.
 
-**The panel is empty.** The capture daemon is not running. `clipbasket-omarchy
-doctor` will say so. History starts from the moment the daemon starts — it cannot
-recover copies made before it was running.
+**The panel is empty.** The capture watchers are not running — most often
+because the shell has not been restarted since the plugin was added.
+`bin/clipbasket-omarchy doctor` counts them and says which of the two is missing.
+History starts from the moment capture starts; it cannot recover copies made
+before that.
 
 **`SUPER + CTRL + V` does nothing after `make-default`.** Hyprland has the block
 in the file but has not loaded it. Run `hyprctl reload`, or log out and back in.

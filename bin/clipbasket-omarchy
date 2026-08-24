@@ -91,8 +91,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # `omarchy plugin` and `omarchy-shell` resolve their plugin roots through
 # $OMARCHY_PATH and fail with a misleading `find: '/shell/plugins'` when it is
-# unset — which it is for any invocation outside a desktop session (a cron job,
-# an SSH shell, a systemd unit).
+# unset — which it is for any invocation outside a desktop session (a cron job
+# or an SSH shell).
 ensure_omarchy_path() {
   local candidate
   [[ -n "${OMARCHY_PATH:-}" && -d "${OMARCHY_PATH:-}/shell" ]] && return 0
@@ -145,11 +145,17 @@ omarchy_clipboard_state() {
   fi
 }
 
-daemon_running() {
-  if have systemctl && systemctl --user is-active --quiet clipbasket-omarchy.service 2>/dev/null; then
-    return 0
-  fi
-  pgrep -f 'clipbasket-daemon|clipbasket-omarchy-daemon' >/dev/null 2>&1
+# Capture is the two `wl-paste --watch` processes Service.qml starts inside the
+# shell; there is no daemon and no unit to ask. Match on our own capture path so
+# omarchy.clipboard's watchers are never counted as ours.
+capture_watchers() {
+  # `|| true` because pgrep exits 1 when nothing matches, and `set -o pipefail`
+  # would turn "no watchers" -- the case this exists to report -- into an abort.
+  { pgrep -f 'wl-paste .*--watch .*/clipbasket-capture' 2>/dev/null || true; } | wc -l | tr -d ' '
+}
+
+capture_running() {
+  [[ "$(capture_watchers)" -gt 0 ]]
 }
 
 shell_running() {
@@ -348,14 +354,10 @@ cmd_enable() {
     die "omarchy is not on PATH."
   fi
 
-  if have systemctl && [[ -f "$CONFIG_HOME/systemd/user/clipbasket-omarchy.service" ]]; then
-    run_soft systemctl --user enable --now clipbasket-omarchy.service || \
-      warn "Could not start the capture daemon."
-  fi
-
   info ""
-  info "Clipbasket is in your bar. Omarchy's clipboard still owns $DEFAULT_KEY;"
-  info "run \`clipbasket-omarchy make-default\` to change that."
+  info "Clipbasket is in your bar, and capture starts with the shell."
+  info "Omarchy's clipboard still owns $DEFAULT_KEY; run"
+  info "\`clipbasket-omarchy make-default\` to change that."
 }
 
 cmd_disable() {
@@ -370,11 +372,6 @@ cmd_disable() {
     fi
   else
     warn "omarchy is not on PATH; skipping the plugin step."
-  fi
-
-  if have systemctl && systemctl --user list-unit-files clipbasket-omarchy.service >/dev/null 2>&1; then
-    run_soft systemctl --user disable --now clipbasket-omarchy.service >/dev/null 2>&1 && \
-      ok "Capture daemon stopped" || true
   fi
 
   if managed_block_present; then
@@ -501,7 +498,7 @@ cmd_status() {
   printf '    %-26s %s\n' "Database"          "$DB_FILE"
   printf '\n'
   printf '    %-26s %s\n' "Bar widget"        "$plugin"
-  printf '    %-26s %s\n' "Capture daemon"    "$(daemon_running && echo running || echo 'not running')"
+  printf '    %-26s %s\n' "Clipboard capture" "$(capture_running && echo "running ($(capture_watchers) watchers)" || echo 'not running')"
   printf '    %-26s %s\n' "Omarchy shell"     "$(shell_running && echo running || echo 'not running')"
   printf '    %-26s %s\n' "Omarchy clipboard" "$their_clip"
   if [[ -n "$key" ]]; then
@@ -528,7 +525,7 @@ check_binary() {
   if have "$bin"; then
     check_pass "$label" "$(command -v "$bin")"
   else
-    check_fail "$label" "not found — sudo pacman -S $package"
+    check_fail "$label" "not found — install it: pacman -S $package"
   fi
 }
 
@@ -583,16 +580,26 @@ cmd_doctor() {
   fi
 
   if [[ -L "$HOME/.local/bin/clipbasket-omarchy" || -f "$HOME/.local/bin/clipbasket-omarchy" ]]; then
-    check_pass "CLI on PATH" "$HOME/.local/bin/clipbasket-omarchy"
+    check_info "CLI on PATH" "$HOME/.local/bin/clipbasket-omarchy"
   else
-    check_warn "CLI on PATH" "not linked into ~/.local/bin"
+    # Nothing links it: a plugin folder may not contain symlinks, and the
+    # marketplace install runs no script that could make one elsewhere.
+    check_info "CLI" "$PLUGIN_DIR/bin/clipbasket-omarchy"
   fi
 
   printf '\n  %sRuntime%s\n' "$C_BOLD" "$C_RESET"
-  if daemon_running; then
-    check_pass "Capture daemon running"
+  local watchers
+  watchers="$(capture_watchers)"
+  if [[ "$watchers" -ge 2 ]]; then
+    check_pass "Clipboard capture running" "$watchers wl-paste watchers"
+  elif [[ "$watchers" -gt 0 ]]; then
+    # One of the two means text or images are being silently dropped, which
+    # looks exactly like working software until you copy the wrong thing.
+    check_fail "Clipboard capture running" "only $watchers of 2 watchers — restart omarchy-shell"
+  elif shell_running; then
+    check_fail "Clipboard capture running" "no watchers — is the plugin enabled? then restart omarchy-shell"
   else
-    check_fail "Capture daemon running" "history will not update — see docs/INSTALL.md"
+    check_warn "Clipboard capture running" "the shell is not running; capture runs inside it"
   fi
 
   if [[ -f "$DB_FILE" ]]; then
@@ -613,7 +620,7 @@ cmd_doctor() {
       fi
     fi
   elif [[ ! -d "$DATA_DIR" ]]; then
-    check_fail "Database writable" "$DATA_DIR does not exist — run install.sh"
+    check_warn "Database writable" "$DATA_DIR does not exist yet; the first copy creates it"
   elif [[ -w "$DATA_DIR" ]]; then
     check_warn "Database writable" "no database yet, but $DATA_DIR is writable"
   else
@@ -629,7 +636,9 @@ cmd_doctor() {
       check_fail "Settings file" "$SETTINGS_FILE is not valid JSON"
     fi
   else
-    check_warn "Settings file" "missing — run: clipbasket-omarchy settings-init"
+    # Absent is the normal state of a fresh install: every key falls back to
+    # settings.schema.json, and the file appears when a setting is changed.
+    check_info "Settings file" "none yet — running on schema defaults"
   fi
 
   printf '\n  %sKeybindings%s\n' "$C_BOLD" "$C_RESET"
@@ -701,7 +710,7 @@ cmd_settings_init() {
     schema="$here/settings.schema.json"
   fi
   [[ -f "$schema" ]] || die "settings.schema.json not found (looked in $PLUGIN_DIR)."
-  have jq || die "jq is required to seed settings. sudo pacman -S jq"
+  have jq || die "jq is required to seed settings. Install it: pacman -S jq"
 
   if [[ -f "$SETTINGS_FILE" && $force -eq 0 ]]; then
     info "$SETTINGS_FILE already exists. Pass --force to overwrite it with defaults."
@@ -732,8 +741,8 @@ ${C_BOLD}Usage${C_RESET}
   clipbasket-omarchy <command> [options]
 
 ${C_BOLD}Commands${C_RESET}
-  enable              Enable the bar widget and start the capture daemon
-  disable             Disable the bar widget and stop the daemon (history kept)
+  enable              Enable the bar widget and the capture service
+  disable             Disable both (your clip history is kept)
   make-default        Bind $DEFAULT_KEY to Clipbasket and step
                       Omarchy's own clipboard aside
   restore-default     Undo make-default exactly

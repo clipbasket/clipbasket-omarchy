@@ -14,11 +14,17 @@ Edit it in the panel's settings page, or with a text editor — nothing caches i
 authoritative contract: names, types, defaults, ranges, and the reasons behind
 the settings that are deliberately absent.
 
-Seed a fresh file with the defaults:
+There is no settings file until something writes one. Nothing seeds it at
+install time, and nothing needs to: every key falls back to the default in the
+schema, so a fresh install runs on defaults and the file appears the first time
+you change a setting in the panel.
+
+Write one out explicitly if you would rather start from a full file — from the
+plugin directory, `~/.config/omarchy/plugins/clipbasket.clipboard/`:
 
 ```sh
-clipbasket-omarchy settings-init          # only if the file is missing
-clipbasket-omarchy settings-init --force  # overwrite with defaults
+bin/clipbasket-omarchy settings-init          # only if the file is missing
+bin/clipbasket-omarchy settings-init --force  # overwrite with defaults
 ```
 
 Defaults are derived from the schema, so they exist in exactly one place.
@@ -33,7 +39,6 @@ downgrading never destroys a newer install's settings.
   "closePanelAfterAction": true,
   "globalShortcut": "",
   "ignoreConfidentialCopies": true,
-  "launchAtLogin": true,
   "maxClips": 1000,
   "openAtCursorOnShortcut": false,
   "pasteSelectedClipImmediately": false
@@ -42,21 +47,6 @@ downgrading never destroys a newer install's settings.
 
 ## General
 
-### `launchAtLogin` — boolean, default `true`
-
-Start the capture daemon when you log in.
-
-A clipboard manager cannot recover history from a session it was not running
-for, so this defaults on: off-by-default means the product silently stops doing
-its one job after your first reboot.
-
-Backed by a systemd user unit, not by `~/.config/autostart/*.desktop` — Hyprland
-never reads that directory, so writing there would record a preference the system
-silently ignores.
-
-The macOS app defaults this to `false` only because its installer registers the
-login item separately. The effective behaviour is the same on both.
-
 ### `globalShortcut` — string, read-only, default `""`
 
 The key that opens Clipbasket. Empty means **not bound**.
@@ -64,7 +54,9 @@ The key that opens Clipbasket. Empty means **not bound**.
 On Wayland the compositor owns keybindings, so this field is a *mirror*, not a
 control. The binding lives in `~/.config/hypr/bindings.lua`, between the
 `-- >>> clipbasket` and `-- <<< clipbasket` markers, and
-`clipbasket-omarchy make-default` writes both the block and this field together.
+The **Use Clipbasket for Super+Ctrl+V** toggle in the settings page, and
+`bin/clipbasket-omarchy make-default` behind it, write both the block and this
+field together.
 `restore-default` clears both.
 
 The settings page displays it and must never write it: writing here would
@@ -72,6 +64,18 @@ desynchronise the field from the file that actually decides the binding.
 
 It defaults to empty because a fresh install deliberately does not take a key.
 Omarchy's own clipboard keeps `SUPER + CTRL + V` until you ask otherwise.
+
+### Use Clipbasket for Super+Ctrl+V — a control, not a setting
+
+The toggle underneath the shortcut in the settings page is the button form of
+`make-default` / `restore-default`. It is deliberately **not** a key in
+`settings.json`: the compositor decides what the key does, so the truth is the
+managed block in `~/.config/hypr/bindings.lua` plus the marker file at
+`~/.local/state/clipbasket/make-default.json`. Storing a second copy of that in
+the settings file would create two answers to one question.
+
+The panel reads its state from the marker file every time it opens, so turning
+it on here and running `restore-default` in a terminal cannot disagree.
 
 ## History
 
@@ -85,6 +89,11 @@ app, so a hand-edited file never fails to load.
 
 Pinned and saved clips are exempt from the prune. Lowering this number never
 deletes something you deliberately kept.
+
+The capture service passes this to `clipbasket-capture` as `CLIPBASKET_MAX_CLIPS`
+when it starts the watchers. A process's environment is fixed at spawn, so
+changing this number restarts the two watchers — a copy made in that instant is
+the one thing a retention change can cost you.
 
 ### `ignoreConfidentialCopies` — boolean, default `true`
 
@@ -148,12 +157,24 @@ in.
 
 Change your theme in Omarchy; Clipbasket follows.
 
+### Launch at login
+
+There is nothing to opt out of. Capture is two `wl-paste --watch` processes that
+`Service.qml` starts inside `omarchy-shell` and that the kernel kills when the
+shell exits, so it runs exactly when your desktop does.
+
+This setting existed in an earlier build of this port, backed by a systemd user
+unit, and it was inert: nothing read the key it wrote. The unit and the setting
+were both removed rather than repaired — the shell owning capture is the correct
+answer on this platform, and a second capture path writing to the same database
+would be a worse bug than any gap it closed.
+
 ### Automatic update checks
 
-`git` and `pacman` own updates here. The update mechanism is:
+The marketplace owns updates here. The update mechanism is:
 
 ```sh
-git -C ~/.config/omarchy/plugins/clipbasket.clipboard pull
+omarchy plugin update clipbasket.clipboard
 ```
 
 There is nothing for the app to check, and a plugin that phoned home for version
@@ -163,7 +184,7 @@ numbers on a system with a package manager would be doing the wrong thing twice.
 
 macOS gates synthetic keystrokes behind an Accessibility grant, so the app has a
 whole permission flow around it. Wayland has no equivalent: `wtype` either works
-or is not installed. `clipbasket-omarchy doctor` reports which.
+or is not installed. `bin/clipbasket-omarchy doctor` reports which.
 
 ### Licence key
 
