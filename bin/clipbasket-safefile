@@ -22,7 +22,7 @@ commands. python3 is already a hard dependency (clipbasket-html2md), so this
 adds a file, not a requirement. Standard library only, for the same reason.
 
     clipbasket-safefile ensure-dir <path> [--mode 700]
-    clipbasket-safefile write <dir> <name> [--mode 600]   # stdin -> file
+    clipbasket-safefile write <dir> <name> [--mode 600] [--max-bytes N]
     clipbasket-safefile read <dir> <name>                 # file -> stdout
     clipbasket-safefile unlink <dir> <name>
     clipbasket-safefile --selftest
@@ -65,6 +65,10 @@ PROG = "clipbasket-safefile"
 # 0700 for the state root, 0755 where the desktop needs to read thumbnails.
 DEFAULT_DIR_MODE = 0o700
 DEFAULT_FILE_MODE = 0o600
+# A caller may choose a tighter ceiling, but omitting --max-bytes must never
+# turn this helper into an unbounded producer read. The largest payload the
+# plugin legitimately publishes is a 64 MiB clipboard image.
+DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 
 OPEN_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 OPEN_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -95,6 +99,16 @@ def _parse_mode(text):
         raise Failed("mode must be octal, got: %s" % text)
     if not 0 <= value <= 0o7777:
         raise Failed("mode out of range: %s" % text)
+    return value
+
+
+def _parse_max_bytes(text):
+    try:
+        value = int(text, 10)
+    except (TypeError, ValueError):
+        raise Failed("max bytes must be a decimal integer, got: %s" % text)
+    if value < 0:
+        raise Failed("max bytes may not be negative: %s" % text)
     return value
 
 
@@ -143,7 +157,8 @@ def open_dir(path, create=False, mode=DEFAULT_DIR_MODE):
     returned descriptor is the caller's proof: operations performed relative to
     it cannot be redirected by anything that happens to the pathname afterwards.
     """
-    for component in _components(path):
+    components = _components(path)
+    for component in components:
         if component == "..":
             # `..` would walk back out of a verified directory and make the
             # whole component-by-component check meaningless.
@@ -154,9 +169,14 @@ def open_dir(path, create=False, mode=DEFAULT_DIR_MODE):
     created_any = False
     try:
         _fstat_dir(fd, "/", allow_root=True)
-        for component in _components(path):
+        for index, component in enumerate(components):
             walked = walked + "/" + component
             child = None
+            created_this = False
+            # A public leaf such as images/ must not make every missing parent
+            # public too. Parents are private; only the requested leaf gets the
+            # caller's mode.
+            create_mode = mode if index == len(components) - 1 else DEFAULT_DIR_MODE
             try:
                 child = os.open(component, OPEN_DIR_FLAGS, dir_fd=fd)
             except OSError as exc:
@@ -176,25 +196,48 @@ def open_dir(path, create=False, mode=DEFAULT_DIR_MODE):
                     # unlink to EXIT_OK, so a token whose directory does not
                     # exist yet reads as "no token" rather than an error.
                     raise Missing("%s does not exist" % walked)
+                old_umask = os.umask(0)
                 try:
-                    os.mkdir(component, mode, dir_fd=fd)
-                except FileExistsError:
-                    # Lost a benign race with another Clipbasket process; the
-                    # open below re-checks whatever is there now, so a hostile
-                    # winner is still caught.
-                    pass
-                except OSError as mkexc:
-                    raise Failed("cannot create %s: %s" % (walked, mkexc.strerror))
+                    try:
+                        # Passing 0700 is not enough when umask can reduce it to
+                        # 000: on macOS we then cannot even re-open the directory
+                        # in order to fchmod it. Create at the exact private mode
+                        # and still fchmod the verified descriptor below.
+                        os.mkdir(component, create_mode, dir_fd=fd)
+                        created_this = True
+                    except FileExistsError:
+                        # Lost a benign race with another Clipbasket process;
+                        # the open below re-checks whatever is there now, so a
+                        # hostile winner is still caught.
+                        pass
+                    except OSError as mkexc:
+                        raise Failed("cannot create %s: %s" % (walked, mkexc.strerror))
+                finally:
+                    os.umask(old_umask)
                 created_any = True
                 try:
                     child = os.open(component, OPEN_DIR_FLAGS, dir_fd=fd)
                 except OSError as reexc:
-                    if reexc.errno == errno.ELOOP:
-                        raise Refused("%s became a symlink; refusing" % walked)
+                    if reexc.errno in (errno.ELOOP, errno.ENOTDIR):
+                        # Linux reports ELOOP here; macOS commonly reports
+                        # ENOTDIR for the same post-mkdir symlink substitution.
+                        raise Refused(_describe_bad_component(fd, component, walked))
                     raise Failed("cannot open %s: %s" % (walked, reexc.strerror))
             # A directory we just created must be ours; an ancestor that
             # predates us may be root's.
-            _fstat_dir(child, walked, allow_root=not created_any)
+            try:
+                _fstat_dir(child, walked, allow_root=not created_any)
+                if created_this:
+                    # mkdir honours umask. fchmod the descriptor so a strict
+                    # umask cannot silently turn the requested contract into a
+                    # different mode (and so parents are exactly 0700).
+                    os.fchmod(child, create_mode)
+            except BaseException:
+                # `child` is not yet installed as the loop's live descriptor;
+                # without this close, a failed fstat/fchmod leaks it.
+                os.close(child)
+                raise
+            created_any = created_any or created_this
             os.close(fd)
             fd = child
         return fd
@@ -212,13 +255,14 @@ def _check_name(name):
 def cmd_ensure_dir(path, mode):
     fd = open_dir(path, create=True, mode=mode)
     try:
+        # The path passed to ensure-dir is the object being entrusted, not just
+        # a root-owned ancestor on the way to a file.
+        _fstat_dir(fd, path, allow_root=False)
         # chmod through the descriptor, not the name: the umask may have
         # narrowed the mkdir, and a pathname chmod would be another window.
         os.fchmod(fd, mode)
-    except OSError:
-        # A pre-existing directory the user has deliberately loosened is their
-        # business; the ownership and type checks above are the security ones.
-        pass
+    except OSError as exc:
+        raise Failed("cannot set mode on %s: %s" % (path, exc.strerror))
     finally:
         os.close(fd)
     return EXIT_OK
@@ -247,9 +291,8 @@ def _refuse_if_dest_unsafe(dfd, name, dirpath):
         os.close(fd)
 
 
-def cmd_write(dirpath, name, mode):
+def cmd_write(dirpath, name, mode, max_bytes):
     _check_name(name)
-    payload = sys.stdin.buffer.read()
     dfd = open_dir(dirpath, create=False)
     tmpname = None
     try:
@@ -272,9 +315,29 @@ def cmd_write(dirpath, name, mode):
             raise Failed("could not find a free temporary name in %s" % dirpath)
 
         try:
+            # O_CREAT's mode is filtered through umask; make the requested mode
+            # exact on the descriptor before any bytes become publishable.
+            os.fchmod(tfd, mode)
+
             written = 0
-            while written < len(payload):
-                written += os.write(tfd, payload[written:])
+            stdin_fd = sys.stdin.fileno()
+            while True:
+                # Read one byte past the remaining allowance. This rejects an
+                # oversized or never-ending producer without buffering it in
+                # memory and without ever publishing a truncated destination.
+                remaining = max_bytes - written
+                chunk = os.read(stdin_fd, min(65536, remaining + 1))
+                if not chunk:
+                    break
+                if len(chunk) > remaining:
+                    raise Failed("stdin exceeds --max-bytes %d" % max_bytes)
+                view = memoryview(chunk)
+                while view:
+                    count = os.write(tfd, view)
+                    if count <= 0:
+                        raise Failed("short write in %s" % dirpath)
+                    view = view[count:]
+                written += len(chunk)
             # The rename below is atomic, but only orders against the data if
             # the data is on disk first; otherwise a crash can leave the new
             # name pointing at a zero-length file.
@@ -403,6 +466,22 @@ def _selftest():
         rc, _, _ = run(["ensure-dir", target])
         check("ensure-dir is idempotent", rc == 0)
 
+        # A permissive leaf must not make newly created parents permissive, and
+        # a restrictive umask must not silently narrow either requested mode.
+        masked = os.path.join(root, "masked", "parent", "public-leaf")
+        old_umask = os.umask(0o777)
+        try:
+            rc, _, err = run(["ensure-dir", masked, "--mode", "755"])
+        finally:
+            os.umask(old_umask)
+        check("ensure-dir keeps new intermediates private",
+              rc == 0
+              and stat.S_IMODE(os.stat(os.path.join(root, "masked")).st_mode) == 0o700
+              and stat.S_IMODE(os.stat(os.path.join(root, "masked", "parent")).st_mode) == 0o700,
+              err.decode())
+        check("ensure-dir applies the leaf mode despite umask",
+              stat.S_IMODE(os.stat(masked).st_mode) == 0o755)
+
         # 4: refuses a symlinked component, and creates nothing behind it
         elsewhere = os.path.join(root, "elsewhere")
         os.mkdir(elsewhere)
@@ -426,6 +505,32 @@ def _selftest():
         check("write creates the file",
               rc == 0 and open(wrote, "rb").read() == b'{"a":1}'
               and stat.S_IMODE(os.stat(wrote).st_mode) == 0o600, err.decode())
+
+        # O_CREAT applies umask before returning the descriptor. The explicit
+        # fchmod in cmd_write must restore the mode the caller asked for.
+        old_umask = os.umask(0o777)
+        try:
+            rc, _, err = run(["write", target, "masked", "--mode", "640"], b"mode")
+        finally:
+            os.umask(old_umask)
+        check("write applies its mode despite umask",
+              rc == 0
+              and stat.S_IMODE(os.stat(os.path.join(target, "masked")).st_mode) == 0o640,
+              err.decode())
+
+        # The cap is checked while streaming into the private temp file. Exact
+        # limit is accepted; limit+1 leaves the previous destination untouched.
+        rc, _, err = run(["write", target, "bounded", "--max-bytes", "4"], b"1234")
+        bounded = os.path.join(target, "bounded")
+        check("write accepts content exactly at --max-bytes",
+              rc == 0 and open(bounded, "rb").read() == b"1234", err.decode())
+        rc, _, err = run(["write", target, "bounded", "--max-bytes", "4"], b"12345")
+        check("write rejects content over --max-bytes without replacing the destination",
+              rc == EXIT_ERROR and open(bounded, "rb").read() == b"1234"
+              and b"exceeds --max-bytes 4" in err,
+              "rc=%d %s" % (rc, err.decode().strip()))
+        check("an over-limit write leaves no temp file",
+              [n for n in os.listdir(target) if n.startswith(".bounded.")] == [])
 
         # 7: write replaces an existing regular file
         rc, _, _ = run(["write", target, "settings.json"], b'{"a":2}')
@@ -542,7 +647,7 @@ def _selftest():
 
 USAGE = """usage:
   clipbasket-safefile ensure-dir <path> [--mode 700]
-  clipbasket-safefile write <dir> <name> [--mode 600]    # stdin -> file
+  clipbasket-safefile write <dir> <name> [--mode 600] [--max-bytes N]
   clipbasket-safefile read <dir> <name>                  # file -> stdout
   clipbasket-safefile unlink <dir> <name>
   clipbasket-safefile --selftest
@@ -566,6 +671,30 @@ def _take_mode(args, default):
     return mode, rest
 
 
+def _take_write_options(args):
+    """Pull write-only options out of argv without any shell parsing."""
+    mode = DEFAULT_FILE_MODE
+    max_bytes = DEFAULT_MAX_BYTES
+    rest = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--mode":
+            if i + 1 >= len(args):
+                raise Failed("--mode needs a value")
+            mode = _parse_mode(args[i + 1])
+            i += 2
+            continue
+        if args[i] == "--max-bytes":
+            if i + 1 >= len(args):
+                raise Failed("--max-bytes needs a value")
+            max_bytes = _parse_max_bytes(args[i + 1])
+            i += 2
+            continue
+        rest.append(args[i])
+        i += 1
+    return mode, max_bytes, rest
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         sys.stdout.write(USAGE)
@@ -581,10 +710,10 @@ def main(argv):
                 raise Failed("ensure-dir takes exactly one path")
             return cmd_ensure_dir(rest[0], mode)
         if command == "write":
-            mode, rest = _take_mode(args, DEFAULT_FILE_MODE)
+            mode, max_bytes, rest = _take_write_options(args)
             if len(rest) != 2:
                 raise Failed("write takes a directory and a name")
-            return cmd_write(rest[0], rest[1], mode)
+            return cmd_write(rest[0], rest[1], mode, max_bytes)
         if command == "read":
             if len(args) != 2:
                 raise Failed("read takes a directory and a name")
@@ -605,10 +734,10 @@ def main(argv):
     except Failed as exc:
         _warn(str(exc))
         return EXIT_ERROR
+    except BrokenPipeError:
+        return EXIT_ERROR
     except OSError as exc:
         _warn("%s: %s" % (exc.filename or "", exc.strerror))
-        return EXIT_ERROR
-    except BrokenPipeError:
         return EXIT_ERROR
 
 

@@ -403,8 +403,8 @@ privileged write. bash cannot do this itself: it has no `O_NOFOLLOW`, no
 
 | Command | What it binds |
 | --- | --- |
-| `ensure-dir <path> [--mode]` | Opens every component with `O_DIRECTORY\|O_NOFOLLOW`, creating missing ones with `mkdirat`; `fstat`s each descriptor for "is a directory, owned by us" |
-| `write <dir> <name> [--mode]` | stdin → a `O_CREAT\|O_EXCL\|O_NOFOLLOW` temp file inside the **verified descriptor**, `fsync`, then `renameat` onto the final name |
+| `ensure-dir <path> [--mode]` | Opens every component with `O_DIRECTORY\|O_NOFOLLOW`, creating missing parents as exact `0700` and applying the requested mode only to the leaf; `fstat`s each descriptor for "is a directory, owned by us" |
+| `write <dir> <name> [--mode] [--max-bytes N]` | Streams at most `N` bytes (64 MiB by default) into an `O_CREAT\|O_EXCL\|O_NOFOLLOW` temp file inside the **verified descriptor**, `fchmod`s the exact mode despite `umask`, `fsync`s, then `renameat`s onto the final name |
 | `read <dir> <name>` | `openat` with `O_NOFOLLOW`, `fstat` regular-and-owned, stream to stdout |
 | `unlink <dir> <name>` | `unlinkat` relative to the verified descriptor; a planted symlink is removed *as the link*, never followed |
 
@@ -424,13 +424,13 @@ means the attacker owns a directory nobody is writing to.
 | Write | Bound by |
 | --- | --- |
 | `clips.db`, and its `-wal` / `-shm` | **CWD pinning**: `clipbasket-db` `cd -P`s into the state directory once, confirms `$PWD` came back equal to the path it asked for (so no component was a symlink) and that `.` is owned by us, then opens the database as `./clips.db`. sqlite3 resolves against the held working directory, and the journal files follow the database into it. |
-| `.fts` and `.schema-vN` stamps | **CWD pinning**, same as the database. These are read on every `list` and `count`, so a helper call would be a python fork per keystroke; once pinned they are addressed by relative name and resolve against the same held descriptor |
+| `.fts-enabled`, `.fts-disabled`, `.schema-vN` markers | `safefile write` / `unlink`. The hot path never opens marker content: non-symlink, owned, regular-file existence is only an untrusted cache hint, so the FTS-enabled path stays fork-free without following a planted marker. The legacy `.fts` name is removed through `unlinkat`. |
 | `suppress` (write and consume) | `safefile write` / `read` / `unlink` |
 | `images/<hash>.<ext>`, `thumbs/<hash>.png` | Staged in `$TMPDIR`, published with `safefile write` |
 | `settings.json` (CLI and panel) | `safefile write`, with jq still doing the merge |
 | `make-default.json`, `backups/bindings.lua.*` | `safefile write` |
 | `globalShortcut` mirrored into `settings.json` | `safefile write`, best-effort: a refusal warns rather than failing the keybinding change it followed |
-| `bindings.lua` | Resolved **once** with `readlink -f` — this is the one path that may legitimately be a symlink, because dotfile repos do that — then replaced with `safefile write` against the resolved directory |
+| `bindings.lua` | Resolved **once** with `readlink -f`, required to remain inside the canonical `$XDG_CONFIG_HOME`, then replaced as mode `0644` with `safefile write` against the resolved directory |
 
 The pathname checks (`ensure_private_dir`, `refuse_symlink`) are still there
 and still run first. They are fast-fail UX: they turn the common mistake into a
@@ -443,6 +443,13 @@ name used to read as "already stored", skip the write, and get recorded —
 refusing nothing and logging nothing. Those tests now ask `[ -L ]` as well, so
 anything that is not a real file goes down the write path where the helper
 refuses it.
+
+The read and cleanup sides use the same discipline. `copy` accepts an image
+path only when its parent is exactly `images/`, then streams the single basename
+through `safefile read`; an asset symlink therefore produces no clipboard
+bytes. Deletion accepts only direct children of `images/` or `thumbs/` and
+passes the basename to `safefile unlink`. A prefix-shaped value such as
+`images/../precious` is ignored rather than unlinked.
 
 ### Bounded reads
 
@@ -462,8 +469,15 @@ one terminate rather than stream into a pipe nobody is draining.
 | Read | Bound |
 | --- | --- |
 | the payload on stdin | `CLIPBASKET_MAX_TEXT_BYTES` or `CLIPBASKET_MAX_IMAGE_BYTES`, by watcher |
+| `wl-paste --list-types` | `CLIPBASKET_MAX_TYPES_BYTES` (65536); an oversized partial type list is unclassifiable and the change is dropped before the confidential check |
 | the `text/html` flavour | `CLIPBASKET_MAX_HTML_BYTES` |
-| `text/uri-list`, both readers | `CLIPBASKET_MAX_URI_LIST_BYTES`, default `MAX_FILE_ITEMS * 4096 + 1` — generous per URI, so a list inside the item limit is never truncated and one past it is rejected by the count check |
+| `text/uri-list`, both readers | `CLIPBASKET_MAX_URI_LIST_BYTES`, default `MAX_FILE_ITEMS * 4096 + 1`; raw bytes are staged at limit+1 and rejected before parsing, so a partial final path is never recorded |
+| `hyprctl activewindow` | 256 bytes, before `awk` parses the client-controlled `initialClass` line |
+
+ImageMagick receives a second, decoder-level envelope on both `identify -ping`
+and thumbnail conversion: memory 256 MiB, map 256 MiB, area 64 MP and time 10
+seconds. If the bounded header probe cannot determine dimensions, Clipbasket
+stores the original but skips thumbnail decoding entirely.
 
 ### The boundary, stated plainly
 
@@ -481,10 +495,11 @@ records how far it got: it is cut off within a pipe buffer of the limit rather
 than draining, the clip is rejected by the existing check, and a producer that
 never closes is shown to return rather than hang.
 
-`clipbasket-safefile --selftest` covers the descriptor binding: 21 cases including planted symlinks
+`clipbasket-safefile --selftest` covers the descriptor binding: 29 cases including planted symlinks
 at a directory component, at a write destination and at an unlink target,
-wrong-owner refusal, temp-file cleanup on both the success and the refusal
-path, and an assertion that nothing appears behind any planted link. Each of
+wrong-owner refusal, exact modes under a restrictive `umask`, private
+intermediate directories, bounded streaming, temp-file cleanup on both the
+success and the refusal path, and an assertion that nothing appears behind any planted link. Each of
 the three shell suites additionally asserts that its writes actually go
 *through* the helper, by pointing `CLIPBASKET_SAFEFILE` at a path that does not
 exist and requiring the write to fail.
@@ -492,10 +507,10 @@ exist and requiring the write to fail.
 ## Testing
 
 ```
-bin/clipbasket-db selftest        # 122 cases, incl. migration, has_html, markdown, copy
-bin/clipbasket-html2md --selftest # ~66 cases, one per supported element
-bin/clipbasket-capture --selftest #  37 cases, against stubbed wl-paste/wl-copy
-bin/clipbasket-omarchy selftest   #  25 cases, against a sandboxed bindings.lua
+bin/clipbasket-db selftest        # 138 cases, incl. migration, copy/GC exploit regressions
+bin/clipbasket-html2md --selftest #  66 cases, one per supported element
+bin/clipbasket-capture --selftest #  69 cases, against stubbed producers and ImageMagick
+bin/clipbasket-omarchy selftest   #  33 cases, against a sandboxed bindings.lua
 ```
 
 `clipbasket-db selftest` runs entirely in a temp directory and never touches the
@@ -521,6 +536,8 @@ the image's **file bytes** on `--type image/png` rather than its preview string.
 | `CLIPBASKET_MAX_HTML_BYTES` | 8388608 |
 | `CLIPBASKET_MAX_IMAGE_BYTES` | 67108864 |
 | `CLIPBASKET_MAX_FILE_ITEMS` | 1024 |
+| `CLIPBASKET_MAX_URI_LIST_BYTES` | `CLIPBASKET_MAX_FILE_ITEMS * 4096 + 1` |
+| `CLIPBASKET_MAX_TYPES_BYTES` | 65536 |
 | `CLIPBASKET_MAX_IMAGE_DIMENSION` | 16384 |
 | `CLIPBASKET_MAX_CLIPS` | 1000 |
 | `CLIPBASKET_IGNORE_CONFIDENTIAL` | 1 (`0` records confidential offers) |

@@ -40,6 +40,10 @@ MAX_FILE_ITEMS="${CLIPBASKET_MAX_FILE_ITEMS:-1024}"
 # A URI is a path plus a scheme and percent-encoding; 4 KiB each is far more
 # than any real one and keeps a full MAX_FILE_ITEMS list well inside the bound.
 MAX_URI_LIST_BYTES="${CLIPBASKET_MAX_URI_LIST_BYTES:-$((MAX_FILE_ITEMS * 4096 + 1))}"
+# MIME discovery runs before the confidential-offer check on every clipboard
+# change. It is attacker-controlled producer output too, so it needs its own
+# small bound; an oversized/truncated list is rejected as unclassifiable.
+MAX_TYPES_BYTES="${CLIPBASKET_MAX_TYPES_BYTES:-65536}"
 MAX_CLIPS="${CLIPBASKET_MAX_CLIPS:-1000}"
 THUMB_SIZE="${CLIPBASKET_THUMB_SIZE:-224}"
 # CLIPBOARD_IMAGE_MAX_DIMENSION in the desktop app. A guard on *decoded* pixels
@@ -107,9 +111,9 @@ safe_ensure_dir() {
 }
 
 safe_write() {
-	# $1 dir, $2 name, $3 mode. Content on stdin.
-	local rc=0
-	"$SAFEFILE" write "$1" "$2" --mode "${3:-600}" || rc=$?
+	# $1 dir, $2 name, $3 mode, $4 maximum input bytes. Content on stdin.
+	local rc=0 max="${4:-$MAX_IMAGE_BYTES}"
+	"$SAFEFILE" write "$1" "$2" --mode "${3:-600}" --max-bytes "$max" || rc=$?
 	if [ "$rc" -ne 0 ]; then log "refusing to write $1/$2 (clipbasket-safefile exit $rc)"; return 1; fi
 	return 0
 }
@@ -298,9 +302,12 @@ bounded_cat() {
 # of the copy. Same approximation the Tauri app makes on macOS and Windows.
 source_app() {
 	command -v hyprctl >/dev/null 2>&1 || return 0
-	hyprctl activewindow 2>/dev/null |
+	# initialClass is supplied by the focused client. Bound before awk sees the
+	# line: bounding after it would still let awk buffer an arbitrarily long one.
+	{ hyprctl activewindow 2>/dev/null |
+		bounded_cat 256 |
 		awk -F': ' '/^[[:space:]]*initialClass: /{ print $2; exit }' |
-		tr -d '\r'
+		tr -d '\r'; } || true
 }
 
 # --- URL handling ----------------------------------------------------------
@@ -510,12 +517,21 @@ magick_cmd() {
 # otherwise the PNG header, which covers what compositors and screenshot tools
 # actually put on a Wayland clipboard.
 image_dimensions() {
-	local file="$1" magick
-	magick=$(magick_cmd)
-	if [ -n "$magick" ]; then
+	local file="$1"
+	if command -v magick >/dev/null 2>&1; then
 		# -ping reads the header and stops; without it identify decodes the
 		# whole image, which is exactly what the caller is guarding against.
-		"$magick" identify -ping -format '%w %h' "${file}[0]" 2>/dev/null && return 0
+		# Resource limits still apply: malformed coders and hostile headers must
+		# not get an unlimited process merely because this is only the probe.
+		magick identify \
+			-limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10 \
+			-ping -format '%w %h' "${file}[0]" 2>/dev/null && return 0
+	elif command -v identify >/dev/null 2>&1; then
+		# ImageMagick 6 exposes identify as a separate binary rather than as the
+		# `magick identify` subcommand.
+		identify \
+			-limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10 \
+			-ping -format '%w %h' "${file}[0]" 2>/dev/null && return 0
 	fi
 	# 89 50 4E 47 = \x89PNG; IHDR width/height are bytes 16..23, big-endian.
 	if [ "$(od -An -tx1 -N4 "$file" | tr -d ' \n')" = "89504e47" ]; then
@@ -531,14 +547,28 @@ image_dimensions() {
 # not its correctness. The destination is a parameter because the caller stages
 # it under a temporary name and only renames it once the row exists.
 make_thumbnail() {
-	local source="$1" dest="$2" magick
-	magick=$(magick_cmd)
-	[ -n "$magick" ] || return 0
+	local source="$1" dest="$2"
 	# `png:` states the output format rather than letting ImageMagick infer it
 	# from the extension: the destination is now a staging file in TMPDIR, which
 	# has none, and an inferred format there is a silent failure.
-	if ! "$magick" "${source}[0]" -thumbnail "${THUMB_SIZE}x${THUMB_SIZE}>" \
-		-background none -alpha background "png:$dest" 2>/dev/null; then
+	if command -v magick >/dev/null 2>&1; then
+		magick -limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10 \
+			"${source}[0]" -thumbnail "${THUMB_SIZE}x${THUMB_SIZE}>" \
+			-background none -alpha background "png:$dest" 2>/dev/null || {
+				rm -f -- "$dest"
+				return 0
+			}
+	elif command -v convert >/dev/null 2>&1; then
+		convert -limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10 \
+			"${source}[0]" -thumbnail "${THUMB_SIZE}x${THUMB_SIZE}>" \
+			-background none -alpha background "png:$dest" 2>/dev/null || {
+				rm -f -- "$dest"
+				return 0
+			}
+	else
+		return 0
+	fi
+	if [ ! -s "$dest" ]; then
 		rm -f -- "$dest"
 	fi
 	return 0
@@ -606,15 +636,36 @@ record() {
 	"$DB_CLI" prune --max "$MAX_CLIPS" >/dev/null 2>&1 || true
 }
 
+# Fetches and parses text/uri-list into the NUL-delimited file at $1. The raw
+# producer is staged at limit+1 first so a partial final URI can never be
+# mistaken for a complete, under-limit list. Status 2 means oversized; callers
+# treat that as an offer they own but deliberately drop, never as text/image.
+read_uri_list_paths() {
+	local dest="$1" raw size
+	mktempfile
+	raw="$REPLY_TMPFILE"
+	"$WL_PASTE_BIN" --no-newline --type text/uri-list 2>/dev/null |
+		bounded_cat $((MAX_URI_LIST_BYTES + 1)) >"$raw" || true
+	size=$(file_size "$raw")
+	if [ "$size" -gt "$MAX_URI_LIST_BYTES" ]; then
+		: >"$dest"
+		log "skipping ${size}-byte file list (limit $MAX_URI_LIST_BYTES)"
+		return 2
+	fi
+	uri_list_paths <"$raw" >"$dest"
+}
+
 # True when the offer's text/uri-list resolves to at least one local path.
 # The image watcher's half of the file-copy check: a NUL-delimited list is
 # non-empty exactly when there is a path in it, so no grep is involved.
 offer_is_local_file_list() {
-	local probe
+	local probe status=0
 	mktempfile
 	probe="$REPLY_TMPFILE"
-	"$WL_PASTE_BIN" --no-newline --type text/uri-list 2>/dev/null |
-		bounded_cat $((MAX_URI_LIST_BYTES)) | uri_list_paths >"$probe" || true
+	read_uri_list_paths "$probe" || status=$?
+	# An oversized list is still conclusively a file-list offer. Claim and drop
+	# it so the image watcher cannot reinterpret a truncated payload as an image.
+	[ "$status" -eq 2 ] && return 0
 	[ -s "$probe" ]
 }
 
@@ -627,14 +678,14 @@ offer_is_local_file_list() {
 # file list", so the text watcher recorded the plain-text rendering of the same
 # paths as a second clip -- with the one-shot suppression token already spent.
 capture_files() {
-	local paths count hash payload preview app mime='' first=''
+	local paths count hash payload preview app mime='' first='' status=0
 	mktempfile
 	paths="$REPLY_TMPFILE"
 	# Bounded before the parse, not after: a hostile uri-list is a stream like
 	# any other. The generous per-path ceiling means a list under the item limit
 	# is never truncated, and one over it is rejected by the count check below.
-	"$WL_PASTE_BIN" --no-newline --type text/uri-list 2>/dev/null |
-		bounded_cat $((MAX_URI_LIST_BYTES)) | uri_list_paths >"$paths" || true
+	read_uri_list_paths "$paths" || status=$?
+	[ "$status" -eq 2 ] && return 2
 	count_paths "$paths"
 	count="$REPLY_COUNT"
 	[ "$count" -gt 0 ] || return 1
@@ -730,6 +781,13 @@ capture_image() {
 		width=${dims%% *}
 		height=${dims##* }
 	fi
+	case "$width" in '' | *[!0-9]*) width='' ;; esac
+	case "$height" in '' | *[!0-9]*) height='' ;; esac
+	if { [ -n "$width" ] && [ "$width" -eq 0 ]; } ||
+		{ [ -n "$height" ] && [ "$height" -eq 0 ]; }; then
+		width=''
+		height=''
+	fi
 
 	# The decoded-pixel guard, mirroring CLIPBOARD_IMAGE_MAX_DIMENSION in the
 	# desktop app. Dimensions come from the header (-ping / the PNG IHDR), so
@@ -743,11 +801,15 @@ capture_image() {
 	fi
 
 	# The thumbnail is content-addressed on the same hash, so it is staged and
-	# renamed with the image for exactly the same reason.
+	# renamed with the image for exactly the same reason. Unknown dimensions are
+	# a fail-closed thumbnail decision: never full-decode what the header probe
+	# could not size. The original remains a valid, copyable clip.
 	thumb_target="$THUMB_DIR/$hash.png"
 	staged_thumb=''
+	if [ -z "$width" ] || [ -z "$height" ]; then
+		thumb="$target"
 	# Same non-following reuse test as the image above, for the same reason.
-	if [ -f "$thumb_target" ] && [ ! -L "$thumb_target" ]; then
+	elif [ -f "$thumb_target" ] && [ ! -L "$thumb_target" ]; then
 		thumb="$thumb_target"
 	else
 		mktempfile
@@ -808,11 +870,11 @@ capture_image() {
 	# Publish. Both go through the helper, so the bytes land in the directory
 	# whose descriptor was verified rather than at a name that merely looked
 	# right a moment ago.
-	if [ -n "$staged" ] && ! safe_write "$IMAGE_DIR" "$hash.$extension" 644 <"$staged"; then
+	if [ -n "$staged" ] && ! safe_write "$IMAGE_DIR" "$hash.$extension" 644 "$MAX_IMAGE_BYTES" <"$staged"; then
 		return 2
 	fi
 	if [ -n "$staged_thumb" ]; then
-		safe_write "$THUMB_DIR" "$hash.png" 644 <"$staged_thumb" || true
+		safe_write "$THUMB_DIR" "$hash.png" 644 "$MAX_IMAGE_BYTES" <"$staged_thumb" || true
 	fi
 	return 0
 }
@@ -1046,6 +1108,9 @@ cmd_selftest() {
 	asset_count() {
 		find "$state/images" -type f 2>/dev/null | wc -l | tr -d ' '
 	}
+	thumb_count() {
+		find "$state/thumbs" -type f 2>/dev/null | wc -l | tr -d ' '
+	}
 	# $1 dest, $2 width, $3 height. Signature + IHDR header only: enough for
 	# image_dimensions, which reads bytes 16..23, and small enough that no
 	# decoder will touch it.
@@ -1107,6 +1172,52 @@ cmd_selftest() {
 	check 'an image over the pixel cap is not recorded' '0' "$(clip_count)"
 	check 'and leaves no asset behind' '0' "$(asset_count)"
 
+	# ImageMagick is an unsandboxed decoder. Assert the exact resource envelope
+	# on both the header probe and thumbnail conversion, then make the probe fail
+	# and prove that unknown dimensions do not fall through to a full decode.
+	local magick_bin="$SELFTEST_ROOT/magick-bin" magick_log="$SELFTEST_ROOT/magick.log"
+	local old_path="$PATH" unknown_image="$SELFTEST_ROOT/unknown-image"
+	mkdir -p "$magick_bin"
+	cat >"$magick_bin/magick" <<-'STUB'
+		#!/bin/sh
+		printf '%s\n' "$*" >>"$CLIPBASKET_SELFTEST_MAGICK_LOG"
+		if [ "$1" = identify ]; then
+			[ -z "${CLIPBASKET_SELFTEST_MAGICK_FAIL_IDENTIFY:-}" ] || exit 1
+			printf '32 16'
+			exit 0
+		fi
+		last=''
+		for last do :; done
+		printf 'THUMB' >"${last#png:}"
+	STUB
+	chmod +x "$magick_bin/magick"
+	export CLIPBASKET_SELFTEST_MAGICK_LOG="$magick_log"
+	PATH="$magick_bin:$PATH"
+	export PATH
+
+	reset_db
+	printf 'image/png\n' >"$fix/types"
+	: >"$magick_log"
+	run_capture image "$SELFTEST_ROOT/small.png"
+	check 'ImageMagick limits wrap both identify and thumbnail' '2' \
+		"$(grep -c -- '-limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10' "$magick_log" || true)"
+	check 'the limited conversion still publishes a thumbnail' '1' "$(thumb_count)"
+
+	reset_db
+	printf 'not an image header' >"$unknown_image"
+	: >"$magick_log"
+	export CLIPBASKET_SELFTEST_MAGICK_FAIL_IDENTIFY=1
+	run_capture image "$unknown_image"
+	unset CLIPBASKET_SELFTEST_MAGICK_FAIL_IDENTIFY
+	check 'an image with unknown dimensions is still recorded' '1' "$(clip_count)"
+	check 'unknown dimensions skip the thumbnail decoder' '0' \
+		"$(grep -c -- '-thumbnail' "$magick_log" || true)"
+	check 'and no thumbnail asset is published' '0' "$(thumb_count)"
+
+	PATH="$old_path"
+	export PATH
+	unset CLIPBASKET_SELFTEST_MAGICK_LOG
+
 	# The confidential parity switch.
 	reset_db
 	printf 'text/plain\napplication/x-kde-passwordManagerHint\n' >"$fix/types"
@@ -1139,6 +1250,29 @@ cmd_selftest() {
 	check_contains 'a re-copied path with a percent round-trips exactly' \
 		"\"path\":\"$files_dir/100%.txt\"" "$listing"
 
+	# The uri-list bound must retain one extra byte long enough to distinguish an
+	# exact-limit list from a truncated final path. Oversized lists are owned and
+	# dropped by both watchers rather than reinterpreted as text or image.
+	local uri_size
+	printf 'file:///tmp/exact-limit.txt\n' >"$fix/type.text_uri-list"
+	uri_size=$(file_size "$fix/type.text_uri-list")
+	reset_db
+	out=$(printf 'plain fallback' |
+		CLIPBASKET_MAX_URI_LIST_BYTES="$uri_size" "$SCRIPT_DIR/clipbasket-capture" text 2>&1 || true)
+	check 'a uri-list exactly at the byte limit is accepted' '1' "$(clip_count)"
+	check 'and it is classified as files' '1' \
+		"$($DB_CLI count --filter files 2>/dev/null | sed -n 's/.*\"filtered\":\([0-9]*\).*/\1/p')"
+
+	reset_db
+	out=$(printf 'plain fallback' |
+		CLIPBASKET_MAX_URI_LIST_BYTES=$((uri_size - 1)) "$SCRIPT_DIR/clipbasket-capture" text 2>&1 || true)
+	check_contains 'an oversized uri-list is rejected instead of truncated' 'file list' "$out"
+	check_contains 'and the uri-list log names the configured limit' "limit $((uri_size - 1))" "$out"
+	check 'the text watcher does not record its fallback rendering' '0' "$(clip_count)"
+	out=$(CLIPBASKET_MAX_URI_LIST_BYTES=$((uri_size - 1)) \
+		"$SCRIPT_DIR/clipbasket-capture" image <"$SELFTEST_ROOT/small.png" 2>&1 || true)
+	check 'the image watcher also claims and drops the oversized file offer' '0' "$(clip_count)"
+
 	# predictable-path hardening: a planted symlink at images/ is refused
 	reset_db
 	printf 'image/png\n' >"$fix/types"
@@ -1167,6 +1301,58 @@ cmd_selftest() {
 	esac
 	check 'and the file behind the link is untouched' 'original' "$(cat "$state/victim.png")"
 	rm -f "$state/images/$sym_hash.png" "$state/victim.png"
+
+	# hyprctl reports a client-controlled initialClass. Feed an endless single
+	# line and prove the parser sees only the first 256 producer bytes.
+	local hypr_bin="$SELFTEST_ROOT/hypr-bin" app app_bytes
+	mkdir -p "$hypr_bin"
+	cat >"$hypr_bin/hyprctl" <<-'STUB'
+		#!/bin/sh
+		[ "$1" = activewindow ] || exit 1
+		printf 'initialClass: '
+		yes x | tr -d '\n'
+	STUB
+	chmod +x "$hypr_bin/hyprctl"
+	old_path="$PATH"
+	PATH="$hypr_bin:$PATH"
+	export PATH
+	app=$(source_app)
+	PATH="$old_path"
+	export PATH
+	app_bytes=$(printf '%s' "$app" | wc -c | tr -d ' ')
+	check 'source_app bounds client-controlled hyprctl output' 'bounded' \
+		"$([ "$app_bytes" -le 256 ] && printf bounded || printf "unbounded:$app_bytes")"
+
+	# --list-types is queried before the confidential check. A partial list
+	# cannot prove an offer is safe, so oversized and never-ending producers are
+	# bounded at limit+1 and the entire change is dropped.
+	reset_db
+	printf 'text/plain\napplication/x-kde-passwordManagerHint\n' >"$fix/types"
+	out=$(printf 'must not be recorded' |
+		CLIPBASKET_MAX_TYPES_BYTES=16 "$SCRIPT_DIR/clipbasket-capture" text 2>&1 || true)
+	check_contains 'an oversized MIME list is rejected before classification' 'MIME list' "$out"
+	check_contains 'and the MIME-list log names its configured limit' 'limit 16' "$out"
+	check 'a confidential marker beyond the cap cannot be recorded' '0' "$(clip_count)"
+
+	if command -v timeout >/dev/null 2>&1; then
+		local endless_types="$SELFTEST_ROOT/endless-types" types_rc=0
+		cat >"$endless_types" <<-'STUB'
+			#!/bin/sh
+			if [ "$1" = --list-types ]; then exec yes text/plain; fi
+			exit 1
+		STUB
+		chmod +x "$endless_types"
+		out=$(timeout 10 env CLIPBASKET_WL_PASTE="$endless_types" \
+			CLIPBASKET_MAX_TYPES_BYTES=64 "$SCRIPT_DIR/clipbasket-capture" text \
+			<"$payload_in" 2>&1) || types_rc=$?
+		out="${out} rc=$types_rc"
+		check_contains 'a never-ending MIME producer does not hang the watcher' 'rc=0' "$out"
+		check_contains 'and its partial type list is rejected' 'MIME list' "$out"
+	else
+		pass=$((pass + 2))
+		printf 'PASS  %s\n' 'a never-ending MIME producer does not hang the watcher (skipped: no timeout)'
+		printf 'PASS  %s\n' 'and its partial type list is rejected (skipped: no timeout)'
+	fi
 
 	# --- bounded producer reads (marketplace review, third round) -----------
 	# Each limit used to be checked after the whole producer stream had been
@@ -1234,22 +1420,24 @@ cmd_selftest() {
 	if command -v timeout >/dev/null 2>&1; then
 		reset_db
 		printf 'text/plain\n' >"$fix/types"
-		local endless="$SELFTEST_ROOT/endless"
+		local endless="$SELFTEST_ROOT/endless" endless_rc=0
 		cat >"$endless" <<-'STUB'
 			#!/bin/sh
-			dd if=/dev/zero bs=4096 count=2 2>/dev/null | tr '\0' 'a'
-			sleep 60
+			exec yes a
 		STUB
 		chmod +x "$endless"
-		out=$("$endless" |
-			timeout 10 env CLIPBASKET_MAX_TEXT_BYTES=1024 \
-				"$SCRIPT_DIR/clipbasket-capture" text 2>&1
-			printf 'rc=%s' "$?")
+		# Put timeout around the whole pipeline. Wrapping only the consumer leaves
+		# a shell-based producer free to sleep after its writer receives SIGPIPE.
+		out=$(timeout 10 env CLIPBASKET_MAX_TEXT_BYTES=1024 \
+			sh -c '"$1" | "$2" text' sh "$endless" "$SCRIPT_DIR/clipbasket-capture" \
+			2>&1) || endless_rc=$?
+		out="${out} rc=$endless_rc"
 		check_contains 'a never-closing producer does not hang the watcher' 'rc=0' "$out"
 		check_contains 'and its stream is rejected by the size limit' 'skipping' "$out"
 	else
-		pass=$((pass + 1))
+		pass=$((pass + 2))
 		printf 'PASS  %s\n' 'a never-closing producer does not hang the watcher (skipped: no timeout)'
+		printf 'PASS  %s\n' 'and its stream is rejected by the size limit (skipped: no timeout)'
 	fi
 
 	unset CLIPBASKET_SELFTEST_FIXTURE CLIPBASKET_WL_PASTE CLIPBASKET_WL_COPY
@@ -1261,7 +1449,7 @@ cmd_selftest() {
 	return 0
 }
 main() {
-	local mode="${1:-text}" types stdin_file
+	local mode="${1:-text}" types='' types_file types_size stdin_file
 
 	case "$mode" in
 	--selftest | selftest)
@@ -1276,7 +1464,21 @@ main() {
 	}
 	clipboard_state_is_recordable || exit 0
 
-	types=$("$WL_PASTE_BIN" --list-types 2>/dev/null || printf '')
+	# MIME discovery is a producer read just like the payload. It happens before
+	# the confidential marker check, so an unbounded owner here could otherwise
+	# wedge the watcher before the password-manager policy even runs.
+	mktempfile
+	types_file="$REPLY_TMPFILE"
+	"$WL_PASTE_BIN" --list-types 2>/dev/null |
+		bounded_cat $((MAX_TYPES_BYTES + 1)) >"$types_file" || true
+	types_size=$(file_size "$types_file")
+	if [ "$types_size" -gt "$MAX_TYPES_BYTES" ]; then
+		# A partial type list cannot prove that the offer is non-confidential or
+		# classify which watcher owns it. Fail closed and wait for the next change.
+		log "skipping clipboard offer with ${types_size}-byte MIME list (limit $MAX_TYPES_BYTES)"
+		exit 0
+	fi
+	IFS= read -r -d '' types <"$types_file" || true
 	if [ "$IGNORE_CONFIDENTIAL" != "0" ] && offer_is_confidential "$types"; then
 		log 'skipping confidential clipboard offer'
 		exit 0

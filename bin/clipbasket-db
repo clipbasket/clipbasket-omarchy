@@ -85,9 +85,9 @@ refuse_symlink() {
 # renames relative to that descriptor. bash cannot express any of that.
 # (Marketplace security review, second round, 2026-08-24.)
 safe_write() {
-	# $1 dir, $2 name, $3 mode (optional). Content on stdin.
-	local dir="$1" name="$2" mode="${3:-600}" rc=0
-	"$SAFEFILE" write "$dir" "$name" --mode "$mode" || rc=$?
+	# $1 dir, $2 name, $3 mode, $4 maximum input bytes. Content on stdin.
+	local dir="$1" name="$2" mode="${3:-600}" max="${4:-1048576}" rc=0
+	"$SAFEFILE" write "$dir" "$name" --mode "$mode" --max-bytes "$max" || rc=$?
 	[ "$rc" -eq 0 ] || die "refusing to write $dir/$name (clipbasket-safefile exit $rc)"
 }
 
@@ -129,28 +129,36 @@ safe_ensure_dir() {
 # purpose is not pinned, because there is no directory we own to pin it to.
 STATE_DIR_PINNED=0
 
-# Where the stamp files (.fts, .schema-vN) are addressed from. Once pinned this
-# becomes "./", so every stamp open resolves against the held working directory
-# -- the same descriptor binding that blesses ./clips.db, and for the same
-# reason: these are predictable names in a predictable directory, read and
-# written on the keystroke path. Routing them through clipbasket-safefile would
-# cost a python fork per `list`, which is the regression the pinning exists to
-# avoid; the CWD *is* the verified descriptor, so a relative name needs nothing
-# else. Unpinned (CLIPBASKET_DB override, relative STATE_DIR, selftest) it stays
-# absolute and behaves exactly as before.
+# Marker paths are relative after the state directory is pinned. The hot path
+# never opens them: their non-symlink, owned, regular-file existence is only an
+# untrusted cache hint, equivalent to another same-user process creating or
+# removing a file inside our state directory. All actual writes and removals go
+# through clipbasket-safefile, so a planted marker symlink is never followed.
 STAMP_PREFIX="$STATE_DIR/"
+FTS_ENABLED_STAMP='.fts-enabled'
+FTS_DISABLED_STAMP='.fts-disabled'
 
 # Recomputed rather than trusted: STATE_DIR is reassigned after this file is
 # sourced -- the selftest points it at a scratch directory -- so a prefix
 # captured at load time would send the stamps somewhere else entirely. It is
-# refreshed at the top of ensure_schema, which is the only thing that reads or
-# writes them, and stays fork-free.
+# refreshed at the top of ensure_schema before marker checks and writes, and
+# stays fork-free.
 set_stamp_prefix() {
 	if [ "$STATE_DIR_PINNED" = "1" ]; then
 		STAMP_PREFIX="./"
 	else
 		STAMP_PREFIX="$STATE_DIR/"
 	fi
+}
+
+stamp_marker_present() {
+	local path="${STAMP_PREFIX}$1"
+	[ ! -L "$path" ] && [ -f "$path" ] && [ -O "$path" ]
+}
+
+write_stamp_marker() {
+	# Marker content is deliberately irrelevant; the fast path never reads it.
+	printf 'ready\n' | safe_write "$STATE_DIR" "$1" 600 16
 }
 
 pin_state_dir() {
@@ -500,20 +508,17 @@ drop_fts_triggers() {
 probe_fts() {
 	if fts_schema | run_raw >/dev/null 2>&1; then
 		FTS_ENABLED=1
+		write_stamp_marker "$FTS_ENABLED_STAMP"
+		safe_unlink "$STATE_DIR" "$FTS_DISABLED_STAMP"
 	else
 		FTS_ENABLED=0
 		drop_fts_triggers >/dev/null 2>&1 || true
+		write_stamp_marker "$FTS_DISABLED_STAMP"
+		safe_unlink "$STATE_DIR" "$FTS_ENABLED_STAMP"
 	fi
-	printf '%s\n' "$FTS_ENABLED" >"${STAMP_PREFIX}.fts" 2>/dev/null || true
-}
-
-# True when the cached "no FTS5" answer is still trustworthy: the sqlite3 that
-# produced it has not been replaced since.
-fts_answer_is_current() {
-	local bin
-	bin=$(command -v "$SQLITE_BIN" 2>/dev/null) || return 1
-	[ -n "$bin" ] || return 1
-	[ ! "$bin" -nt "${STAMP_PREFIX}.fts" ]
+	# Remove the content-bearing legacy cache through unlinkat. If it was replaced
+	# with a symlink, this removes the link itself and never its target.
+	safe_unlink "$STATE_DIR" .fts
 }
 
 ensure_schema() {
@@ -524,24 +529,20 @@ ensure_schema() {
 	pin_state_dir || true
 	set_stamp_prefix
 
-	# Relative once pinned -- see STAMP_PREFIX. pin_state_dir has already run
-	# above, so this is resolved the same way whichever path is taken below.
-	local stamp="${STAMP_PREFIX}.schema-v$SCHEMA_VERSION"
+	local stamp_name=".schema-v$SCHEMA_VERSION" old_version
 
 	build_projections
 
 	# Fast path: no forks at all. A stamp file rather than PRAGMA user_version,
 	# because reading the pragma would itself cost a whole sqlite3 process on
 	# every keystroke.
-	if [ -f "$DB_PATH" ] && [ -f "$stamp" ]; then
-		if [ -r "${STAMP_PREFIX}.fts" ]; then
-			read -r FTS_ENABLED <"${STAMP_PREFIX}.fts" || FTS_ENABLED=0
-		fi
-		[ "$FTS_ENABLED" = "1" ] || FTS_ENABLED=0
-		# A cached yes is final. A cached no is re-probed once the sqlite3
-		# binary is newer than the answer -- the fast path stays fork-free for
-		# everyone whose sqlite3 has FTS5, which is everyone on Arch.
-		if [ "$FTS_ENABLED" = "1" ] || fts_answer_is_current; then
+	if [ -f "$DB_PATH" ] && stamp_marker_present "$stamp_name"; then
+		# The production (Arch) fast path stays fork-free: marker existence carries
+		# the cached yes and no marker bytes are ever opened. A cached no is probed
+		# again so an upgraded sqlite3 can enable FTS without trusting mtime through
+		# a potentially substituted pathname.
+		if stamp_marker_present "$FTS_ENABLED_STAMP"; then
+			FTS_ENABLED=1
 			return 0
 		fi
 		probe_fts
@@ -553,19 +554,21 @@ ensure_schema() {
 	safe_ensure_dir "$THUMB_DIR" 755
 	refuse_symlink "$DB_PATH"
 	pin_state_dir || die "could not enter $STATE_DIR"
-	# Pinning may have just succeeded for the first time; the stamps written
+	# Pinning may have just succeeded for the first time; marker existence checks
 	# below must use the form that reflects that.
 	set_stamp_prefix
-	stamp="${STAMP_PREFIX}.schema-v$SCHEMA_VERSION"
 
 	migrate_schema
 	base_schema | run_raw >/dev/null || die "could not open or create $DB_PATH"
 
 	probe_fts
-	# The stamp is per-version, so an upgraded binary always takes the slow
-	# path once and runs its migrations. Older stamps are dead weight.
-	rm -f -- "${STAMP_PREFIX}".schema-v*
-	: >"$stamp"
+	# The marker is per-version, so an upgraded binary always takes the slow path
+	# once and runs its migrations. Remove only the older names we know about,
+	# descriptor-relative; a glob could be traversal-shaped after substitution.
+	for ((old_version = 0; old_version < SCHEMA_VERSION; old_version++)); do
+		safe_unlink "$STATE_DIR" ".schema-v$old_version"
+	done
+	write_stamp_marker "$stamp_name"
 }
 
 # ---------------------------------------------------------------------------
@@ -952,7 +955,7 @@ cmd_flag() {
 # registers for cleanup dies with the subshell and is never unlinked.
 REPLY_DELETED=0
 delete_where() {
-	local predicate="$1" doomed out count hexline asset q_doomed
+	local predicate="$1" doomed out count hexline asset asset_dir asset_name q_doomed
 	mktempfile
 	doomed="$REPLY_TMPFILE"
 	sql_quote "$doomed"
@@ -987,11 +990,16 @@ delete_where() {
 			[ -n "$hexline" ] || continue
 			hex_decode "$hexline"
 			asset="$REPLY_SQL"
-			# Only ever unlink inside our own asset directories, so a
-			# hand-edited or imported row can never point the cleanup at
-			# something the user cares about.
-			case "$asset" in
-			"$IMAGE_DIR"/* | "$THUMB_DIR"/*) rm -f -- "$asset" ;;
+			# A prefix glob also matches traversal-shaped values such as
+			# images/../../precious. Require an exact direct parent, then unlink the
+			# single component through the verified directory descriptor. A planted
+			# symlink is removed as a link and is never followed.
+			asset_dir=${asset%/*}
+			asset_name=${asset##*/}
+			case "$asset_name" in '' | . | ..) continue ;; esac
+			case "$asset_dir" in
+			"$IMAGE_DIR") safe_unlink "$IMAGE_DIR" "$asset_name" ;;
+			"$THUMB_DIR") safe_unlink "$THUMB_DIR" "$asset_name" ;;
 			esac
 		done <"$doomed"
 	fi
@@ -1054,7 +1062,7 @@ cmd_suppress() {
 	local hash="${1:-}"
 	[ -n "$hash" ] || die "suppress: expected a hash"
 	safe_ensure_dir "$STATE_DIR" 700
-	printf '%s\n' "$hash" | safe_write "$STATE_DIR" suppress 600
+	printf '%s\n' "$hash" | safe_write "$STATE_DIR" suppress 600 4096
 	printf '{"ok":true}\n'
 }
 
@@ -1062,8 +1070,8 @@ cmd_suppress() {
 # capture watcher's read, so it arms suppression and bumps the clip itself
 # rather than waiting for the echo to come back around.
 cmd_copy() {
-	local kind='' hash='' image_path='' mime='' payload hash_file path_file mime_file
-	local q_hash q_path q_mime q_payload
+	local kind='' hash='' image_path='' image_name='' mime='' payload hash_file path_file mime_file
+	local q_hash q_path q_mime q_payload copy_rc=0
 	require_id "${1:-}"
 	command -v "$WL_COPY_BIN" >/dev/null 2>&1 || die "wl-copy is not installed"
 
@@ -1107,8 +1115,19 @@ cmd_copy() {
 	image_path=${image_path%$'\n'}
 	mime=${mime%$'\n'}
 
+	if [ "$kind" = image ]; then
+		[ -n "$image_path" ] || die "clip $1 has no image on disk"
+		image_name=${image_path##*/}
+		# Stored rows are untrusted input (`insert` is public). Only a direct child
+		# of our image directory is a Clipbasket asset; a prefix-only check would
+		# accept traversal components such as ../.
+		[ "${image_path%/*}" = "$IMAGE_DIR" ] ||
+			die "clip $1 has an image path outside $IMAGE_DIR"
+		case "$image_name" in '' | . | ..) die "clip $1 has an invalid image name" ;; esac
+	fi
+
 	safe_ensure_dir "$STATE_DIR" 700
-	printf '%s\n' "$hash" | safe_write "$STATE_DIR" suppress 600
+	printf '%s\n' "$hash" | safe_write "$STATE_DIR" suppress 600 4096
 
 	mktempfile
 	payload="$REPLY_TMPFILE"
@@ -1117,8 +1136,12 @@ cmd_copy() {
 
 	case "$kind" in
 	image)
-		[ -n "$image_path" ] && [ -f "$image_path" ] || die "clip $1 has no image on disk"
-		"$WL_COPY_BIN" --type "${mime:-image/png}" <"$image_path" || die "wl-copy failed"
+		# Both the directory walk and the asset open are descriptor-bound and
+		# O_NOFOLLOW. A symlink planted at images/<hash> therefore yields no bytes
+		# to wl-copy instead of exfiltrating whatever it points at.
+		"$SAFEFILE" read "$IMAGE_DIR" "$image_name" |
+			"$WL_COPY_BIN" --type "${mime:-image/png}" || copy_rc=$?
+		[ "$copy_rc" -eq 0 ] || die "clip $1 image asset could not be read safely"
 		;;
 	files)
 		# A text/uri-list carries URIs, not paths: a space or a '%' in a file
@@ -1353,7 +1376,7 @@ cmd_selftest() {
 		check_contains 'a migrated row reports has_html false' '"has_html":false' "$out"
 
 		# Re-running the migration must be a no-op, not a duplicate-column error.
-		rm -f -- "$STATE_DIR"/.schema-v*
+		safe_unlink "$STATE_DIR" ".schema-v$SCHEMA_VERSION"
 		ensure_schema
 		check 'migrating an already-migrated database is a no-op' '1' "$(column_count html)"
 
@@ -1650,6 +1673,35 @@ tab	here"
 	check 'copy image uses the image mime type' '--type image/png' "$(cat "$args_file")"
 	check 'copy image sends the file bytes, not the preview' 'PNGBYTES' "$(cat "$stdin_file")"
 
+	# A stored image path is untrusted database input. Reading it by pathname
+	# followed a planted symlink and handed the target (including private keys)
+	# straight to wl-copy. The helper must refuse before a target byte is emitted.
+	local copy_victim="$SELFTEST_ROOT/private-key" copy_id
+	printf 'PRIVATE KEY MATERIAL\n' >"$copy_victim"
+	copy_id=$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-img';")
+	rm -f -- "$IMAGE_DIR/h-copy-img.png"
+	ln -s "$copy_victim" "$IMAGE_DIR/h-copy-img.png"
+	printf 'sentinel' >"$stdin_file"
+	out=$( (CLIPBASKET_STATE_DIR="$STATE_DIR" CLIPBASKET_DB="$DB_PATH" \
+		CLIPBASKET_WL_COPY="$stub" "$SELF_BIN" copy "$copy_id") 2>&1 || true)
+	check_contains 'copy refuses a symlink planted at an image asset' 'could not be read safely' "$out"
+	check 'copy emits none of the symlink target to wl-copy' 'safe' \
+		"$(grep -q 'PRIVATE KEY MATERIAL' "$stdin_file" 2>/dev/null && printf leaked || printf safe)"
+	safe_unlink "$IMAGE_DIR" h-copy-img.png
+	printf 'PNGBYTES' >"$IMAGE_DIR/h-copy-img.png"
+
+	# Even a regular file is not an image asset unless the stored path names a
+	# direct child of images/. This also rejects traversal before wl-copy starts.
+	printf '{"kind":"image","preview":"Image","hash":"h-copy-outside","image_path":"%s/../private-key","mime":"image/png"}\n' \
+		"$IMAGE_DIR" | cmd_insert >/dev/null
+	local outside_copy_id
+	outside_copy_id=$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-outside';")
+	printf 'sentinel' >"$stdin_file"
+	out=$( (CLIPBASKET_STATE_DIR="$STATE_DIR" CLIPBASKET_DB="$DB_PATH" \
+		CLIPBASKET_WL_COPY="$stub" "$SELF_BIN" copy "$outside_copy_id") 2>&1 || true)
+	check_contains 'copy rejects an image path with traversal' 'outside' "$out"
+	check 'a rejected outside path never invokes wl-copy' 'sentinel' "$(cat "$stdin_file")"
+
 	printf '{"kind":"files","preview":"a.txt, b.txt","hash":"h-copy-files","files":[{"path":"/tmp/a.txt","name":"a.txt"},{"path":"/tmp/b.txt","name":"b.txt"}]}\n' |
 		cmd_insert >/dev/null
 	out=$(cmd_copy "$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-files';")")
@@ -1717,6 +1769,19 @@ file:///tmp/caf%C3%A9.txt' "$(cat "$stdin_file")"
 	check 'delete unlinks an asset whose path contains a newline' 'gone' \
 		"$([ -e "$nl_asset" ] && printf present || printf gone)"
 
+	# Prefix globs match images/../precious even though it resolves outside the
+	# asset directory. A public insert followed by delete must never unlink it.
+	local traversal_victim="$STATE_DIR/precious-gc.txt" traversal_id
+	printf 'PRECIOUS\n' >"$traversal_victim"
+	printf '{"kind":"image","preview":"Image","hash":"h-gc-traversal","image_path":"%s/../precious-gc.txt"}\n' \
+		"$IMAGE_DIR" | cmd_insert >/dev/null
+	traversal_id=$(run_sql "SELECT id FROM clips WHERE hash = 'h-gc-traversal';")
+	cmd_delete "$traversal_id" >/dev/null
+	check 'asset cleanup rejects a traversal path from a public insert' 'PRECIOUS' \
+		"$(cat "$traversal_victim")"
+	check 'the traversal row itself is still deleted' '0' \
+		"$(run_sql "SELECT count(*) FROM clips WHERE hash = 'h-gc-traversal';")"
+
 	# --- fts5 query syntax ------------------------------------------------
 	# fts5 reads a bare AND/OR/NOT as an operator: an unquoted token turned
 	# these into a syntax error, which dropped to the LIKE path -- where the
@@ -1757,22 +1822,43 @@ file:///tmp/caf%C3%A9.txt' "$(cat "$stdin_file")"
 	out=$(cmd_list --offset 99999999999999999999 2>/dev/null) || true
 	check_contains 'an out-of-range --offset is a JSON error' '"error"' "$out"
 
-	# --- the cached FTS5 answer -------------------------------------------
+	# --- descriptor-safe cache markers -------------------------------------
 	if [ "$FTS_ENABLED" = "1" ]; then
-		local keep_fts_flag="$FTS_ENABLED"
-		printf '0\n' >"$STATE_DIR/.fts"
-		touch -t 197001020000 "$STATE_DIR/.fts"
+		local keep_fts_flag="$FTS_ENABLED" stamp_victim="$SELFTEST_ROOT/stamp-victim"
+		printf 'STAMP VICTIM\n' >"$stamp_victim"
+
+		# The old content-bearing .fts name is removed during the first re-probe.
+		# If an attacker planted a symlink there, unlinkat removes only the link.
+		safe_unlink "$STATE_DIR" "$FTS_ENABLED_STAMP"
+		ln -s "$stamp_victim" "$STATE_DIR/.fts"
 		FTS_ENABLED=0
 		ensure_schema
-		check 'a stale "no FTS5" answer is re-probed after a sqlite3 upgrade' '1' "$FTS_ENABLED"
-		printf '0\n' >"$STATE_DIR/.fts"
-		FTS_ENABLED=0
-		ensure_schema
-		check 'a "no FTS5" answer newer than sqlite3 is trusted as it stands' '0' "$FTS_ENABLED"
-		out=$(cmd_info)
-		check_contains 'info re-probes rather than repeat a cached no' '"fts5":true' "$out"
+		check 'a missing FTS marker is re-probed after a sqlite3 upgrade' '1' "$FTS_ENABLED"
+		check 'the legacy .fts symlink is removed without touching its target' 'STAMP VICTIM' \
+			"$(cat "$stamp_victim")"
+		check 'and the legacy symlink itself is gone' 'gone' \
+			"$([ -e "$STATE_DIR/.fts" ] || [ -L "$STATE_DIR/.fts" ] && printf present || printf gone)"
+
+		# A planted new marker must be refused when the rare re-probe writes it.
+		safe_unlink "$STATE_DIR" "$FTS_ENABLED_STAMP"
+		ln -s "$stamp_victim" "$STATE_DIR/$FTS_ENABLED_STAMP"
+		out=$( (CLIPBASKET_STATE_DIR="$STATE_DIR" CLIPBASKET_DB="$DB_PATH" \
+			CLIPBASKET_SQLITE="$SQLITE_BIN" "$SELF_BIN" count) 2>&1 || true)
+		check_contains 'a symlink planted at the FTS marker is refused' 'symlink' "$out"
+		check 'and the FTS marker target is untouched' 'STAMP VICTIM' "$(cat "$stamp_victim")"
+		safe_unlink "$STATE_DIR" "$FTS_ENABLED_STAMP"
+		probe_fts
+
+		# The per-schema marker is written through the same helper.
+		safe_unlink "$STATE_DIR" ".schema-v$SCHEMA_VERSION"
+		ln -s "$stamp_victim" "$STATE_DIR/.schema-v$SCHEMA_VERSION"
+		out=$( (CLIPBASKET_STATE_DIR="$STATE_DIR" CLIPBASKET_DB="$DB_PATH" \
+			CLIPBASKET_SQLITE="$SQLITE_BIN" "$SELF_BIN" count) 2>&1 || true)
+		check_contains 'a symlink planted at the schema marker is refused' 'symlink' "$out"
+		check 'and the schema marker target is untouched' 'STAMP VICTIM' "$(cat "$stamp_victim")"
+		safe_unlink "$STATE_DIR" ".schema-v$SCHEMA_VERSION"
+		write_stamp_marker ".schema-v$SCHEMA_VERSION"
 		FTS_ENABLED="$keep_fts_flag"
-		printf '%s\n' "$FTS_ENABLED" >"$STATE_DIR/.fts"
 	fi
 
 	# --- signals ----------------------------------------------------------

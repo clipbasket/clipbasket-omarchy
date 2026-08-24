@@ -84,9 +84,9 @@ die()  { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 # a shell redirection is a window a same-user process can race.
 # (Marketplace security review, second round, 2026-08-24.)
 safe_write() {
-  # $1 dir, $2 name, $3 mode. Content on stdin.
-  local rc=0
-  "$SAFEFILE" write "$1" "$2" --mode "${3:-600}" || rc=$?
+  # $1 dir, $2 name, $3 mode, $4 maximum input bytes. Content on stdin.
+  local rc=0 max="${4:-67108864}"
+  "$SAFEFILE" write "$1" "$2" --mode "${3:-600}" --max-bytes "$max" || rc=$?
   (( rc == 0 )) || die "Refusing to write $1/$2 (clipbasket-safefile exit $rc)."
 }
 
@@ -95,8 +95,8 @@ safe_write() {
 # into settings.json must never fail a keybinding change, because the file in
 # ~/.config/hypr is the one that actually decides the binding.
 safe_write_soft() {
-  local rc=0
-  "$SAFEFILE" write "$1" "$2" --mode "${3:-600}" || rc=$?
+  local rc=0 max="${4:-67108864}"
+  "$SAFEFILE" write "$1" "$2" --mode "${3:-600}" --max-bytes "$max" || rc=$?
   (( rc == 0 )) && return 0
   warn "Could not write $1/$2 (clipbasket-safefile exit $rc)."
   return 0
@@ -261,14 +261,29 @@ keybind_live() {
 
 # --------------------------------------------------------- bindings.lua -----
 
-# The real file behind $BINDINGS_FILE. A dotfiles setup symlinks
-# ~/.config/hypr/bindings.lua into a git repo, and `mv`ing a new file over the
-# link would silently replace the link with a copy -- the user's next `stow` or
-# `git status` is then the first they hear of it.
+# The real file behind $BINDINGS_FILE. A config layout may symlink this file,
+# and replacing the link itself would silently detach it. The resolved target
+# is accepted only inside the canonical config root; writing through a link to
+# an arbitrary location would expand this command's authority beyond ~/.config.
+checked_bindings_target() {
+  local target="$1" target_dir config_root
+  target_dir=$(cd -P -- "$(dirname -- "$target")" 2>/dev/null && pwd -P) ||
+    die "Could not resolve the directory behind $BINDINGS_FILE."
+  config_root=$(cd -P -- "$CONFIG_HOME" 2>/dev/null && pwd -P) ||
+    die "Could not resolve config root $CONFIG_HOME."
+  if [[ "$config_root" != "/" ]]; then
+    case "$target_dir/" in
+      "$config_root"/*) ;;
+      *) die "Resolved bindings target $target is outside $CONFIG_HOME; refusing to write it." ;;
+    esac
+  fi
+  printf '%s/%s' "${target_dir%/}" "$(basename -- "$target")"
+}
+
 resolve_bindings_target() {
   local path="$BINDINGS_FILE" resolved dir base link
   if resolved=$(readlink -f -- "$path" 2>/dev/null) && [[ -n "$resolved" ]]; then
-    printf '%s' "$resolved"
+    checked_bindings_target "$resolved"
     return 0
   fi
   # readlink -f is GNU and modern-BSD only; walk the chain by hand otherwise.
@@ -283,7 +298,7 @@ resolve_bindings_target() {
     esac
     hops=$((hops + 1))
   done
-  printf '%s/%s' "${dir%/}" "$base"
+  checked_bindings_target "${dir%/}/$base"
 }
 
 # Fails with the friendly `die` *before* anything is written, so an unwritable
@@ -351,12 +366,12 @@ backup_bindings() {
   prune_backups 10
 }
 
-# Write $1 to the file $BINDINGS_FILE resolves to, atomically, preserving the
-# original's mode. $2 is 1 to end the file with a newline (the default) or 0 to
+# Write $1 to the file $BINDINGS_FILE resolves to, atomically, with mode 0644.
+# $2 is 1 to end the file with a newline (the default) or 0 to
 # write it without one, so `restore-default` gives back exactly the shape it
 # was handed.
 write_bindings() {
-  local content="$1" trailing="${2:-1}" target dir mode
+  local content="$1" trailing="${2:-1}" target dir
   if (( DRY_RUN )); then
     printf '    %s[dry-run]%s would write %s:\n' "$C_DIM" "$C_RESET" "$BINDINGS_FILE"
     printf '%s\n' "$content" | sed 's/^/        /'
@@ -365,17 +380,14 @@ write_bindings() {
   # Write *through* a symlink to the file it points at, and stage the temp file
   # in that file's own directory so the rename stays on one filesystem.
   # bindings.lua is the one path here that may legitimately BE a symlink --
-  # dotfile repos do this constantly -- so the link is resolved once, on
-  # purpose, and everything after that is bound to the resolved directory. The
+  # including in config layouts that keep it elsewhere under CONFIG_HOME -- so
+  # the link is resolved once, on purpose, and everything after that is bound
+  # to the resolved directory. Targets outside CONFIG_HOME are refused. The
   # helper still refuses if the resolved *directory* is reached through a
   # symlinked component, and its rename is descriptor-relative, so the resolve
   # is the only pathname step and it happens exactly once.
   target="$(resolve_bindings_target)"
   dir="$(dirname -- "$target")"
-  mode=644
-  if [[ -f "$target" ]]; then
-    mode="$(stat -c %a -- "$target" 2>/dev/null || stat -f %Lp -- "$target" 2>/dev/null || printf 644)"
-  fi
   # A single atomic replacement, so an out-of-space or interrupted write can
   # never leave the user with a truncated bindings.lua — they get the old file
   # or the new one.
@@ -383,7 +395,7 @@ write_bindings() {
     printf '%s\n' "$content"
   else
     printf '%s' "$content"
-  fi | safe_write "$dir" "$(basename -- "$target")" "$mode"
+  fi | safe_write "$dir" "$(basename -- "$target")" 644
 }
 
 # The file with our managed block removed, markers included. Everything outside
@@ -935,12 +947,15 @@ cmd_selftest() {
          printf 'FAIL  %s\n        wanted substring: %s\n        actual:   %s\n' "$1" "$2" "$3" ;;
     esac
   }
+  file_mode() {
+    stat -c %a -- "$1" 2>/dev/null || stat -f %Lp -- "$1" 2>/dev/null
+  }
 
   state="$root/state"
   # $1 bindings file, then the CLI arguments.
   cli() {
     local bindings="$1"; shift
-    CLIPBASKET_BINDINGS="$bindings" XDG_STATE_HOME="$state" \
+    CLIPBASKET_BINDINGS="$bindings" XDG_CONFIG_HOME="$root" XDG_STATE_HOME="$state" \
       CLIPBASKET_SETTINGS="$root/settings.json" NO_COLOR=1 \
       "$self" "$@" --no-reload --keep-omarchy-clipboard 2>&1 || true
   }
@@ -1019,14 +1034,31 @@ o.bind("SUPER + X", "Mine", "true")'
   local realdir="$root/real" linkdir="$root/link"
   mkdir -p "$realdir" "$linkdir"
   printf '%s\n' "$user_text" >"$realdir/bindings.lua"
+  chmod 600 "$realdir/bindings.lua"
   ln -s "$realdir/bindings.lua" "$linkdir/bindings.lua"
   cli "$linkdir/bindings.lua" make-default >/dev/null
   check 'a symlinked bindings.lua is still a symlink afterwards' 'link' \
     "$([[ -L "$linkdir/bindings.lua" ]] && printf link || printf file)"
   check_contains 'and the block landed in the file it points at' 'Clipbasket' \
     "$(cat "$realdir/bindings.lua")"
+  check 'and the resolved target is pinned to mode 0644' '644' \
+    "$(file_mode "$realdir/bindings.lua")"
   check 'with no stray temp file beside the link' '1' \
     "$(find "$linkdir" -mindepth 1 | wc -l | tr -d ' ')"
+
+  # A symlink is legitimate only while its resolved target stays inside the
+  # config root. Refuse before backup or write when it points elsewhere.
+  local confined="$root/confined" outside="$root/outside" outside_state="$root/outside-state"
+  mkdir -p "$confined" "$outside"
+  printf '%s\n' "$user_text" >"$outside/bindings.lua"
+  ln -s "$outside/bindings.lua" "$confined/bindings.lua"
+  out=$(CLIPBASKET_BINDINGS="$confined/bindings.lua" XDG_CONFIG_HOME="$confined" \
+    XDG_STATE_HOME="$outside_state" CLIPBASKET_SETTINGS="$root/settings.json" NO_COLOR=1 \
+    "$self" make-default --no-reload --keep-omarchy-clipboard 2>&1 || true)
+  check_contains 'a bindings symlink outside the config root is refused' 'outside' "$out"
+  check 'and its target is untouched' "$user_text" "$(cat "$outside/bindings.lua")"
+  check 'and no backup is created before the refusal' '0' \
+    "$(find "$outside_state" -type f 2>/dev/null | wc -l | tr -d ' ')"
 
   # --- backups are pruned ------------------------------------------------
   local churn="$root/churn.lua" i
@@ -1043,7 +1075,8 @@ o.bind("SUPER + X", "Mine", "true")'
     mkdir -p "$ro"
     printf '%s\n' "$user_text" >"$ro/bindings.lua"
     chmod 500 "$ro"
-    out=$(CLIPBASKET_BINDINGS="$ro/bindings.lua" XDG_STATE_HOME="$rostate" NO_COLOR=1 \
+    out=$(CLIPBASKET_BINDINGS="$ro/bindings.lua" XDG_CONFIG_HOME="$root" \
+      XDG_STATE_HOME="$rostate" NO_COLOR=1 \
       "$self" make-default --no-reload --keep-omarchy-clipboard 2>&1 || true)
     check_contains 'an unwritable config directory is a friendly error' 'not writable' "$out"
     check_contains 'and it names the command that fixes it' 'permissions' "$out"
