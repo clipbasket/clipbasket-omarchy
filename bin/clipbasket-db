@@ -38,6 +38,35 @@ WL_COPY_BIN="${CLIPBASKET_WL_COPY:-wl-copy}"
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 HTML2MD="${CLIPBASKET_HTML2MD:-$SCRIPT_DIR/clipbasket-html2md}"
 
+# The state, image and thumbnail directories sit at predictable paths, so
+# another process running as the same user could plant a symlink there ahead of
+# us and redirect every database and captured-content write wherever it likes.
+# Never create-and-trust: refuse anything that already exists as a symlink or
+# as something we do not own, and only then create it. (Marketplace security
+# review finding, 2026-08-24.)
+ensure_private_dir() {
+	# $1 path, $2 mode for a fresh create (optional, default 700)
+	local dir="$1" mode="${2:-700}" owner
+	if [ -L "$dir" ]; then
+		die "$dir is a symlink; refusing to write through it"
+	fi
+	if [ -e "$dir" ]; then
+		[ -d "$dir" ] || die "$dir exists and is not a directory"
+		owner=$(stat -c %u -- "$dir" 2>/dev/null || stat -f %u -- "$dir" 2>/dev/null)
+		[ "$owner" = "$(id -u)" ] || die "$dir is not owned by the current user"
+		return 0
+	fi
+	mkdir -p -- "$dir" || die "could not create $dir"
+	[ -L "$dir" ] && die "$dir became a symlink; refusing"
+	chmod "$mode" -- "$dir" 2>/dev/null || true
+}
+
+# A regular file at a predictable path gets the same treatment before we write.
+refuse_symlink() {
+	[ -L "$1" ] && die "$1 is a symlink; refusing to write through it"
+	return 0
+}
+
 # Mirrors RECENT_DUPLICATE_CAPTURE_WINDOW_MS in the Tauri app: re-copying the
 # same payload inside this window is a no-op rather than a re-order, so a clip
 # the user is actively pasting around does not thrash to the top repeatedly.
@@ -406,8 +435,10 @@ ensure_schema() {
 		return 0
 	fi
 
-	mkdir -p "$STATE_DIR" "$IMAGE_DIR" "$THUMB_DIR"
-	chmod 700 "$STATE_DIR" 2>/dev/null || true
+	ensure_private_dir "$STATE_DIR" 700
+	ensure_private_dir "$IMAGE_DIR" 755
+	ensure_private_dir "$THUMB_DIR" 755
+	refuse_symlink "$DB_PATH"
 
 	migrate_schema
 	base_schema | run_raw >/dev/null || die "could not open or create $DB_PATH"
@@ -904,7 +935,8 @@ cmd_touch() {
 cmd_suppress() {
 	local hash="${1:-}"
 	[ -n "$hash" ] || die "suppress: expected a hash"
-	mkdir -p "$STATE_DIR"
+	ensure_private_dir "$STATE_DIR" 700
+	refuse_symlink "$SUPPRESS_FILE"
 	printf '%s\n' "$hash" >"$SUPPRESS_FILE"
 	printf '{"ok":true}\n'
 }
@@ -958,7 +990,8 @@ cmd_copy() {
 	image_path=${image_path%$'\n'}
 	mime=${mime%$'\n'}
 
-	mkdir -p "$STATE_DIR"
+	ensure_private_dir "$STATE_DIR" 700
+	refuse_symlink "$SUPPRESS_FILE"
 	printf '%s\n' "$hash" >"$SUPPRESS_FILE"
 
 	mktempfile
@@ -1689,6 +1722,22 @@ file:///tmp/caf%C3%A9.txt' "$(cat "$stdin_file")"
 			printf '      %-28s %s ms\n' "$label" $(((t1 - t0) / 1000000))
 		fi
 	}
+
+	# --- predictable-path hardening (marketplace security review) ------------
+	symroot="$SELFTEST_ROOT/symattack"; mkdir -p "$symroot/real"
+	ln -s "$symroot/real" "$symroot/planted"
+	out=$( (CLIPBASKET_STATE_DIR="$symroot/planted" CLIPBASKET_DB="$symroot/planted/clips.db" "$0" count) 2>&1 || true)
+	check_contains 'a symlinked state dir is refused' 'symlink' "$out"
+	ln -sf "$SELFTEST_ROOT/elsewhere.db" "$symroot/real/clips.db"
+	out=$( (CLIPBASKET_STATE_DIR="$symroot/real" CLIPBASKET_DB="$symroot/real/clips.db" "$0" count) 2>&1 || true)
+	check_contains 'a symlinked database file is refused' 'symlink' "$out"
+	rm -f "$SUPPRESS_FILE"; ln -s "$SELFTEST_ROOT/steal-token" "$SUPPRESS_FILE"
+	# A child process, not cmd_suppress in-process: die exits, and it must exit
+	# the CLI under test, not this suite.
+	out=$( (CLIPBASKET_STATE_DIR="$SELFTEST_ROOT" CLIPBASKET_DB="$DB_PATH" "$0" suppress deadbeef) 2>&1 || true)
+	check_contains 'a symlinked suppression file is refused' 'symlink' "$out"
+	check 'and the token was not written through it' 'absent' "$( [ -e "$SELFTEST_ROOT/steal-token" ] && echo present || echo absent )"
+	rm -f "$SUPPRESS_FILE"
 
 	out=$(cmd_list --limit 50 --query 'lorem')
 	check_contains 'search over 10k clips returns hits' '"kind":"text"' "$out"

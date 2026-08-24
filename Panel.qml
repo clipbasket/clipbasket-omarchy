@@ -1342,7 +1342,8 @@ Panel {
     // with it.
     var tmpl = "\"" + root.settingsDir + "/.settings.XXXXXX\"";
     root.runAction(
-      "mkdir -p " + dir + " && tmp=$(mktemp " + tmpl + ") && "
+      "if [ -L " + dir + " ] || [ -L " + file + " ]; then exit 1; fi && "
+      + "mkdir -p " + dir + " && tmp=$(mktemp " + tmpl + ") && "
       + "{ { jq -e . " + file + " 2>/dev/null || printf '{}'; } "
       + "| jq --argjson patch " + root.shq(payload) + " '. * $patch' > \"$tmp\" "
       + "&& mv \"$tmp\" " + file + "; } || rm -f \"$tmp\"", false);

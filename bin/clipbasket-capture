@@ -70,6 +70,28 @@ trap 'on_signal HUP' HUP
 
 log() { printf 'clipbasket-capture: %s\n' "$*" >&2; }
 
+# Predictable-path hardening (marketplace security review, 2026-08-24): never
+# create-and-trust a directory another same-user process could have planted as
+# a symlink; a planted link would redirect captured images and thumbnails.
+ensure_private_dir() {
+	# $1 path, $2 mode for a fresh create
+	local dir="$1" mode="${2:-700}" owner
+	if [ -L "$dir" ]; then
+		log "$dir is a symlink; refusing to write through it"
+		exit 1
+	fi
+	if [ -e "$dir" ]; then
+		if [ ! -d "$dir" ]; then log "$dir exists and is not a directory"; exit 1; fi
+		owner=$(stat -c %u -- "$dir" 2>/dev/null || stat -f %u -- "$dir" 2>/dev/null)
+		if [ "$owner" != "$(id -u)" ]; then log "$dir is not owned by the current user"; exit 1; fi
+		return 0
+	fi
+	mkdir -p -- "$dir" || { log "could not create $dir"; exit 1; }
+	if [ -L "$dir" ]; then log "$dir became a symlink; refusing"; exit 1; fi
+	chmod "$mode" -- "$dir" 2>/dev/null || true
+}
+
+
 # Creates a temp file, records it for cleanup, and leaves the path in
 # REPLY_TMPFILE. Deliberately not a `$(mktempfile)` helper: a command
 # substitution runs in a subshell, so the array it appended to went out of
@@ -597,7 +619,9 @@ capture_image() {
 	# and one dedupe key, without ever decoding the pixels.
 	hash=$(sha256_of image "$stdin_file")
 
-	mkdir -p "$IMAGE_DIR" "$THUMB_DIR"
+	ensure_private_dir "$STATE_DIR" 700
+	ensure_private_dir "$IMAGE_DIR" 755
+	ensure_private_dir "$THUMB_DIR" 755
 	target="$IMAGE_DIR/$hash.$extension"
 	# Staged under a temporary name and renamed only once the row exists: the
 	# old order copied the image in first, so a failed insert left an orphan in
@@ -1015,14 +1039,26 @@ cmd_selftest() {
 	check_contains 'a re-copied path with a percent round-trips exactly' \
 		"\"path\":\"$files_dir/100%.txt\"" "$listing"
 
+	# predictable-path hardening: a planted symlink at images/ is refused
+	reset_db
+	printf 'image/png\n' >"$fix/types"
+	rm -rf "$state/images"; mkdir -p "$state/elsewhere"; ln -s "$state/elsewhere" "$state/images"
+	sym_out=$("$SCRIPT_DIR/clipbasket-capture" image <"$SELFTEST_ROOT/small.png" 2>&1 || true)
+	case "$sym_out" in
+	*symlink*) pass=$((pass+1)); printf 'PASS  %s\n' 'a planted symlink at images/ is refused' ;;
+	*) fail=$((fail+1)); printf 'FAIL  a planted symlink at images/ is refused\n        got: %s\n' "$sym_out" ;;
+	esac
+	check 'and nothing was written through it' "0" "$(find "$state/elsewhere" -type f 2>/dev/null | wc -l | tr -d ' ')"
+	rm -f "$state/images"
+
 	unset CLIPBASKET_SELFTEST_FIXTURE CLIPBASKET_WL_PASTE CLIPBASKET_WL_COPY
 	unset CLIPBASKET_STATE_DIR CLIPBASKET_DB CLIPBASKET_DB_CLI
+
 
 	printf '\n%s passed, %s failed\n' "$pass" "$fail"
 	[ "$fail" -eq 0 ] || return 1
 	return 0
 }
-
 main() {
 	local mode="${1:-text}" types stdin_file
 

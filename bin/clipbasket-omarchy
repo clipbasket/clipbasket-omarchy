@@ -73,6 +73,22 @@ ok()   { printf '    %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '    %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
+# Predictable-path hardening (marketplace security review, 2026-08-24): refuse
+# to write through a planted symlink at any directory we create.
+ensure_private_dir() {
+  local dir="$1" mode="${2:-700}" owner
+  [[ -L "$dir" ]] && die "$dir is a symlink; refusing to write through it"
+  if [[ -e "$dir" ]]; then
+    [[ -d "$dir" ]] || die "$dir exists and is not a directory"
+    owner=$(stat -c %u -- "$dir" 2>/dev/null || stat -f %u -- "$dir" 2>/dev/null)
+    [[ "$owner" == "$(id -u)" ]] || die "$dir is not owned by the current user"
+    return 0
+  fi
+  mkdir -p -- "$dir" || die "could not create $dir"
+  [[ -L "$dir" ]] && die "$dir became a symlink; refusing"
+  chmod "$mode" -- "$dir" 2>/dev/null || true
+}
+
 quoted() {
   local out="" arg
   for arg in "$@"; do out+="${out:+ }$(printf '%q' "$arg")"; done
@@ -287,6 +303,7 @@ backup_bindings() {
     dest="$(printf '%s/bindings.lua.%s.%03d' "$BACKUP_DIR" "$stamp" "$n")"
     n=$((n + 1))
   done
+  (( DRY_RUN )) || ensure_private_dir "$BACKUP_DIR" 700
   run mkdir -p -- "$BACKUP_DIR"
   run cp -p -- "$BINDINGS_FILE" "$dest"
   (( DRY_RUN )) || ok "Backed up bindings.lua to $dest"
@@ -398,7 +415,8 @@ record_default_state() {
       "$C_DIM" "$C_RESET" "$disabled_theirs" "$DEFAULT_STATE_FILE"
     return 0
   fi
-  mkdir -p -- "$STATE_DIR"
+  ensure_private_dir "$STATE_DIR" 700
+  [[ -L "$DEFAULT_STATE_FILE" ]] && die "$DEFAULT_STATE_FILE is a symlink; refusing"
   cat >"$DEFAULT_STATE_FILE" <<EOF
 {
   "boundKey": $(json_string "$BIND_KEY"),
@@ -845,7 +863,8 @@ cmd_settings_init() {
     return 0
   fi
 
-  mkdir -p -- "$(dirname -- "$SETTINGS_FILE")"
+  ensure_private_dir "$(dirname -- "$SETTINGS_FILE")" 755
+  [[ -L "$SETTINGS_FILE" ]] && die "$SETTINGS_FILE is a symlink; refusing"
   printf '%s\n' "$defaults" >"$SETTINGS_FILE"
   ok "Wrote defaults to $SETTINGS_FILE"
 }
