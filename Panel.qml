@@ -2024,6 +2024,9 @@ Panel {
               Text {
                 width: parent.width
                 text: clipRow.rowTitle
+                // Clip content is data, never markup: a copied "<b>" or "<h2>" must not
+                // render as rich text.
+                textFormat: Text.PlainText
                 color: root.barForeground
                 elide: Text.ElideRight
                 maximumLineCount: 1
@@ -2035,6 +2038,9 @@ Panel {
                 width: parent.width
                 visible: clipRow.rowSecondary.length > 0
                 text: clipRow.rowSecondary
+                // Clip content is data, never markup: a copied "<b>" or "<h2>" must not
+                // render as rich text.
+                textFormat: Text.PlainText
                 color: root.barForeground
                 opacity: 0.4
                 elide: Text.ElideRight
@@ -2474,6 +2480,9 @@ Panel {
             width: parent.width - Style.space(28)
             visible: text.length > 0
             text: root.detailTitle
+            // Clip content is data, never markup: a copied "<b>" or "<h2>" must not
+            // render as rich text.
+            textFormat: Text.PlainText
             color: root.barForeground
             opacity: 0.55
             elide: Text.ElideRight
@@ -2655,6 +2664,9 @@ Panel {
                     anchors.leftMargin: Style.space(10)
                     anchors.verticalCenter: parent.verticalCenter
                     text: fileRow.modelData.isDirectory ? root.glyphFolder : root.glyphFile
+                    // Clip content is data, never markup: a copied "<b>" or "<h2>" must not
+                    // render as rich text.
+                    textFormat: Text.PlainText
                     color: root.barForeground
                     opacity: 0.55
                     font.family: Style.font.family
@@ -2675,6 +2687,9 @@ Panel {
 
                       Text {
                         text: fileRow.modelData.name
+                        // Clip content is data, never markup: a copied "<b>" or "<h2>" must not
+                        // render as rich text.
+                        textFormat: Text.PlainText
                         color: root.barForeground
                         elide: Text.ElideMiddle
                         width: Math.min(implicitWidth, parent.width - (dirBadge.visible ? dirBadge.width + Style.space(6) : 0))
@@ -2706,6 +2721,9 @@ Panel {
                     Text {
                       width: parent.width
                       text: fileRow.modelData.parent
+                      // Clip content is data, never markup: a copied "<b>" or "<h2>" must not
+                      // render as rich text.
+                      textFormat: Text.PlainText
                       color: root.barForeground
                       opacity: 0.38
                       elide: Text.ElideMiddle
