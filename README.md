@@ -20,6 +20,19 @@ Check it over afterwards with:
 ~/.config/omarchy/plugins/clipbasket.clipboard/bin/clipbasket-omarchy doctor
 ```
 
+## Screenshots
+
+![Clipboard history in the Omarchy bar](docs/screenshots/01-history.png)
+
+| | |
+|---|---|
+| ![Clip detail with Copy as Markdown](docs/screenshots/02-detail-markdown.png) | ![Image clip detail](docs/screenshots/03-image.png) |
+| *A web copy keeps its HTML flavour, so **Copy as Markdown** is there when you need it* | *Images come with dimensions, type and size — click for a lightbox* |
+| ![Search](docs/screenshots/05-search.png) | ![File list detail](docs/screenshots/06-files.png) |
+| *Search as you type, grouped by when you copied it* | *File copies list every item with Open / Reveal / Copy path* |
+| ![Lightbox](docs/screenshots/04-lightbox.png) | ![Settings](docs/screenshots/07-settings.png) |
+| *The lightbox* | *Settings that mean something on Wayland — and nothing that doesn't* |
+
 ## Requirements
 
 Everything is in the Arch repositories; Omarchy already ships most of it.
