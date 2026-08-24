@@ -36,7 +36,11 @@ SQLITE_BIN="${CLIPBASKET_SQLITE:-sqlite3}"
 WL_COPY_BIN="${CLIPBASKET_WL_COPY:-wl-copy}"
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# Absolute, because pin_state_dir moves this process's working directory and a
+# relative $0 stops resolving the moment it does.
+SELF_BIN="$SCRIPT_DIR/$(basename -- "$0")"
 HTML2MD="${CLIPBASKET_HTML2MD:-$SCRIPT_DIR/clipbasket-html2md}"
+SAFEFILE="${CLIPBASKET_SAFEFILE:-$SCRIPT_DIR/clipbasket-safefile}"
 
 # The state, image and thumbnail directories sit at predictable paths, so
 # another process running as the same user could plant a symlink there ahead of
@@ -64,6 +68,81 @@ ensure_private_dir() {
 # A regular file at a predictable path gets the same treatment before we write.
 refuse_symlink() {
 	[ -L "$1" ] && die "$1 is a symlink; refusing to write through it"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# Descriptor-bound writes.
+#
+# The two checks above are fast-fail UX: they turn the common mistake into a
+# clear message without paying for a subprocess. They are NOT the security
+# boundary, because a pathname check followed by a shell redirection is a
+# check-to-use window -- between the check and the `>`, a same-user process can
+# replace the directory with a symlink and the write lands somewhere else.
+#
+# Every real write goes through clipbasket-safefile, which opens each path
+# component with O_NOFOLLOW, verifies the descriptor with fstat, and writes and
+# renames relative to that descriptor. bash cannot express any of that.
+# (Marketplace security review, second round, 2026-08-24.)
+safe_write() {
+	# $1 dir, $2 name, $3 mode (optional). Content on stdin.
+	local dir="$1" name="$2" mode="${3:-600}" rc=0
+	"$SAFEFILE" write "$dir" "$name" --mode "$mode" || rc=$?
+	[ "$rc" -eq 0 ] || die "refusing to write $dir/$name (clipbasket-safefile exit $rc)"
+}
+
+safe_read() {
+	# $1 dir, $2 name. Content on stdout. Exit 2 (missing) is not an error.
+	local rc=0
+	"$SAFEFILE" read "$1" "$2" || rc=$?
+	case "$rc" in
+	0) return 0 ;;
+	2) return 1 ;;
+	*) die "refusing to read $1/$2 (clipbasket-safefile exit $rc)" ;;
+	esac
+}
+
+safe_unlink() {
+	local rc=0
+	"$SAFEFILE" unlink "$1" "$2" || rc=$?
+	[ "$rc" -eq 0 ] || die "refusing to remove $1/$2 (clipbasket-safefile exit $rc)"
+}
+
+safe_ensure_dir() {
+	# $1 path, $2 mode. Creates missing components with O_NOFOLLOW at each step.
+	local rc=0
+	"$SAFEFILE" ensure-dir "$1" --mode "${2:-700}" || rc=$?
+	[ "$rc" -eq 0 ] || die "refusing to use $1 (clipbasket-safefile exit $rc)"
+}
+
+# Holds the state directory as the working directory of this process, so every
+# later sqlite3 open is resolved against a descriptor we verified rather than a
+# pathname anyone can re-point. `cd -P` refuses to resolve through symlinks
+# silently: if any component were one, $PWD would not come back equal to the
+# path we asked for. After this, the database is opened as ./clips.db, and its
+# -wal and -shm files follow it into the same held directory.
+#
+# Costs no subprocess: `cd`, `[ -O . ]` and $PWD are all shell builtins, and
+# this is on the UI keystroke path where a fork is the whole latency budget.
+#
+# CLIPBASKET_DB is a test-only override; a database pointed somewhere else on
+# purpose is not pinned, because there is no directory we own to pin it to.
+STATE_DIR_PINNED=0
+pin_state_dir() {
+	[ "$STATE_DIR_PINNED" = "1" ] && return 0
+	[ -z "${CLIPBASKET_DB:-}" ] || return 0
+	# The selftest drives cmd_* in-process against its own scratch DB_PATH;
+	# pinning would both overwrite that and move the CWD out from under the
+	# relative paths the suite uses.
+	[ -z "${SELFTEST_ROOT:-}" ] || return 0
+	# A relative state directory has no stable meaning once we chdir.
+	case "$STATE_DIR" in /*) ;; *) return 0 ;; esac
+	cd -P -- "$STATE_DIR" 2>/dev/null || return 1
+	[ "$PWD" = "$STATE_DIR" ] ||
+		die "$STATE_DIR resolves to $PWD; refusing to write through a symlink"
+	[ -O . ] || die "$STATE_DIR is not owned by the current user"
+	DB_PATH="./clips.db"
+	STATE_DIR_PINNED=1
 	return 0
 }
 
@@ -413,6 +492,12 @@ fts_answer_is_current() {
 }
 
 ensure_schema() {
+	# Pin before anything reads or writes, so even the fork-free fast path below
+	# resolves the database against the held directory rather than a pathname. A
+	# failure here just means the directory does not exist yet; the slow path
+	# creates it and pins afterwards.
+	pin_state_dir || true
+
 	local stamp="$STATE_DIR/.schema-v$SCHEMA_VERSION"
 
 	build_projections
@@ -435,10 +520,11 @@ ensure_schema() {
 		return 0
 	fi
 
-	ensure_private_dir "$STATE_DIR" 700
-	ensure_private_dir "$IMAGE_DIR" 755
-	ensure_private_dir "$THUMB_DIR" 755
+	safe_ensure_dir "$STATE_DIR" 700
+	safe_ensure_dir "$IMAGE_DIR" 755
+	safe_ensure_dir "$THUMB_DIR" 755
 	refuse_symlink "$DB_PATH"
+	pin_state_dir || die "could not enter $STATE_DIR"
 
 	migrate_schema
 	base_schema | run_raw >/dev/null || die "could not open or create $DB_PATH"
@@ -935,9 +1021,8 @@ cmd_touch() {
 cmd_suppress() {
 	local hash="${1:-}"
 	[ -n "$hash" ] || die "suppress: expected a hash"
-	ensure_private_dir "$STATE_DIR" 700
-	refuse_symlink "$SUPPRESS_FILE"
-	printf '%s\n' "$hash" >"$SUPPRESS_FILE"
+	safe_ensure_dir "$STATE_DIR" 700
+	printf '%s\n' "$hash" | safe_write "$STATE_DIR" suppress 600
 	printf '{"ok":true}\n'
 }
 
@@ -990,9 +1075,8 @@ cmd_copy() {
 	image_path=${image_path%$'\n'}
 	mime=${mime%$'\n'}
 
-	ensure_private_dir "$STATE_DIR" 700
-	refuse_symlink "$SUPPRESS_FILE"
-	printf '%s\n' "$hash" >"$SUPPRESS_FILE"
+	safe_ensure_dir "$STATE_DIR" 700
+	printf '%s\n' "$hash" | safe_write "$STATE_DIR" suppress 600
 
 	mktempfile
 	payload="$REPLY_TMPFILE"
@@ -1118,7 +1202,11 @@ cmd_selftest() {
 
 	# Deliberately not `local`: the EXIT trap runs after this function's scope
 	# is gone and still has to find the directory it must remove.
+	# Resolved with -P: on macOS $TMPDIR sits under /var, which is a symlink,
+	# and clipbasket-safefile refuses to walk through one -- correctly. Harness
+	# fix only; the rule the helper enforces is unchanged.
 	SELFTEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/clipbasket-selftest.XXXXXX")
+	SELFTEST_ROOT=$(CDPATH='' cd -P -- "$SELFTEST_ROOT" && pwd -P)
 	selftest_cleanup() {
 		rm -rf "${SELFTEST_ROOT:-}"
 		cleanup
@@ -1726,17 +1814,29 @@ file:///tmp/caf%C3%A9.txt' "$(cat "$stdin_file")"
 	# --- predictable-path hardening (marketplace security review) ------------
 	symroot="$SELFTEST_ROOT/symattack"; mkdir -p "$symroot/real"
 	ln -s "$symroot/real" "$symroot/planted"
-	out=$( (CLIPBASKET_STATE_DIR="$symroot/planted" CLIPBASKET_DB="$symroot/planted/clips.db" "$0" count) 2>&1 || true)
+	out=$( (CLIPBASKET_STATE_DIR="$symroot/planted" CLIPBASKET_DB="$symroot/planted/clips.db" "$SELF_BIN" count) 2>&1 || true)
 	check_contains 'a symlinked state dir is refused' 'symlink' "$out"
 	ln -sf "$SELFTEST_ROOT/elsewhere.db" "$symroot/real/clips.db"
-	out=$( (CLIPBASKET_STATE_DIR="$symroot/real" CLIPBASKET_DB="$symroot/real/clips.db" "$0" count) 2>&1 || true)
+	out=$( (CLIPBASKET_STATE_DIR="$symroot/real" CLIPBASKET_DB="$symroot/real/clips.db" "$SELF_BIN" count) 2>&1 || true)
 	check_contains 'a symlinked database file is refused' 'symlink' "$out"
 	rm -f "$SUPPRESS_FILE"; ln -s "$SELFTEST_ROOT/steal-token" "$SUPPRESS_FILE"
 	# A child process, not cmd_suppress in-process: die exits, and it must exit
 	# the CLI under test, not this suite.
-	out=$( (CLIPBASKET_STATE_DIR="$SELFTEST_ROOT" CLIPBASKET_DB="$DB_PATH" "$0" suppress deadbeef) 2>&1 || true)
+	out=$( (CLIPBASKET_STATE_DIR="$SELFTEST_ROOT" CLIPBASKET_DB="$DB_PATH" "$SELF_BIN" suppress deadbeef) 2>&1 || true)
 	check_contains 'a symlinked suppression file is refused' 'symlink' "$out"
 	check 'and the token was not written through it' 'absent' "$( [ -e "$SELFTEST_ROOT/steal-token" ] && echo present || echo absent )"
+	rm -f "$SUPPRESS_FILE"
+
+	# The refusal above could in principle come from the fast-fail pathname
+	# check rather than from the descriptor-bound write, and those are not the
+	# same guarantee. Point CLIPBASKET_SAFEFILE at nothing: if the token write
+	# still succeeds, it is not going through the helper.
+	out=$( (CLIPBASKET_STATE_DIR="$SELFTEST_ROOT" CLIPBASKET_DB="$DB_PATH" \
+		CLIPBASKET_SAFEFILE="$SELFTEST_ROOT/no-such-helper" "$SELF_BIN" suppress cafebabe) 2>&1 || true)
+	check_contains 'the suppression token is written by clipbasket-safefile' \
+		'clipbasket-safefile' "$out"
+	check 'and no token is left behind when the helper is missing' 'absent' \
+		"$( [ -e "$SUPPRESS_FILE" ] && echo present || echo absent )"
 	rm -f "$SUPPRESS_FILE"
 
 	out=$(cmd_list --limit 50 --query 'lorem')

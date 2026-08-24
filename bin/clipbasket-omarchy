@@ -52,6 +52,9 @@ BACKUP_DIR="$STATE_DIR/backups"
 DEFAULT_STATE_FILE="$STATE_DIR/make-default.json"
 BINDINGS_FILE="${CLIPBASKET_BINDINGS:-$CONFIG_HOME/hypr/bindings.lua}"
 
+SCRIPT_DIR_SELF="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SAFEFILE="${CLIPBASKET_SAFEFILE:-$SCRIPT_DIR_SELF/clipbasket-safefile}"
+
 DRY_RUN=0
 BAR_SECTION="right"
 RELOAD=1
@@ -75,6 +78,24 @@ die()  { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
 # Predictable-path hardening (marketplace security review, 2026-08-24): refuse
 # to write through a planted symlink at any directory we create.
+# The pathname checks below are fast-fail UX. Every real write goes through
+# clipbasket-safefile, which opens each component O_NOFOLLOW, verifies the
+# descriptor with fstat and renames relative to it -- a check followed later by
+# a shell redirection is a window a same-user process can race.
+# (Marketplace security review, second round, 2026-08-24.)
+safe_write() {
+  # $1 dir, $2 name, $3 mode. Content on stdin.
+  local rc=0
+  "$SAFEFILE" write "$1" "$2" --mode "${3:-600}" || rc=$?
+  (( rc == 0 )) || die "Refusing to write $1/$2 (clipbasket-safefile exit $rc)."
+}
+
+safe_ensure_dir() {
+  local rc=0
+  "$SAFEFILE" ensure-dir "$1" --mode "${2:-700}" || rc=$?
+  (( rc == 0 )) || die "Refusing to use $1 (clipbasket-safefile exit $rc)."
+}
+
 ensure_private_dir() {
   local dir="$1" mode="${2:-700}" owner
   [[ -L "$dir" ]] && die "$dir is a symlink; refusing to write through it"
@@ -303,9 +324,15 @@ backup_bindings() {
     dest="$(printf '%s/bindings.lua.%s.%03d' "$BACKUP_DIR" "$stamp" "$n")"
     n=$((n + 1))
   done
-  (( DRY_RUN )) || ensure_private_dir "$BACKUP_DIR" 700
-  run mkdir -p -- "$BACKUP_DIR"
-  run cp -p -- "$BINDINGS_FILE" "$dest"
+  if (( DRY_RUN )); then
+    printf '    %s[dry-run]%s cp %s %s\n' "$C_DIM" "$C_RESET" \
+      "$(printf '%q' "$BINDINGS_FILE")" "$(printf '%q' "$dest")"
+  else
+    safe_ensure_dir "$BACKUP_DIR" 700
+    # Through the helper rather than `cp`, so the backup cannot be diverted by
+    # a symlink planted at its (timestamped, therefore guessable) name.
+    safe_write "$BACKUP_DIR" "$(basename -- "$dest")" 600 <"$BINDINGS_FILE"
+  fi
   (( DRY_RUN )) || ok "Backed up bindings.lua to $dest"
   # Nothing else ever pruned these, so a user who ran make-default a few dozen
   # times accumulated a few dozen copies of their keybindings forever.
@@ -317,7 +344,7 @@ backup_bindings() {
 # write it without one, so `restore-default` gives back exactly the shape it
 # was handed.
 write_bindings() {
-  local content="$1" trailing="${2:-1}" target dir tmp
+  local content="$1" trailing="${2:-1}" target dir mode
   if (( DRY_RUN )); then
     printf '    %s[dry-run]%s would write %s:\n' "$C_DIM" "$C_RESET" "$BINDINGS_FILE"
     printf '%s\n' "$content" | sed 's/^/        /'
@@ -325,34 +352,26 @@ write_bindings() {
   fi
   # Write *through* a symlink to the file it points at, and stage the temp file
   # in that file's own directory so the rename stays on one filesystem.
+  # bindings.lua is the one path here that may legitimately BE a symlink --
+  # dotfile repos do this constantly -- so the link is resolved once, on
+  # purpose, and everything after that is bound to the resolved directory. The
+  # helper still refuses if the resolved *directory* is reached through a
+  # symlinked component, and its rename is descriptor-relative, so the resolve
+  # is the only pathname step and it happens exactly once.
   target="$(resolve_bindings_target)"
   dir="$(dirname -- "$target")"
-  tmp="$(mktemp -- "$dir/.clipbasket-bindings.XXXXXX")" ||
-    die "Could not create a temp file in $dir — is it writable?"
-
-  # The write goes to a sibling temp file and lands with a single rename, so an
-  # out-of-space or interrupted write can never leave the user with a truncated
-  # bindings.lua — they either get the old file or the new one. Failures clean
-  # the temp file up explicitly rather than through a RETURN trap, which bash
-  # runs after the local `tmp` is already out of scope.
+  mode=644
   if [[ -f "$target" ]]; then
-    chmod --reference="$target" -- "$tmp" 2>/dev/null || true
+    mode="$(stat -c %a -- "$target" 2>/dev/null || stat -f %Lp -- "$target" 2>/dev/null || printf 644)"
   fi
+  # A single atomic replacement, so an out-of-space or interrupted write can
+  # never leave the user with a truncated bindings.lua — they get the old file
+  # or the new one.
   if (( trailing )); then
-    printf '%s\n' "$content" >"$tmp" || {
-      rm -f -- "$tmp"
-      die "Failed to write $tmp — $target is unchanged."
-    }
+    printf '%s\n' "$content"
   else
-    printf '%s' "$content" >"$tmp" || {
-      rm -f -- "$tmp"
-      die "Failed to write $tmp — $target is unchanged."
-    }
-  fi
-  if ! mv -f -- "$tmp" "$target"; then
-    rm -f -- "$tmp"
-    die "Failed to replace $target — it is unchanged."
-  fi
+    printf '%s' "$content"
+  fi | safe_write "$dir" "$(basename -- "$target")" "$mode"
 }
 
 # The file with our managed block removed, markers included. Everything outside
@@ -415,9 +434,8 @@ record_default_state() {
       "$C_DIM" "$C_RESET" "$disabled_theirs" "$DEFAULT_STATE_FILE"
     return 0
   fi
-  ensure_private_dir "$STATE_DIR" 700
-  [[ -L "$DEFAULT_STATE_FILE" ]] && die "$DEFAULT_STATE_FILE is a symlink; refusing"
-  cat >"$DEFAULT_STATE_FILE" <<EOF
+  safe_ensure_dir "$STATE_DIR" 700
+  cat <<EOF | safe_write "$STATE_DIR" make-default.json 600
 {
   "boundKey": $(json_string "$BIND_KEY"),
   "disabledOmarchyClipboard": $disabled_theirs,
@@ -863,9 +881,9 @@ cmd_settings_init() {
     return 0
   fi
 
-  ensure_private_dir "$(dirname -- "$SETTINGS_FILE")" 755
-  [[ -L "$SETTINGS_FILE" ]] && die "$SETTINGS_FILE is a symlink; refusing"
-  printf '%s\n' "$defaults" >"$SETTINGS_FILE"
+  safe_ensure_dir "$(dirname -- "$SETTINGS_FILE")" 755
+  printf '%s\n' "$defaults" |
+    safe_write "$(dirname -- "$SETTINGS_FILE")" "$(basename -- "$SETTINGS_FILE")" 600
   ok "Wrote defaults to $SETTINGS_FILE"
 }
 
@@ -876,7 +894,11 @@ cmd_settings_init() {
 cmd_selftest() {
   local pass=0 fail=0 root self out state
   self="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+  # Resolved with -P: on macOS $TMPDIR lives under /var, which is itself a
+  # symlink, and clipbasket-safefile refuses to walk through one -- correctly.
+  # This is a harness fix, not a softening of the rule the helper enforces.
   root="$(mktemp -d "${TMPDIR:-/tmp}/clipbasket-omarchy-selftest.XXXXXX")"
+  root="$(CDPATH='' cd -P -- "$root" && pwd -P)"
   SELFTEST_ROOT="$root"
   trap 'rm -rf "${SELFTEST_ROOT:-}"' EXIT
 
@@ -1011,6 +1033,25 @@ o.bind("SUPER + X", "Mine", "true")'
       "$(find "$rostate/clipbasket/backups" -type f 2>/dev/null | wc -l | tr -d ' ')"
     chmod 700 "$ro"
   fi
+
+  # --- settings-init writes through clipbasket-safefile -------------------
+  local sroot="$root/settings" victim="$root/settings-victim"
+  mkdir -p "$sroot/clipbasket"
+  printf 'original\n' >"$victim"
+  ln -sf "$victim" "$sroot/clipbasket/settings.json"
+  out=$(CLIPBASKET_SETTINGS="$sroot/clipbasket/settings.json" NO_COLOR=1 \
+    "$self" settings-init --force 2>&1 || true)
+  check_contains 'a planted symlink at settings.json is refused' 'Refusing to write' "$out"
+  check 'and the file behind the link is untouched' 'original' "$(cat "$victim")"
+  rm -f "$sroot/clipbasket/settings.json"
+
+  # And that the refusal came from the helper rather than a pathname check.
+  out=$(CLIPBASKET_SETTINGS="$sroot/clipbasket/settings.json" \
+    CLIPBASKET_SAFEFILE="$root/no-such-helper" NO_COLOR=1 \
+    "$self" settings-init --force 2>&1 || true)
+  check_contains 'settings-init writes through clipbasket-safefile' 'clipbasket-safefile' "$out"
+  check 'and writes nothing when the helper is missing' 'absent' \
+    "$( [[ -e "$sroot/clipbasket/settings.json" ]] && echo present || echo absent )"
 
   printf '\n%s passed, %s failed\n' "$pass" "$fail"
   [[ "$fail" -eq 0 ]] || return 1

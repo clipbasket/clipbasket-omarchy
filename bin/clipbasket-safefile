@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""clipbasket-safefile — descriptor-bound file I/O for predictable paths.
+
+Every path Clipbasket writes to is predictable: ~/.local/state/clipbasket and
+everything under it. A pathname check followed by a later open is a
+check-to-use window -- between `[ -L "$dir" ]` and the `cp` that follows,
+another process running as the same user can replace the directory with a
+symlink, and the write lands wherever that link points. Checking harder does
+not close the window; only binding the operation to the object you checked
+does.
+
+So nothing here works on pathnames. Each command walks to its target one
+component at a time with O_NOFOLLOW, verifies the *descriptor* with fstat, and
+performs the real operation relative to that descriptor with the dir_fd
+arguments of os.open/os.mkdir/os.rename/os.unlink. A directory swapped after
+the check is simply not the directory the descriptor refers to, so the write
+still lands in the verified one.
+
+This exists in Python because bash cannot express any of it: there is no
+O_NOFOLLOW, no openat, and no way to hold a directory descriptor across
+commands. python3 is already a hard dependency (clipbasket-html2md), so this
+adds a file, not a requirement. Standard library only, for the same reason.
+
+    clipbasket-safefile ensure-dir <path> [--mode 700]
+    clipbasket-safefile write <dir> <name> [--mode 600]   # stdin -> file
+    clipbasket-safefile read <dir> <name>                 # file -> stdout
+    clipbasket-safefile unlink <dir> <name>
+    clipbasket-safefile --selftest
+
+Exit codes:
+
+    0   success
+    2   read: the file does not exist (silent; an expected outcome)
+    3   refused -- a symlink, a wrong type, or a wrong owner was found where a
+        directory or a regular file was required. Always with a one-line reason
+        on stderr. This is the security answer and it is never retried.
+    1   any other error (permission, I/O, bad usage)
+
+Ownership rule: a target file, and any directory this tool creates, must be
+owned by the invoking user. A *pre-existing ancestor* may also be owned by
+root, because / and /home are and because a root-owned directory is not a
+same-uid attack vector -- an attacker who owns root-owned directories does not
+need to race us. Anything else is refused.
+
+Threat model boundary, stated plainly: this defends against another process
+running as the same user substituting a directory or file at a predictable path
+between our check and our use. It does not, and cannot, defend against a
+process that can already write inside our 0700 directories, ptrace us, or
+replace this file. That is not a gap in the implementation; it is the edge of
+what any userspace file discipline can do.
+"""
+
+import errno
+import os
+import stat
+import sys
+
+EXIT_OK = 0
+EXIT_MISSING = 2
+EXIT_REFUSED = 3
+EXIT_ERROR = 1
+
+PROG = "clipbasket-safefile"
+
+# 0700 for the state root, 0755 where the desktop needs to read thumbnails.
+DEFAULT_DIR_MODE = 0o700
+DEFAULT_FILE_MODE = 0o600
+
+OPEN_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+OPEN_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+class Refused(Exception):
+    """A path was not what it must be. Never retried, never worked around."""
+
+
+class Failed(Exception):
+    """Anything else: permission, I/O, usage."""
+
+
+def _warn(message):
+    sys.stderr.write("%s: %s\n" % (PROG, message))
+
+
+def _parse_mode(text):
+    try:
+        # Always octal: "700" means 0o700, which is what the caller wrote.
+        value = int(text, 8)
+    except (TypeError, ValueError):
+        raise Failed("mode must be octal, got: %s" % text)
+    if not 0 <= value <= 0o7777:
+        raise Failed("mode out of range: %s" % text)
+    return value
+
+
+def _fstat_dir(fd, path, allow_root):
+    """A descriptor must be a directory we own before anything happens in it."""
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refused("%s is not a directory" % path)
+    owners = (os.getuid(), 0) if allow_root else (os.getuid(),)
+    if st.st_uid not in owners:
+        raise Refused("%s is owned by uid %d, not %d" % (path, st.st_uid, os.getuid()))
+    return st
+
+
+def _fstat_file(fd, path):
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise Refused("%s is not a regular file" % path)
+    if st.st_uid != os.getuid():
+        raise Refused("%s is owned by uid %d, not %d" % (path, st.st_uid, os.getuid()))
+    return st
+
+
+def _components(path):
+    if not path.startswith("/"):
+        raise Failed("path must be absolute: %s" % path)
+    return [c for c in path.split("/") if c not in ("", ".")]
+
+
+def _describe_bad_component(parent_fd, component, walked):
+    """Say whether the thing in the way is a symlink or another file type."""
+    try:
+        st = os.lstat(component, dir_fd=parent_fd)
+    except OSError:
+        return "%s is not a directory" % walked
+    if stat.S_ISLNK(st.st_mode):
+        return "%s is a symlink; refusing to write through it" % walked
+    return "%s is not a directory" % walked
+
+
+def open_dir(path, create=False, mode=DEFAULT_DIR_MODE):
+    """Walk to `path` one component at a time and return its descriptor.
+
+    Every component is opened O_NOFOLLOW, so a symlink anywhere along the way
+    is an ELOOP we turn into a refusal rather than a path we follow. The
+    returned descriptor is the caller's proof: operations performed relative to
+    it cannot be redirected by anything that happens to the pathname afterwards.
+    """
+    for component in _components(path):
+        if component == "..":
+            # `..` would walk back out of a verified directory and make the
+            # whole component-by-component check meaningless.
+            raise Failed("path may not contain '..': %s" % path)
+
+    fd = os.open("/", OPEN_DIR_FLAGS)
+    walked = ""
+    created_any = False
+    try:
+        _fstat_dir(fd, "/", allow_root=True)
+        for component in _components(path):
+            walked = walked + "/" + component
+            child = None
+            try:
+                child = os.open(component, OPEN_DIR_FLAGS, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    # Exactly the attack: something is a symlink, or simply not
+                    # a directory, where we require one. Linux reports ELOOP
+                    # for a symlink opened O_NOFOLLOW|O_DIRECTORY and macOS
+                    # reports ENOTDIR, so the kind is settled by asking the
+                    # descriptor rather than by trusting the errno -- an
+                    # lstat that does not follow anything and only decides
+                    # which true sentence to print.
+                    raise Refused(_describe_bad_component(fd, component, walked))
+                if exc.errno != errno.ENOENT:
+                    raise Failed("cannot open %s: %s" % (walked, exc.strerror))
+                if not create:
+                    raise Failed("%s does not exist" % walked)
+                try:
+                    os.mkdir(component, mode, dir_fd=fd)
+                except FileExistsError:
+                    # Lost a benign race with another Clipbasket process; the
+                    # open below re-checks whatever is there now, so a hostile
+                    # winner is still caught.
+                    pass
+                except OSError as mkexc:
+                    raise Failed("cannot create %s: %s" % (walked, mkexc.strerror))
+                created_any = True
+                try:
+                    child = os.open(component, OPEN_DIR_FLAGS, dir_fd=fd)
+                except OSError as reexc:
+                    if reexc.errno == errno.ELOOP:
+                        raise Refused("%s became a symlink; refusing" % walked)
+                    raise Failed("cannot open %s: %s" % (walked, reexc.strerror))
+            # A directory we just created must be ours; an ancestor that
+            # predates us may be root's.
+            _fstat_dir(child, walked, allow_root=not created_any)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _check_name(name):
+    if name in ("", ".", "..") or "/" in name:
+        raise Failed("name must be a single path component, got: %r" % name)
+    return name
+
+
+def cmd_ensure_dir(path, mode):
+    fd = open_dir(path, create=True, mode=mode)
+    try:
+        # chmod through the descriptor, not the name: the umask may have
+        # narrowed the mkdir, and a pathname chmod would be another window.
+        os.fchmod(fd, mode)
+    except OSError:
+        # A pre-existing directory the user has deliberately loosened is their
+        # business; the ownership and type checks above are the security ones.
+        pass
+    finally:
+        os.close(fd)
+    return EXIT_OK
+
+
+def _refuse_if_dest_unsafe(dfd, name, dirpath):
+    """A destination that already exists must be a regular file we own.
+
+    A symlink there is the planted-file attack, and it surfaces as ELOOP
+    because the open is O_NOFOLLOW. The rename that follows replaces whatever
+    is at `name` atomically and relative to the verified descriptor, so a file
+    substituted after this check is overwritten rather than followed -- this
+    check exists to refuse loudly, not to make the write safe.
+    """
+    try:
+        fd = os.open(name, OPEN_FILE_FLAGS, dir_fd=dfd)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return
+        if exc.errno == errno.ELOOP:
+            raise Refused("%s/%s is a symlink; refusing to write through it" % (dirpath, name))
+        raise Failed("cannot inspect %s/%s: %s" % (dirpath, name, exc.strerror))
+    try:
+        _fstat_file(fd, "%s/%s" % (dirpath, name))
+    finally:
+        os.close(fd)
+
+
+def cmd_write(dirpath, name, mode):
+    _check_name(name)
+    payload = sys.stdin.buffer.read()
+    dfd = open_dir(dirpath, create=False)
+    tmpname = None
+    try:
+        _refuse_if_dest_unsafe(dfd, name, dirpath)
+        # O_EXCL means we own the temp name or we do not write at all, so a
+        # planted temp file cannot be written through either.
+        for _ in range(8):
+            candidate = ".%s.%s.tmp" % (name, os.urandom(6).hex())
+            try:
+                tfd = os.open(candidate,
+                              os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                              mode, dir_fd=dfd)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise Failed("cannot create a temporary file in %s: %s" % (dirpath, exc.strerror))
+            tmpname = candidate
+            break
+        if tmpname is None:
+            raise Failed("could not find a free temporary name in %s" % dirpath)
+
+        try:
+            written = 0
+            while written < len(payload):
+                written += os.write(tfd, payload[written:])
+            # The rename below is atomic, but only orders against the data if
+            # the data is on disk first; otherwise a crash can leave the new
+            # name pointing at a zero-length file.
+            os.fsync(tfd)
+        finally:
+            os.close(tfd)
+
+        os.rename(tmpname, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        tmpname = None
+        try:
+            os.fsync(dfd)
+        except OSError:
+            # Not every filesystem allows fsync on a directory descriptor. The
+            # rename is still atomic; only the durability of it is weaker.
+            pass
+        return EXIT_OK
+    finally:
+        if tmpname is not None:
+            # Never leave a half-written temp file behind, on any path out.
+            try:
+                os.unlink(tmpname, dir_fd=dfd)
+            except OSError:
+                pass
+        os.close(dfd)
+
+
+def cmd_read(dirpath, name):
+    _check_name(name)
+    dfd = open_dir(dirpath, create=False)
+    try:
+        try:
+            fd = os.open(name, OPEN_FILE_FLAGS, dir_fd=dfd)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                return EXIT_MISSING
+            if exc.errno == errno.ELOOP:
+                raise Refused("%s/%s is a symlink; refusing to read through it" % (dirpath, name))
+            raise Failed("cannot open %s/%s: %s" % (dirpath, name, exc.strerror))
+        try:
+            _fstat_file(fd, "%s/%s" % (dirpath, name))
+            out = sys.stdout.buffer
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                out.write(chunk)
+            out.flush()
+        finally:
+            os.close(fd)
+        return EXIT_OK
+    finally:
+        os.close(dfd)
+
+
+def cmd_unlink(dirpath, name):
+    _check_name(name)
+    dfd = open_dir(dirpath, create=False)
+    try:
+        try:
+            fd = os.open(name, OPEN_FILE_FLAGS, dir_fd=dfd)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                # Already gone. Removing is idempotent by design: the callers
+                # are consuming a one-shot token.
+                return EXIT_OK
+            if exc.errno == errno.ELOOP:
+                # A planted symlink is precisely what we want gone, and
+                # unlinkat removes the link itself rather than its target.
+                os.unlink(name, dir_fd=dfd)
+                return EXIT_OK
+            raise Failed("cannot inspect %s/%s: %s" % (dirpath, name, exc.strerror))
+        try:
+            _fstat_file(fd, "%s/%s" % (dirpath, name))
+        finally:
+            os.close(fd)
+        os.unlink(name, dir_fd=dfd)
+        return EXIT_OK
+    finally:
+        os.close(dfd)
+
+
+# --- selftest --------------------------------------------------------------
+
+def _selftest():
+    import shutil
+    import subprocess
+    import tempfile
+
+    passed = []
+    failed = []
+
+    def check(name, condition, detail=""):
+        if condition:
+            passed.append(name)
+        else:
+            failed.append("%s%s" % (name, (": " + detail) if detail else ""))
+
+    def run(args, stdin=b""):
+        proc = subprocess.run([sys.executable, os.path.abspath(__file__)] + args,
+                              input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    # realpath: /var and /tmp are symlinks on macOS, and this tool refuses to
+    # walk through a symlink -- which is the whole point. Resolving the test
+    # root keeps the selftest portable without softening the production rule.
+    root = os.path.realpath(tempfile.mkdtemp(prefix="clipbasket-safefile-test."))
+    try:
+        # 1: creates a nested directory tree
+        target = os.path.join(root, "a", "b", "clipbasket")
+        rc, _, err = run(["ensure-dir", target, "--mode", "700"])
+        check("ensure-dir creates nested dirs", rc == 0 and os.path.isdir(target), err.decode())
+
+        # 2: and the mode it was asked for
+        check("ensure-dir applies the mode",
+              stat.S_IMODE(os.stat(target).st_mode) == 0o700)
+
+        # 3: idempotent
+        rc, _, _ = run(["ensure-dir", target])
+        check("ensure-dir is idempotent", rc == 0)
+
+        # 4: refuses a symlinked component, and creates nothing behind it
+        elsewhere = os.path.join(root, "elsewhere")
+        os.mkdir(elsewhere)
+        linkdir = os.path.join(root, "linkdir")
+        os.symlink(elsewhere, linkdir)
+        rc, _, err = run(["ensure-dir", os.path.join(linkdir, "planted")])
+        check("ensure-dir refuses a symlinked component",
+              rc == EXIT_REFUSED and not os.path.exists(os.path.join(elsewhere, "planted")),
+              "rc=%d %s" % (rc, err.decode().strip()))
+
+        # 5: refuses a regular file where a directory is required
+        afile = os.path.join(root, "afile")
+        with open(afile, "wb") as fh:
+            fh.write(b"x")
+        rc, _, _ = run(["ensure-dir", afile])
+        check("ensure-dir refuses a non-directory", rc == EXIT_REFUSED)
+
+        # 6: write creates a file with the payload and the mode
+        rc, _, err = run(["write", target, "settings.json", "--mode", "600"], b'{"a":1}')
+        wrote = os.path.join(target, "settings.json")
+        check("write creates the file",
+              rc == 0 and open(wrote, "rb").read() == b'{"a":1}'
+              and stat.S_IMODE(os.stat(wrote).st_mode) == 0o600, err.decode())
+
+        # 7: write replaces an existing regular file
+        rc, _, _ = run(["write", target, "settings.json"], b'{"a":2}')
+        check("write replaces an existing file",
+              rc == 0 and open(wrote, "rb").read() == b'{"a":2}')
+
+        # 8: and leaves no temp files behind
+        check("write leaves no temp files",
+              [n for n in os.listdir(target) if n.startswith(".settings.json.")] == [])
+
+        # 9: write refuses a symlinked destination, and the target is untouched
+        victim = os.path.join(root, "victim")
+        with open(victim, "wb") as fh:
+            fh.write(b"original")
+        os.symlink(victim, os.path.join(target, "planted"))
+        rc, _, err = run(["write", target, "planted"], b"attacker")
+        check("write refuses a symlinked destination",
+              rc == EXIT_REFUSED and open(victim, "rb").read() == b"original",
+              "rc=%d %s" % (rc, err.decode().strip()))
+
+        # 10: and still leaves no temp files after refusing
+        check("write cleans up after refusing",
+              [n for n in os.listdir(target) if n.startswith(".planted.")] == [])
+
+        # 11: write refuses when the directory itself is a symlink
+        rc, _, _ = run(["write", linkdir, "x"], b"nope")
+        check("write refuses a symlinked directory",
+              rc == EXIT_REFUSED and not os.path.exists(os.path.join(elsewhere, "x")))
+
+        # 12: read returns the content
+        rc, out, _ = run(["read", target, "settings.json"])
+        check("read returns content", rc == 0 and out == b'{"a":2}')
+
+        # 13: read is silently missing for a file that is not there
+        rc, out, err = run(["read", target, "absent"])
+        check("read reports missing silently",
+              rc == EXIT_MISSING and out == b"" and err == b"")
+
+        # 14: read refuses a symlink
+        rc, out, _ = run(["read", target, "planted"])
+        check("read refuses a symlink", rc == EXIT_REFUSED and out == b"")
+
+        # 15: unlink removes a regular file
+        token = os.path.join(target, "suppress")
+        with open(token, "wb") as fh:
+            fh.write(b"1")
+        rc, _, _ = run(["unlink", target, "suppress"])
+        check("unlink removes a regular file", rc == 0 and not os.path.exists(token))
+
+        # 16: unlink is idempotent
+        rc, _, _ = run(["unlink", target, "suppress"])
+        check("unlink is idempotent", rc == 0)
+
+        # 17: unlink removes a planted symlink WITHOUT following it
+        rc, _, _ = run(["unlink", target, "planted"])
+        check("unlink removes a symlink without following it",
+              rc == 0
+              and not os.path.lexists(os.path.join(target, "planted"))
+              and open(victim, "rb").read() == b"original")
+
+        # 18: unlink refuses a directory
+        os.mkdir(os.path.join(target, "adir"))
+        rc, _, _ = run(["unlink", target, "adir"])
+        check("unlink refuses a directory",
+              rc == EXIT_REFUSED and os.path.isdir(os.path.join(target, "adir")))
+
+        # 19: names must be single components
+        rc, _, _ = run(["write", target, "../escape"], b"x")
+        check("write refuses a name with a separator", rc == EXIT_ERROR)
+
+        # 20: and paths may not contain ..
+        rc, _, _ = run(["ensure-dir", os.path.join(target, "..", "sneak")])
+        check("ensure-dir refuses '..' in a path", rc == EXIT_ERROR)
+
+        # 21: wrong owner. Needs a file owned by someone else that we can see;
+        # /etc/hosts is root's on every system this ships to. Skipped when run
+        # as root, where every owner check trivially passes.
+        if os.getuid() != 0:
+            etc = os.path.realpath("/etc")
+            hosts = os.path.join(etc, "hosts")
+            if os.path.isfile(hosts) and os.stat(hosts).st_uid != os.getuid():
+                rc, out, _ = run(["read", etc, "hosts"])
+                check("read refuses a file owned by another user",
+                      rc == EXIT_REFUSED and out == b"")
+            else:
+                passed.append("read refuses a file owned by another user (skipped: no sample)")
+        else:
+            passed.append("read refuses a file owned by another user (skipped: running as root)")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    for name in passed:
+        sys.stdout.write("  ok    %s\n" % name)
+    for name in failed:
+        sys.stdout.write("  FAIL  %s\n" % name)
+    sys.stdout.write("%s selftest: %d passed, %d failed\n"
+                     % (PROG, len(passed), len(failed)))
+    return EXIT_OK if not failed else EXIT_ERROR
+
+
+# --- argv ------------------------------------------------------------------
+
+USAGE = """usage:
+  clipbasket-safefile ensure-dir <path> [--mode 700]
+  clipbasket-safefile write <dir> <name> [--mode 600]    # stdin -> file
+  clipbasket-safefile read <dir> <name>                  # file -> stdout
+  clipbasket-safefile unlink <dir> <name>
+  clipbasket-safefile --selftest
+"""
+
+
+def _take_mode(args, default):
+    """Pull an optional --mode out of argv. No shell parsing anywhere."""
+    mode = default
+    rest = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--mode":
+            if i + 1 >= len(args):
+                raise Failed("--mode needs a value")
+            mode = _parse_mode(args[i + 1])
+            i += 2
+            continue
+        rest.append(args[i])
+        i += 1
+    return mode, rest
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(USAGE)
+        return EXIT_OK
+    if argv[0] == "--selftest":
+        return _selftest()
+
+    command, args = argv[0], argv[1:]
+    try:
+        if command == "ensure-dir":
+            mode, rest = _take_mode(args, DEFAULT_DIR_MODE)
+            if len(rest) != 1:
+                raise Failed("ensure-dir takes exactly one path")
+            return cmd_ensure_dir(rest[0], mode)
+        if command == "write":
+            mode, rest = _take_mode(args, DEFAULT_FILE_MODE)
+            if len(rest) != 2:
+                raise Failed("write takes a directory and a name")
+            return cmd_write(rest[0], rest[1], mode)
+        if command == "read":
+            if len(args) != 2:
+                raise Failed("read takes a directory and a name")
+            return cmd_read(args[0], args[1])
+        if command == "unlink":
+            if len(args) != 2:
+                raise Failed("unlink takes a directory and a name")
+            return cmd_unlink(args[0], args[1])
+        raise Failed("unknown command: %s" % command)
+    except Refused as exc:
+        _warn(str(exc))
+        return EXIT_REFUSED
+    except Failed as exc:
+        _warn(str(exc))
+        return EXIT_ERROR
+    except OSError as exc:
+        _warn("%s: %s" % (exc.filename or "", exc.strerror))
+        return EXIT_ERROR
+    except BrokenPipeError:
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

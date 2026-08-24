@@ -378,6 +378,89 @@ lose content.
 
 ---
 
+## Writing to predictable paths
+
+Everything above lives at a path anyone can guess: `~/.local/state/clipbasket`
+and a fixed set of names beneath it. That makes every write a place where
+another process running as **the same user** can get in front of us — plant a
+symlink at `images/`, at `suppress`, at `settings.json` — and have our bytes
+land somewhere of its choosing.
+
+Checking the path first does not fix this. `[ -L "$dir" ]` followed by a `cp`
+is two operations on a name, and the name can be re-pointed in between; the
+check passes, the write goes elsewhere, and nothing looks wrong. Checking
+harder makes the window smaller, never zero. This is the classic TOCTOU shape
+and it is what the marketplace review flagged on 2026-08-24.
+
+So the check is not what protects the write. **`bin/clipbasket-safefile`** does.
+
+### The contract
+
+`clipbasket-safefile` is a small python3 helper (standard library only —
+python3 is already required by `clipbasket-html2md`) that bash calls for every
+privileged write. bash cannot do this itself: it has no `O_NOFOLLOW`, no
+`openat`, and no way to hold a directory descriptor across commands.
+
+| Command | What it binds |
+| --- | --- |
+| `ensure-dir <path> [--mode]` | Opens every component with `O_DIRECTORY\|O_NOFOLLOW`, creating missing ones with `mkdirat`; `fstat`s each descriptor for "is a directory, owned by us" |
+| `write <dir> <name> [--mode]` | stdin → a `O_CREAT\|O_EXCL\|O_NOFOLLOW` temp file inside the **verified descriptor**, `fsync`, then `renameat` onto the final name |
+| `read <dir> <name>` | `openat` with `O_NOFOLLOW`, `fstat` regular-and-owned, stream to stdout |
+| `unlink <dir> <name>` | `unlinkat` relative to the verified descriptor; a planted symlink is removed *as the link*, never followed |
+
+Exit codes: `0` success, `2` the file is not there (`read` only, silent, an
+ordinary outcome), `3` **refused** — a symlink, a wrong file type or a wrong
+owner was found where it must not be — and `1` for anything else. A `3` is
+never retried or worked around by any caller.
+
+The property that matters: after `open_dir` returns, the caller holds a
+descriptor, not a name. Whatever happens to the pathname afterwards, the
+`renameat` still lands in the directory that was verified. Substituting the
+directory after the check no longer substitutes the destination — it just
+means the attacker owns a directory nobody is writing to.
+
+### What is bound where
+
+| Write | Bound by |
+| --- | --- |
+| `clips.db`, and its `-wal` / `-shm` | **CWD pinning**: `clipbasket-db` `cd -P`s into the state directory once, confirms `$PWD` came back equal to the path it asked for (so no component was a symlink) and that `.` is owned by us, then opens the database as `./clips.db`. sqlite3 resolves against the held working directory, and the journal files follow the database into it. |
+| `suppress` (write and consume) | `safefile write` / `read` / `unlink` |
+| `images/<hash>.<ext>`, `thumbs/<hash>.png` | Staged in `$TMPDIR`, published with `safefile write` |
+| `settings.json` (CLI and panel) | `safefile write`, with jq still doing the merge |
+| `make-default.json`, `backups/bindings.lua.*` | `safefile write` |
+| `bindings.lua` | Resolved **once** with `readlink -f` — this is the one path that may legitimately be a symlink, because dotfile repos do that — then replaced with `safefile write` against the resolved directory |
+
+The pathname checks (`ensure_private_dir`, `refuse_symlink`) are still there
+and still run first. They are fast-fail UX: they turn the common mistake into a
+clear message without paying for a subprocess. They are explicitly *not* the
+security boundary, and every one of them is commented to say so.
+
+The reuse tests are non-following too, which is subtler than it sounds: `[ -f
+"$target" ]` follows symlinks, so a link planted at a content-addressed image
+name used to read as "already stored", skip the write, and get recorded —
+refusing nothing and logging nothing. Those tests now ask `[ -L ]` as well, so
+anything that is not a real file goes down the write path where the helper
+refuses it.
+
+### The boundary, stated plainly
+
+This defends against a same-user process substituting a directory or a file at
+a predictable path between our check and our use. It does **not** defend
+against a process that can already write inside our `0700` directories, that
+can `ptrace` us, or that can replace `clipbasket-safefile` itself. Nothing in
+userspace can: a process running as you, with your permissions, that has
+already got inside your data directory has won before any of this starts. The
+threat this closes is the race, and the race is closed by binding to
+descriptors rather than by checking names more times.
+
+`clipbasket-safefile --selftest` covers it: 21 cases including planted symlinks
+at a directory component, at a write destination and at an unlink target,
+wrong-owner refusal, temp-file cleanup on both the success and the refusal
+path, and an assertion that nothing appears behind any planted link. Each of
+the three shell suites additionally asserts that its writes actually go
+*through* the helper, by pointing `CLIPBASKET_SAFEFILE` at a path that does not
+exist and requiring the write to fail.
+
 ## Testing
 
 ```

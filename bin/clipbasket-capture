@@ -31,6 +31,7 @@ SUPPRESS_FILE="$STATE_DIR/suppress"
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 DB_CLI="${CLIPBASKET_DB_CLI:-$SCRIPT_DIR/clipbasket-db}"
+SAFEFILE="${CLIPBASKET_SAFEFILE:-$SCRIPT_DIR/clipbasket-safefile}"
 
 MAX_TEXT_BYTES="${CLIPBASKET_MAX_TEXT_BYTES:-8388608}"    # 8 MiB, as in the Tauri app
 MAX_HTML_BYTES="${CLIPBASKET_MAX_HTML_BYTES:-8388608}"    # CLIPBOARD_HTML_MAX_BYTES
@@ -89,6 +90,43 @@ ensure_private_dir() {
 	mkdir -p -- "$dir" || { log "could not create $dir"; exit 1; }
 	if [ -L "$dir" ]; then log "$dir became a symlink; refusing"; exit 1; fi
 	chmod "$mode" -- "$dir" 2>/dev/null || true
+}
+
+# The check above is fast-fail UX, not the security boundary: a pathname test
+# followed later by a `cp` is a check-to-use window a same-user process can
+# race. Real writes go through clipbasket-safefile, which opens every path
+# component O_NOFOLLOW, verifies the descriptor with fstat, and renames
+# relative to it. (Marketplace security review, second round, 2026-08-24.)
+safe_ensure_dir() {
+	local rc=0
+	"$SAFEFILE" ensure-dir "$1" --mode "${2:-700}" || rc=$?
+	if [ "$rc" -ne 0 ]; then log "refusing to use $1 (clipbasket-safefile exit $rc)"; exit 1; fi
+}
+
+safe_write() {
+	# $1 dir, $2 name, $3 mode. Content on stdin.
+	local rc=0
+	"$SAFEFILE" write "$1" "$2" --mode "${3:-600}" || rc=$?
+	if [ "$rc" -ne 0 ]; then log "refusing to write $1/$2 (clipbasket-safefile exit $rc)"; return 1; fi
+	return 0
+}
+
+# Exit 2 means "not there", which is the ordinary case for a one-shot token.
+safe_read() {
+	local rc=0
+	"$SAFEFILE" read "$1" "$2" || rc=$?
+	case "$rc" in
+	0) return 0 ;;
+	2) return 1 ;;
+	*) log "refusing to read $1/$2 (clipbasket-safefile exit $rc)"; return 1 ;;
+	esac
+}
+
+safe_unlink() {
+	local rc=0
+	"$SAFEFILE" unlink "$1" "$2" || rc=$?
+	[ "$rc" -eq 0 ] || log "could not remove $1/$2 (clipbasket-safefile exit $rc)"
+	return 0
 }
 
 
@@ -215,12 +253,16 @@ offer_is_confidential() {
 consume_suppression() {
 	local want token=''
 	want="$1"
-	[ -f "$SUPPRESS_FILE" ] || return 1
+	# Read and remove through clipbasket-safefile: both are descriptor-relative
+	# and refuse to follow a symlink, so a token planted at this predictable
+	# path can neither leak the hash we are about to read nor redirect the
+	# removal onto something else.
+	#
 	# Read to EOF, not to the first newline: a truncated token silently fails
 	# to match and disarms suppression.
-	IFS= read -r -d '' token <"$SUPPRESS_FILE" || true
+	token=$(safe_read "$STATE_DIR" suppress) || return 1
 	token=${token%$'\n'}
-	rm -f "$SUPPRESS_FILE"
+	safe_unlink "$STATE_DIR" suppress
 	[ "$token" = "$want" ]
 }
 
@@ -466,8 +508,11 @@ make_thumbnail() {
 	local source="$1" dest="$2" magick
 	magick=$(magick_cmd)
 	[ -n "$magick" ] || return 0
+	# `png:` states the output format rather than letting ImageMagick infer it
+	# from the extension: the destination is now a staging file in TMPDIR, which
+	# has none, and an inferred format there is a silent failure.
 	if ! "$magick" "${source}[0]" -thumbnail "${THUMB_SIZE}x${THUMB_SIZE}>" \
-		-background none -alpha background "$dest" 2>/dev/null; then
+		-background none -alpha background "png:$dest" 2>/dev/null; then
 		rm -f -- "$dest"
 	fi
 	return 0
@@ -619,19 +664,29 @@ capture_image() {
 	# and one dedupe key, without ever decoding the pixels.
 	hash=$(sha256_of image "$stdin_file")
 
-	ensure_private_dir "$STATE_DIR" 700
-	ensure_private_dir "$IMAGE_DIR" 755
-	ensure_private_dir "$THUMB_DIR" 755
+	safe_ensure_dir "$STATE_DIR" 700
+	safe_ensure_dir "$IMAGE_DIR" 755
+	safe_ensure_dir "$THUMB_DIR" 755
 	target="$IMAGE_DIR/$hash.$extension"
-	# Staged under a temporary name and renamed only once the row exists: the
-	# old order copied the image in first, so a failed insert left an orphan in
-	# images/ that nothing referenced and nothing would ever clean up.
+	# Staged in TMPDIR and published only once the row exists: a failed insert
+	# must not leave an orphan in images/ that nothing references, and a partial
+	# file must never exist at the content-addressed name. The publish at the
+	# end is a descriptor-relative atomic rename inside the verified directory,
+	# not a `mv` onto a pathname that could have been re-pointed since.
+	# `-f` follows symlinks, so a link planted at the content-addressed name
+	# read as "already present" and skipped the write entirely -- the row was
+	# then recorded pointing at whatever the attacker had linked to, with
+	# nothing refused and nothing logged. `-L` makes the reuse decision
+	# non-following: anything that is not a real file here goes down the write
+	# path, where clipbasket-safefile refuses it.
 	staged=''
-	if [ ! -f "$target" ]; then
-		staged="$IMAGE_DIR/.staging.$$.$hash.$extension"
+	if [ ! -f "$target" ] || [ -L "$target" ]; then
+		mktempfile
+		staged="$REPLY_TMPFILE"
 		if ! cp -- "$stdin_file" "$staged"; then
 			rm -f -- "$staged"
-			log "could not write $target"
+			staged=''
+			log "could not stage $target"
 			return 2
 		fi
 	fi
@@ -659,10 +714,12 @@ capture_image() {
 	# renamed with the image for exactly the same reason.
 	thumb_target="$THUMB_DIR/$hash.png"
 	staged_thumb=''
-	if [ -f "$thumb_target" ]; then
+	# Same non-following reuse test as the image above, for the same reason.
+	if [ -f "$thumb_target" ] && [ ! -L "$thumb_target" ]; then
 		thumb="$thumb_target"
 	else
-		staged_thumb="$THUMB_DIR/.staging.$$.$hash.png"
+		mktempfile
+		staged_thumb="$REPLY_TMPFILE"
 		make_thumbnail "$source_file" "$staged_thumb"
 		if [ -s "$staged_thumb" ]; then
 			thumb="$thumb_target"
@@ -716,8 +773,15 @@ capture_image() {
 		[ -z "$staged_thumb" ] || rm -f -- "$staged_thumb"
 		return 2
 	fi
-	[ -z "$staged" ] || mv -f -- "$staged" "$target"
-	[ -z "$staged_thumb" ] || mv -f -- "$staged_thumb" "$thumb_target"
+	# Publish. Both go through the helper, so the bytes land in the directory
+	# whose descriptor was verified rather than at a name that merely looked
+	# right a moment ago.
+	if [ -n "$staged" ] && ! safe_write "$IMAGE_DIR" "$hash.$extension" 644 <"$staged"; then
+		return 2
+	fi
+	if [ -n "$staged_thumb" ]; then
+		safe_write "$THUMB_DIR" "$hash.png" 644 <"$staged_thumb" || true
+	fi
 	return 0
 }
 
@@ -807,7 +871,11 @@ capture_text() {
 cmd_selftest() {
 	local pass=0 fail=0
 
+	# Resolved with -P: on macOS $TMPDIR sits under /var, which is a symlink,
+	# and clipbasket-safefile refuses to walk through one -- correctly. Harness
+	# fix only; the rule the helper enforces is unchanged.
 	SELFTEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/clipbasket-capture-selftest.XXXXXX")
+	SELFTEST_ROOT=$(CDPATH='' cd -P -- "$SELFTEST_ROOT" && pwd -P)
 	trap 'rm -rf "${SELFTEST_ROOT:-}"; cleanup' EXIT
 	trap 'rm -rf "${SELFTEST_ROOT:-}"; cleanup; trap - INT; kill -s INT $$' INT
 	trap 'rm -rf "${SELFTEST_ROOT:-}"; cleanup; trap - TERM; kill -s TERM $$' TERM
@@ -1050,6 +1118,23 @@ cmd_selftest() {
 	esac
 	check 'and nothing was written through it' "0" "$(find "$state/elsewhere" -type f 2>/dev/null | wc -l | tr -d ' ')"
 	rm -f "$state/images"
+
+	# A symlink planted at the content-addressed image name itself, rather than
+	# at the directory. Nothing checks that path before writing -- the refusal
+	# has to come from the descriptor-bound publish, which is the point.
+	reset_db
+	printf 'image/png\n' >"$fix/types"
+	mkdir -p "$state/images"
+	printf 'original\n' >"$state/victim.png"
+	sym_hash=$(sha256_of image "$SELFTEST_ROOT/small.png")
+	ln -sf "$state/victim.png" "$state/images/$sym_hash.png"
+	sym_out=$("$SCRIPT_DIR/clipbasket-capture" image <"$SELFTEST_ROOT/small.png" 2>&1 || true)
+	case "$sym_out" in
+	*symlink*) pass=$((pass+1)); printf 'PASS  %s\n' 'a planted symlink at the image name is refused' ;;
+	*) fail=$((fail+1)); printf 'FAIL  a planted symlink at the image name is refused\n        got: %s\n' "$sym_out" ;;
+	esac
+	check 'and the file behind the link is untouched' 'original' "$(cat "$state/victim.png")"
+	rm -f "$state/images/$sym_hash.png" "$state/victim.png"
 
 	unset CLIPBASKET_SELFTEST_FIXTURE CLIPBASKET_WL_PASTE CLIPBASKET_WL_COPY
 	unset CLIPBASKET_STATE_DIR CLIPBASKET_DB CLIPBASKET_DB_CLI

@@ -108,6 +108,8 @@ Panel {
   readonly property string stateDir: "${XDG_STATE_HOME:-$HOME/.local/state}/clipbasket"
   readonly property string defaultStatePath: root.stateDir + "/make-default.json"
   readonly property string cliPath: root.pluginDir + "/bin/clipbasket-omarchy"
+  // Same derivation as cliPath: the helper ships beside the rest of bin/.
+  readonly property string safefilePath: root.pluginDir + "/bin/clipbasket-safefile"
   property bool isDefaultShortcut: false
   property bool shortcutBusy: false
   // Empty means "no compositor binding recorded yet"; the compositor owns it.
@@ -1334,19 +1336,22 @@ Panel {
     });
     var dir = "\"" + root.settingsDir + "\"";
     var file = "\"" + root.settingsPath + "\"";
-    // The temporary file has to live in the same directory as the target.
-    // mktemp's default is /tmp, which is a tmpfs on Arch, so the mv was a
-    // cross-filesystem copy-and-unlink rather than an atomic rename -- and a
-    // crash partway through left a truncated settings.json that the next write
-    // read as invalid and silently replaced with `{}`, taking every setting
-    // with it.
-    var tmpl = "\"" + root.settingsDir + "/.settings.XXXXXX\"";
+    // The write is handed to clipbasket-safefile rather than done with a shell
+    // redirection. `mkdir`, `mktemp` and `mv` all act on pathnames, and the
+    // `[ -L ]` guard in front of them was a check-to-use window: between the
+    // test and the rename, a process running as this user can replace the
+    // directory with a symlink and the settings land somewhere else. The
+    // helper opens every component with O_NOFOLLOW, verifies the descriptor,
+    // and renames relative to it, so there is no pathname left to re-point.
+    //
+    // jq still does the merging, exactly as before -- only where its output
+    // lands has changed, and the payload above is untouched.
     root.runAction(
-      "if [ -L " + dir + " ] || [ -L " + file + " ]; then exit 1; fi && "
-      + "mkdir -p " + dir + " && tmp=$(mktemp " + tmpl + ") && "
-      + "{ { jq -e . " + file + " 2>/dev/null || printf '{}'; } "
-      + "| jq --argjson patch " + root.shq(payload) + " '. * $patch' > \"$tmp\" "
-      + "&& mv \"$tmp\" " + file + "; } || rm -f \"$tmp\"", false);
+      root.shq(root.safefilePath) + " ensure-dir " + dir + " --mode 755 && "
+      + "{ jq -e . " + file + " 2>/dev/null || printf '{}'; } "
+      + "| jq --argjson patch " + root.shq(payload) + " '. * $patch' "
+      + "| " + root.shq(root.safefilePath) + " write " + dir + " settings.json --mode 600",
+      false);
   }
 
   // pasteSelectedClipImmediately requires closePanelAfterAction: pasting into
