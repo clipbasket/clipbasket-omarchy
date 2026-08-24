@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-readonly VERSION="0.3.0"
+readonly VERSION="1.0.0"
 readonly PLUGIN_ID="clipbasket.clipboard"
 
 # The keybinding Omarchy ships for its own clipboard overlay, and the one we
@@ -22,11 +22,19 @@ readonly DEFAULT_KEY="SUPER + CTRL + V"
 readonly TOGGLE_COMMAND="omarchy-shell shell toggle $PLUGIN_ID"
 readonly OMARCHY_CLIPBOARD_PLUGIN="omarchy.clipboard"
 
-# Everything the managed block in bindings.lua is delimited by. Never widen
-# these: `restore-default` deletes strictly between them, so a user's own lines
-# can never be caught up in it.
-readonly BLOCK_BEGIN="-- >>> clipbasket"
+# Everything the managed block in bindings.lua is delimited by. These are
+# matched as whole lines, leading whitespace aside -- never as substrings, and
+# never without their partner. A user comment that merely mentions the marker
+# text used to open a block that never closed, and `restore-default` then
+# deleted everything from that comment to the end of the file.
+readonly BLOCK_BEGIN="-- >>> clipbasket — managed by \`clipbasket-omarchy make-default\`. Do not edit by"
 readonly BLOCK_END="-- <<< clipbasket"
+
+# A --key is interpolated into Lua source that Hyprland loads at startup, so it
+# is validated as a keybinding and nothing else: a quote in it is arbitrary code
+# execution at login, and an unbalanced one bricks every binding in the file
+# while this command still prints success.
+readonly BIND_KEY_PATTERN='^[A-Za-z0-9 +,_-]+$'
 
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -162,16 +170,27 @@ shell_running() {
   pgrep -f 'quickshell -n -p' >/dev/null 2>&1
 }
 
+# True only when a *well-formed* BEGIN...END pair is present. Anything less is
+# not our block, and nothing may be stripped on the strength of it.
 managed_block_present() {
-  [[ -f "$BINDINGS_FILE" ]] && grep -qF -- "$BLOCK_BEGIN" "$BINDINGS_FILE"
+  [[ -f "$BINDINGS_FILE" ]] || return 1
+  awk -v b="$BLOCK_BEGIN" -v e="$BLOCK_END" '
+    function strip(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    { line = strip($0) }
+    !inblock && line == b { inblock = 1; next }
+    inblock && line == e  { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  ' "$BINDINGS_FILE"
 }
 
 # The key our managed block currently binds, read back from the file itself.
 managed_block_key() {
   [[ -f "$BINDINGS_FILE" ]] || return 1
   awk -v b="$BLOCK_BEGIN" -v e="$BLOCK_END" '
-    index($0, b) { inblock = 1; next }
-    index($0, e) { inblock = 0; next }
+    function strip(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    { line = strip($0) }
+    !inblock && line == b { inblock = 1; next }
+    inblock && line == e  { inblock = 0; next }
     inblock && /o\.bind\(/ {
       if (match($0, /"[^"]*"/)) {
         print substr($0, RSTART + 1, RLENGTH - 2)
@@ -193,6 +212,69 @@ keybind_live() {
 
 # --------------------------------------------------------- bindings.lua -----
 
+# The real file behind $BINDINGS_FILE. A dotfiles setup symlinks
+# ~/.config/hypr/bindings.lua into a git repo, and `mv`ing a new file over the
+# link would silently replace the link with a copy -- the user's next `stow` or
+# `git status` is then the first they hear of it.
+resolve_bindings_target() {
+  local path="$BINDINGS_FILE" resolved dir base link
+  if resolved=$(readlink -f -- "$path" 2>/dev/null) && [[ -n "$resolved" ]]; then
+    printf '%s' "$resolved"
+    return 0
+  fi
+  # readlink -f is GNU and modern-BSD only; walk the chain by hand otherwise.
+  dir=$(cd -P -- "$(dirname -- "$path")" 2>/dev/null && pwd -P) || { printf '%s' "$path"; return 0; }
+  base=$(basename -- "$path")
+  local hops=0
+  while [[ -L "$dir/$base" && $hops -lt 32 ]]; do
+    link=$(readlink -- "$dir/$base")
+    case "$link" in
+      /*) base=$(basename -- "$link"); dir=$(dirname -- "$link") ;;
+      *)  base=$(basename -- "$link"); dir=$(cd -P -- "$dir/$(dirname -- "$link")" 2>/dev/null && pwd -P) || break ;;
+    esac
+    hops=$((hops + 1))
+  done
+  printf '%s/%s' "${dir%/}" "$base"
+}
+
+# Fails with the friendly `die` *before* anything is written, so an unwritable
+# ~/.config/hypr never gets as far as a backup followed by a raw mktemp error.
+ensure_bindings_writable() {
+  local target dir
+  target="$(resolve_bindings_target)"
+  dir="$(dirname -- "$target")"
+  [[ -d "$dir" ]] || die "$dir does not exist. Is this Omarchy?"
+  [[ -w "$dir" ]] || die "$dir is not writable by $(id -un). Fix its permissions and try again."
+  if [[ -e "$target" && ! -w "$target" ]]; then
+    die "$target is not writable by $(id -un). Fix its permissions and try again."
+  fi
+}
+
+# True when $1 ends in a newline. An empty file counts as "no trailing newline",
+# which is also how it should be written back out.
+file_ends_with_newline() {
+  [[ -s "$1" ]] || return 1
+  [[ -z "$(tail -c 1 -- "$1")" ]]
+}
+
+# Keeps the newest $1 backups and unlinks the rest. Our stamps sort
+# chronologically as text, so the glob's own order is the right order.
+prune_backups() {
+  local keep="$1" n i
+  (( DRY_RUN )) && return 0
+  [[ -d "$BACKUP_DIR" ]] || return 0
+  local -a all=()
+  local f
+  for f in "$BACKUP_DIR"/bindings.lua.*; do
+    [[ -e "$f" ]] && all+=("$f")
+  done
+  n=${#all[@]}
+  (( n > keep )) || return 0
+  for (( i = 0; i < n - keep; i++ )); do
+    rm -f -- "${all[$i]}"
+  done
+}
+
 backup_bindings() {
   [[ -f "$BINDINGS_FILE" ]] || return 0
   local stamp dest n
@@ -202,39 +284,57 @@ backup_bindings() {
   # backup — that is exactly when a user is retrying and needs the earlier one.
   n=1
   while [[ -e "$dest" ]]; do
-    dest="$BACKUP_DIR/bindings.lua.$stamp.$n"
+    dest="$(printf '%s/bindings.lua.%s.%03d' "$BACKUP_DIR" "$stamp" "$n")"
     n=$((n + 1))
   done
   run mkdir -p -- "$BACKUP_DIR"
   run cp -p -- "$BINDINGS_FILE" "$dest"
   (( DRY_RUN )) || ok "Backed up bindings.lua to $dest"
+  # Nothing else ever pruned these, so a user who ran make-default a few dozen
+  # times accumulated a few dozen copies of their keybindings forever.
+  prune_backups 10
 }
 
-# Write $1 to $BINDINGS_FILE atomically, preserving the original's mode.
+# Write $1 to the file $BINDINGS_FILE resolves to, atomically, preserving the
+# original's mode. $2 is 1 to end the file with a newline (the default) or 0 to
+# write it without one, so `restore-default` gives back exactly the shape it
+# was handed.
 write_bindings() {
-  local content="$1" tmp
+  local content="$1" trailing="${2:-1}" target dir tmp
   if (( DRY_RUN )); then
     printf '    %s[dry-run]%s would write %s:\n' "$C_DIM" "$C_RESET" "$BINDINGS_FILE"
     printf '%s\n' "$content" | sed 's/^/        /'
     return 0
   fi
-  tmp="$(mktemp -- "${BINDINGS_FILE}.clipbasket.XXXXXX")"
+  # Write *through* a symlink to the file it points at, and stage the temp file
+  # in that file's own directory so the rename stays on one filesystem.
+  target="$(resolve_bindings_target)"
+  dir="$(dirname -- "$target")"
+  tmp="$(mktemp -- "$dir/.clipbasket-bindings.XXXXXX")" ||
+    die "Could not create a temp file in $dir — is it writable?"
 
   # The write goes to a sibling temp file and lands with a single rename, so an
   # out-of-space or interrupted write can never leave the user with a truncated
   # bindings.lua — they either get the old file or the new one. Failures clean
   # the temp file up explicitly rather than through a RETURN trap, which bash
   # runs after the local `tmp` is already out of scope.
-  if [[ -f "$BINDINGS_FILE" ]]; then
-    chmod --reference="$BINDINGS_FILE" -- "$tmp" 2>/dev/null || true
+  if [[ -f "$target" ]]; then
+    chmod --reference="$target" -- "$tmp" 2>/dev/null || true
   fi
-  if ! printf '%s\n' "$content" >"$tmp"; then
-    rm -f -- "$tmp"
-    die "Failed to write $tmp — $BINDINGS_FILE is unchanged."
+  if (( trailing )); then
+    printf '%s\n' "$content" >"$tmp" || {
+      rm -f -- "$tmp"
+      die "Failed to write $tmp — $target is unchanged."
+    }
+  else
+    printf '%s' "$content" >"$tmp" || {
+      rm -f -- "$tmp"
+      die "Failed to write $tmp — $target is unchanged."
+    }
   fi
-  if ! mv -f -- "$tmp" "$BINDINGS_FILE"; then
+  if ! mv -f -- "$tmp" "$target"; then
     rm -f -- "$tmp"
-    die "Failed to replace $BINDINGS_FILE — it is unchanged."
+    die "Failed to replace $target — it is unchanged."
   fi
 }
 
@@ -243,16 +343,29 @@ write_bindings() {
 # `restore-default` an exact reversal rather than a reformat.
 bindings_without_block() {
   [[ -f "$BINDINGS_FILE" ]] || return 0
+  # Two passes over the same file: the first only asks whether a well-formed
+  # BEGIN...END pair exists at all, and when it does not the second pass prints
+  # the file back unchanged. Without that, a BEGIN with no END deleted the rest
+  # of the file.
   awk -v b="$BLOCK_BEGIN" -v e="$BLOCK_END" '
-    index($0, b) { inblock = 1; next }
-    inblock && index($0, e) { inblock = 0; next }
+    function strip(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    NR == FNR {
+      line = strip($0)
+      if (!seen_begin && line == b) { seen_begin = 1; next }
+      if (seen_begin && line == e)  { well_formed = 1 }
+      next
+    }
+    !well_formed { print; next }
+    { line = strip($0) }
+    !inblock && line == b { inblock = 1; next }
+    inblock && line == e  { inblock = 0; next }
     !inblock { print }
-  ' "$BINDINGS_FILE"
+  ' "$BINDINGS_FILE" "$BINDINGS_FILE"
 }
 
 managed_block_text() {
   cat <<EOF
-$BLOCK_BEGIN — managed by \`clipbasket-omarchy make-default\`. Do not edit by
+$BLOCK_BEGIN
 -- hand; \`clipbasket-omarchy restore-default\` deletes this block verbatim.
 hl.unbind("$BIND_KEY")
 o.bind("$BIND_KEY", "Clipbasket", "$TOGGLE_COMMAND")
@@ -389,6 +502,7 @@ cmd_make_default() {
   if [[ ! -f "$BINDINGS_FILE" ]]; then
     die "$BINDINGS_FILE does not exist. Is this Omarchy? Pass CLIPBASKET_BINDINGS=… to override."
   fi
+  ensure_bindings_writable
 
   local current_key
   if managed_block_present; then
@@ -448,12 +562,17 @@ cmd_restore_default() {
   if ! managed_block_present; then
     ok "No Clipbasket block in $BINDINGS_FILE — nothing to undo there"
   else
+    ensure_bindings_writable
+    # Whether the file ended in a newline is part of "exactly" — a file that had
+    # none must not come back with one.
+    local had_trailing=1
+    file_ends_with_newline "$BINDINGS_FILE" || had_trailing=0
     backup_bindings
     local content
     content="$(bindings_without_block)"
     # Drop the blank separator we added, so the file returns to its prior shape.
     content="${content%$'\n'}"
-    write_bindings "$content"
+    write_bindings "$content" "$had_trailing"
     (( DRY_RUN )) || ok "Removed the Clipbasket block from $BINDINGS_FILE"
   fi
 
@@ -731,6 +850,154 @@ cmd_settings_init() {
   ok "Wrote defaults to $SETTINGS_FILE"
 }
 
+# ------------------------------------------------------------- selftest -----
+
+# Runs entirely inside a scratch directory: no Omarchy, no Hyprland, no writes
+# anywhere near the user's real config.
+cmd_selftest() {
+  local pass=0 fail=0 root self out state
+  self="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+  root="$(mktemp -d "${TMPDIR:-/tmp}/clipbasket-omarchy-selftest.XXXXXX")"
+  SELFTEST_ROOT="$root"
+  trap 'rm -rf "${SELFTEST_ROOT:-}"' EXIT
+
+  check() {
+    if [[ "$2" == "$3" ]]; then
+      pass=$((pass + 1)); printf 'PASS  %s\n' "$1"
+    else
+      fail=$((fail + 1))
+      printf 'FAIL  %s\n        expected: %s\n        actual:   %s\n' "$1" "$2" "$3"
+    fi
+  }
+  check_contains() {
+    case "$3" in
+      *"$2"*) pass=$((pass + 1)); printf 'PASS  %s\n' "$1" ;;
+      *) fail=$((fail + 1))
+         printf 'FAIL  %s\n        wanted substring: %s\n        actual:   %s\n' "$1" "$2" "$3" ;;
+    esac
+  }
+
+  state="$root/state"
+  # $1 bindings file, then the CLI arguments.
+  cli() {
+    local bindings="$1"; shift
+    CLIPBASKET_BINDINGS="$bindings" XDG_STATE_HOME="$state" \
+      CLIPBASKET_SETTINGS="$root/settings.json" NO_COLOR=1 \
+      "$self" "$@" --no-reload --keep-omarchy-clipboard 2>&1 || true
+  }
+
+  printf '%s\n' "clipbasket-omarchy $VERSION selftest"
+  printf '  sandbox: %s\n\n' "$root"
+
+  local decoy="$root/decoy.lua"
+  local user_text='-- my own notes
+-- >>> clipbasket is what I bind SUPER+X to
+o.bind("SUPER + X", "Mine", "true")'
+
+  # --- a decoy marker is not our block ---------------------------------
+  printf '%s\n' "$user_text" >"$decoy"
+  BINDINGS_FILE="$decoy"
+  check 'a comment mentioning the marker is not a managed block' 'absent' \
+    "$(managed_block_present && printf present || printf absent)"
+  check 'and stripping it is a no-op' "$user_text" "$(bindings_without_block)"
+
+  out=$(cli "$decoy" restore-default)
+  check 'restore-default leaves a decoy file byte for byte' "$user_text" "$(cat "$decoy")"
+  check_contains 'and says there was nothing to undo' 'nothing to undo' "$out"
+
+  # --- a BEGIN with no END is not a block either ------------------------
+  local truncated="$root/truncated.lua"
+  printf '%s\n%s\no.bind("SUPER + Y", "Mine", "true")\n' \
+    '-- user line' "$BLOCK_BEGIN" >"$truncated"
+  local truncated_before
+  truncated_before="$(cat "$truncated")"
+  out=$(cli "$truncated" restore-default)
+  check 'a BEGIN with no END is refused, not stripped to EOF' "$truncated_before" \
+    "$(cat "$truncated")"
+
+  # --- make-default / restore-default round trip ------------------------
+  local round="$root/round.lua"
+  printf '%s\n' "$user_text" >"$round"
+  out=$(cli "$round" make-default)
+  check_contains 'make-default binds the default key' "$DEFAULT_KEY -> " "$out"
+  BINDINGS_FILE="$round"
+  check 'the managed block is now present' 'present' \
+    "$(managed_block_present && printf present || printf absent)"
+  check 'and it binds the default key' "$DEFAULT_KEY" "$(managed_block_key)"
+  check_contains 'the user decoy line survived make-default' \
+    '-- >>> clipbasket is what I bind SUPER+X to' "$(cat "$round")"
+  check_contains 'and so did the user binding' 'o.bind("SUPER + X", "Mine", "true")' "$(cat "$round")"
+  out=$(cli "$round" restore-default)
+  check 'restore-default returns the file byte for byte' "$user_text" "$(cat "$round")"
+
+  # --- the trailing newline is part of "exactly" ------------------------
+  local nonl="$root/nonl.lua"
+  { printf '%s\n\n' "$user_text"; managed_block_text; } >"$nonl"
+  # Strip the final newline the block text ends with.
+  printf '%s' "$(cat "$nonl")" >"$nonl.trimmed"
+  mv -f -- "$nonl.trimmed" "$nonl"
+  check 'the fixture really has no trailing newline' 'none' \
+    "$([[ -z "$(tail -c 1 -- "$nonl")" ]] && printf trailing || printf none)"
+  out=$(cli "$nonl" restore-default)
+  check 'restore-default does not add a trailing newline' 'none' \
+    "$([[ -z "$(tail -c 1 -- "$nonl")" ]] && printf trailing || printf none)"
+
+  # --- --key is validated, not interpolated -----------------------------
+  local keyfile="$root/key.lua"
+  printf '%s\n' "$user_text" >"$keyfile"
+  out=$(cli "$keyfile" make-default --key 'X") os.execute("touch /tmp/pwned") --')
+  check_contains 'a --key carrying Lua is refused' 'may only contain' "$out"
+  check 'and the file is untouched' "$user_text" "$(cat "$keyfile")"
+  out=$(cli "$keyfile" make-default --key 'SUPER + "V"')
+  check_contains 'a --key with a quote is refused' 'may only contain' "$out"
+  check 'and the file is still untouched' "$user_text" "$(cat "$keyfile")"
+  out=$(cli "$keyfile" make-default --key 'SUPER + ALT + C')
+  BINDINGS_FILE="$keyfile"
+  check 'a well-formed --key is accepted' 'SUPER + ALT + C' "$(managed_block_key)"
+  cli "$keyfile" restore-default >/dev/null
+
+  # --- a symlinked bindings.lua is written through ----------------------
+  local realdir="$root/real" linkdir="$root/link"
+  mkdir -p "$realdir" "$linkdir"
+  printf '%s\n' "$user_text" >"$realdir/bindings.lua"
+  ln -s "$realdir/bindings.lua" "$linkdir/bindings.lua"
+  cli "$linkdir/bindings.lua" make-default >/dev/null
+  check 'a symlinked bindings.lua is still a symlink afterwards' 'link' \
+    "$([[ -L "$linkdir/bindings.lua" ]] && printf link || printf file)"
+  check_contains 'and the block landed in the file it points at' 'Clipbasket' \
+    "$(cat "$realdir/bindings.lua")"
+  check 'with no stray temp file beside the link' '1' \
+    "$(find "$linkdir" -mindepth 1 | wc -l | tr -d ' ')"
+
+  # --- backups are pruned ------------------------------------------------
+  local churn="$root/churn.lua" i
+  printf '%s\n' "$user_text" >"$churn"
+  for ((i = 0; i < 13; i++)); do
+    cli "$churn" make-default >/dev/null
+  done
+  check 'backups are pruned to the newest ten' '10' \
+    "$(find "$state/clipbasket/backups" -type f 2>/dev/null | wc -l | tr -d ' ')"
+
+  # --- an unwritable config directory ------------------------------------
+  if [[ "$(id -u)" != "0" ]]; then
+    local ro="$root/readonly" rostate="$root/rostate"
+    mkdir -p "$ro"
+    printf '%s\n' "$user_text" >"$ro/bindings.lua"
+    chmod 500 "$ro"
+    out=$(CLIPBASKET_BINDINGS="$ro/bindings.lua" XDG_STATE_HOME="$rostate" NO_COLOR=1 \
+      "$self" make-default --no-reload --keep-omarchy-clipboard 2>&1 || true)
+    check_contains 'an unwritable config directory is a friendly error' 'not writable' "$out"
+    check_contains 'and it names the command that fixes it' 'permissions' "$out"
+    check 'and no backup was written before failing' '0' \
+      "$(find "$rostate/clipbasket/backups" -type f 2>/dev/null | wc -l | tr -d ' ')"
+    chmod 700 "$ro"
+  fi
+
+  printf '\n%s passed, %s failed\n' "$pass" "$fail"
+  [[ "$fail" -eq 0 ]] || return 1
+  return 0
+}
+
 # ----------------------------------------------------------------- help -----
 
 usage() {
@@ -749,6 +1016,7 @@ ${C_BOLD}Commands${C_RESET}
   status              Show what is installed and enabled
   doctor              Diagnose the install, PASS/FAIL per check
   settings-init       Write default settings from settings.schema.json
+  selftest            Run the built-in regression tests in a sandbox
   version             Print the version
   help                Show this help
 
@@ -812,6 +1080,9 @@ main() {
   if [[ -z "${BIND_KEY// /}" ]]; then
     die "--key cannot be empty"
   fi
+  if [[ ! "$BIND_KEY" =~ $BIND_KEY_PATTERN ]]; then
+    die "--key may only contain letters, digits, spaces and + , _ - (got: $BIND_KEY)"
+  fi
 
   case "$command" in
     enable)          cmd_enable ;;
@@ -821,6 +1092,7 @@ main() {
     status)          cmd_status ;;
     doctor)          cmd_doctor ;;
     settings-init)   cmd_settings_init "$force_flag" ;;
+    selftest)        cmd_selftest ;;
     version|--version) printf '%s\n' "$VERSION" ;;
     help)            usage ;;
     *)               die "unknown command: $command (try --help)" ;;

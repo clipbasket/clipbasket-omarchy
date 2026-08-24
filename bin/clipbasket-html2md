@@ -90,6 +90,28 @@ HARD_BREAK = "\x00"
 # fenced code bodies, and every URL.
 LIT_OPEN, LIT_CLOSE = "\x01", "\x02"
 LIT_RE = re.compile(LIT_OPEN + r"(\d+)" + LIT_CLOSE)
+# The three bytes above are an internal alphabet, so they must not be able to
+# arrive from outside: a page carrying \x01 7 \x02 would otherwise index into
+# the literal table (IndexError, or somebody else's code span spliced in), and
+# a \x00 in a text node would render as a hard line break. Stripped at the
+# door, once, for every entry point.
+SENTINEL_RE = re.compile("[\x00\x01\x02]")
+
+# The built-in converter is pure Python over a whole document tree, so a
+# pathological page can take unbounded time. pandoc gets a 20 s timeout; this
+# is the equivalent bound for the fallback path -- a clear error rather than a
+# UI that never comes back.
+BUILTIN_MAX_INPUT = 2 * 1024 * 1024
+
+# html.parser hands back a tree as deep as the source nests, and rendering
+# walks it recursively. Real pages do not nest 800 deep; fuzzers and broken
+# minifiers do, and RecursionError is not an acceptable answer to a paste.
+MAX_TREE_DEPTH = 500
+sys.setrecursionlimit(10000)
+
+
+class InputTooLarge(ValueError):
+    """Raised by convert() when the built-in path would be unbounded work."""
 
 
 class Element(object):
@@ -174,6 +196,12 @@ class TreeBuilder(HTMLParser):
             return
 
         self._implicit_close(tag)
+        if len(self.stack) >= MAX_TREE_DEPTH:
+            # Past the cap the element is flattened away: its text keeps
+            # arriving, it just lands in the deepest ancestor we did keep. A
+            # stray close tag for it finds nothing on the stack and is ignored,
+            # exactly as a browser ignores one.
+            return
         node = Element(tag, {k.lower(): (v if v is not None else "") for k, v in attrs})
         self._append(node)
         if tag not in VOID_TAGS:
@@ -441,7 +469,10 @@ class Renderer(object):
         if not body.strip():
             return []
         language = code_language(node)
-        longest = max((len(run) for run in re.findall(r"^`+", body, re.M)), default=0)
+        # Every backtick run in the body counts, not just the ones at column 0:
+        # an indented ``` inside the code would otherwise close the fence early
+        # and spill the rest of the block into the document as prose.
+        longest = max((len(run) for run in re.findall(r"`+", body)), default=0)
         fence = "`" * max(3, longest + 1)
         return [
             Block(self.lit("%s%s\n%s\n%s" % (fence, language, body, fence)), "pre")
@@ -537,6 +568,7 @@ class Renderer(object):
 
     # -- entry point --
     def convert(self, source):
+        source = SENTINEL_RE.sub("", source)
         root = parse(source)
         if self.base_url is None:
             self.base_url = document_base(root)
@@ -687,7 +719,14 @@ def collect_rows(renderer, table):
     walk(table, loose)
     ordered = sections["thead"] + sections["tbody"] + loose + sections["tfoot"]
     if not ordered:
-        return [], None
+        # `<table><td>a</td><td>b</td></table>` is malformed but common in
+        # hand-written and template-generated mail. Without a <tr> to hang the
+        # cells on the whole table used to vanish; synthesise the row a browser
+        # would have inserted instead.
+        synthetic = synthesise_row(table)
+        if synthetic is None:
+            return [], None
+        ordered = [synthetic]
 
     def cells(row):
         out = []
@@ -724,6 +763,23 @@ def collect_rows(renderer, table):
     return [cells(row) for row in body], header
 
 
+def synthesise_row(table):
+    """A single <tr> holding every stray <td>/<th> the table owns directly, or
+    None when there are none. Section wrappers are searched too, because
+    `<table><tbody><td>x</td></tbody></table>` loses its row the same way."""
+    row = Element("tr")
+    for child in table.children:
+        if not isinstance(child, Element):
+            continue
+        if child.tag in ("td", "th"):
+            row.children.append(child)
+        elif child.tag in ("thead", "tbody", "tfoot"):
+            for cell in child.children:
+                if isinstance(cell, Element) and cell.tag in ("td", "th"):
+                    row.children.append(cell)
+    return row if row.children else None
+
+
 def render_row(cells, width):
     padded = list(cells) + ["" for _ in range(width - len(cells))]
     return "| " + " | ".join(padded[:width]) + " |"
@@ -747,7 +803,14 @@ def render_divider(alignments, width):
 # --- top level -------------------------------------------------------------
 
 
-def convert(source, base_url=None):
+def convert(source, base_url=None, max_input=None):
+    limit = BUILTIN_MAX_INPUT if max_input is None else max_input
+    if limit and source and len(source) > limit:
+        raise InputTooLarge(
+            "input is %d characters; the built-in converter's limit is %d"
+            % (len(source), limit)
+        )
+    source = SENTINEL_RE.sub("", source or "")
     if not source or not source.strip():
         return ""
     return Renderer(base_url).convert(source)
@@ -829,12 +892,19 @@ def main(argv):
             sys.stderr.write("clipbasket-html2md: unknown option %s\n" % arg)
             return usage()
 
-    source = decode(sys.stdin.buffer.read())
+    source = SENTINEL_RE.sub("", decode(sys.stdin.buffer.read()))
     markdown = None
     if not builtin and source.strip():
         markdown = pandoc_convert(source, base_url)
     if markdown is None:
-        markdown = convert(source, base_url)
+        try:
+            markdown = convert(source, base_url)
+        except InputTooLarge as error:
+            sys.stderr.write(
+                "clipbasket-html2md: %s.\n"
+                "Install pandoc to convert documents this large.\n" % error
+            )
+            return 3
     out = markdown.rstrip("\n")
     sys.stdout.write(out + "\n" if out else "")
     return 0
@@ -883,6 +953,11 @@ CASES = [
         "fenced code block without a language",
         "<pre>plain\n  text</pre>",
         "```\nplain\n  text\n```",
+    ),
+    (
+        "an indented backtick run does not close the fence early",
+        "<pre>a\n   ```\nb</pre>",
+        "````\na\n   ```\nb\n````",
     ),
     (
         "links",
@@ -975,6 +1050,41 @@ CASES = [
         "headerless table gets an empty header",
         "<table><tr><td>a</td><td>b</td></tr></table>",
         "| | |\n| --- | --- |\n| a | b |",
+    ),
+    (
+        "cells with no row wrapper still make a table",
+        "<table><td>a</td><td>b</td></table>",
+        "| | |\n| --- | --- |\n| a | b |",
+    ),
+    (
+        "header cells with no row wrapper still make a table",
+        "<table><th>a</th><th>b</th></table>",
+        "| a | b |\n| --- | --- |",
+    ),
+    (
+        "cells directly inside tbody still make a table",
+        "<table><tbody><td>a</td><td>b</td></tbody></table>",
+        "| | |\n| --- | --- |\n| a | b |",
+    ),
+    (
+        "a sentinel byte cannot index the literal table",
+        "<p><code>x</code>\x0199\x02</p>",
+        "`x`99",
+    ),
+    (
+        "a sentinel byte cannot splice in another node's literal",
+        "<p><code>secret</code></p><p>\x010\x02</p>",
+        "`secret`\n\n0",
+    ),
+    (
+        "a null byte in a text node is dropped, not a hard break",
+        "<p>a\x00b</p>",
+        "ab",
+    ),
+    (
+        "800 levels of nesting flatten instead of overflowing",
+        "<div>" * 800 + "x" + "</div>" * 800,
+        "x",
     ),
     (
         "a pipe inside a cell is escaped",
@@ -1152,6 +1262,31 @@ def selftest():
         except Exception as error:  # pragma: no cover - the point of the test
             failed += 1
             sys.stdout.write("FAIL  survives: %s -> %r\n" % (label, error))
+
+    # The built-in path is bounded the way the pandoc path is bounded by its
+    # 20 s timeout: past the input cap it says so instead of grinding.
+    def raises_too_large(source, limit):
+        try:
+            convert(source, None, max_input=limit)
+        except InputTooLarge:
+            return "InputTooLarge"
+        return "no error"
+
+    check(
+        "oversized input is a clear error, not unbounded work",
+        "InputTooLarge",
+        raises_too_large("<p>hello</p>", 4),
+    )
+    check(
+        "input at the limit still converts",
+        "hello",
+        convert("<p>hello</p>", None, max_input=len("<p>hello</p>")).rstrip("\n"),
+    )
+    check(
+        "the built-in converter caps input at 2 MiB by default",
+        "InputTooLarge",
+        raises_too_large("<p>" + "a" * BUILTIN_MAX_INPUT, None),
+    )
 
     if shutil.which("pandoc"):
         out = pandoc_convert("<h1>Title</h1><p><a href='/a'>x</a></p>")

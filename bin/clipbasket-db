@@ -62,13 +62,31 @@ cleanup() {
 		rm -f "${TMPFILES[@]}"
 	fi
 }
-trap cleanup EXIT
 
+# EXIT on its own is not enough: a signal with no handler kills bash outright
+# and the EXIT trap never runs, so an interrupted `copy` or `insert` leaves the
+# clipboard payload sitting in $TMPDIR. Each handler cleans up, disarms itself
+# and re-raises, so the exit status still reports the signal.
+on_signal() {
+	cleanup
+	trap - "$1" EXIT
+	kill -s "$1" "$$"
+}
+trap cleanup EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP' HUP
+
+# Creates a temp file, records it for cleanup, and leaves the path in
+# REPLY_TMPFILE. Deliberately not a `$(mktempfile)` helper: a command
+# substitution runs in a subshell, so the array it appended to went out of
+# scope with the subshell and cleanup had nothing left to remove -- every run
+# leaked its clipboard payload into $TMPDIR. It also saves a fork per call.
+REPLY_TMPFILE=''
 mktempfile() {
-	local path
-	path=$(mktemp "${TMPDIR:-/tmp}/clipbasket.XXXXXX")
-	TMPFILES+=("$path")
-	printf '%s' "$path"
+	REPLY_TMPFILE=$(mktemp "${TMPDIR:-/tmp}/clipbasket.XXXXXX") ||
+		die "could not create a temp file in ${TMPDIR:-/tmp}"
+	TMPFILES[${#TMPFILES[@]}]="$REPLY_TMPFILE"
 }
 
 json_string() {
@@ -91,6 +109,61 @@ require_id() {
 	case "${1:-}" in
 	'' | *[!0-9]*) die "expected a numeric clip id, got: ${1:-<missing>}" ;;
 	esac
+}
+
+# Same as require_id, plus a length cap: --limit and --max reach bash
+# arithmetic, and `[ 99999999999999999999 -gt 0 ]` is a shell error message on
+# stderr rather than the JSON error the caller is parsing.
+require_count() {
+	case "${1:-}" in
+	'' | *[!0-9]*) die "expected a non-negative number, got: ${1:-<missing>}" ;;
+	esac
+	[ "${#1}" -le 9 ] || die "number out of range: $1"
+}
+
+# One pass over the byte alphabet, reused by everything that has to move raw
+# bytes through the shell: BYTE_CHAR turns hex back into bytes, URI_ENCODE
+# turns a byte into its RFC 3986 form (unreserved set plus '/', which stays a
+# path separator). Built lazily -- `list` never needs it.
+BYTE_CHAR=()
+URI_ENCODE=()
+build_byte_tables() {
+	[ "${#BYTE_CHAR[@]}" -eq 256 ] && return 0
+	local i oct char
+	for ((i = 0; i < 256; i++)); do
+		printf -v oct '%03o' "$i"
+		printf -v char '%b' "\\0$oct"
+		BYTE_CHAR[i]="$char"
+		if ((i == 45 || i == 46 || i == 47 || i == 95 || i == 126 ||
+			(i >= 48 && i <= 57) || (i >= 65 && i <= 90) || (i >= 97 && i <= 122))); then
+			URI_ENCODE[i]="$char"
+		else
+			printf -v char '%%%02X' "$i"
+			URI_ENCODE[i]="$char"
+		fi
+	done
+}
+
+# $1 uppercase hex of a UTF-8 string -> the string itself, in REPLY_SQL.
+hex_decode() {
+	local hex="$1" out=''
+	build_byte_tables
+	while [ -n "$hex" ]; do
+		out+="${BYTE_CHAR[$((16#${hex:0:2}))]}"
+		hex=${hex:2}
+	done
+	REPLY_SQL="$out"
+}
+
+# $1 uppercase hex of a UTF-8 path -> its percent-encoded form, in REPLY_SQL.
+hex_to_uri_path() {
+	local hex="$1" out=''
+	build_byte_tables
+	while [ -n "$hex" ]; do
+		out+="${URI_ENCODE[$((16#${hex:0:2}))]}"
+		hex=${hex:2}
+	done
+	REPLY_SQL="$out"
 }
 
 # ---------------------------------------------------------------------------
@@ -288,6 +361,28 @@ drop_fts_triggers() {
 	SQL
 }
 
+# Re-runs the FTS5 probe and rewrites the cached answer. `no FTS5` is only ever
+# true of the sqlite3 that answered it, so an upgraded (or newly built) sqlite3
+# has to be able to turn search back on without the user deleting state by hand.
+probe_fts() {
+	if fts_schema | run_raw >/dev/null 2>&1; then
+		FTS_ENABLED=1
+	else
+		FTS_ENABLED=0
+		drop_fts_triggers >/dev/null 2>&1 || true
+	fi
+	printf '%s\n' "$FTS_ENABLED" >"$STATE_DIR/.fts" 2>/dev/null || true
+}
+
+# True when the cached "no FTS5" answer is still trustworthy: the sqlite3 that
+# produced it has not been replaced since.
+fts_answer_is_current() {
+	local bin
+	bin=$(command -v "$SQLITE_BIN" 2>/dev/null) || return 1
+	[ -n "$bin" ] || return 1
+	[ ! "$bin" -nt "$STATE_DIR/.fts" ]
+}
+
 ensure_schema() {
 	local stamp="$STATE_DIR/.schema-v$SCHEMA_VERSION"
 
@@ -301,6 +396,13 @@ ensure_schema() {
 			read -r FTS_ENABLED <"$STATE_DIR/.fts" || FTS_ENABLED=0
 		fi
 		[ "$FTS_ENABLED" = "1" ] || FTS_ENABLED=0
+		# A cached yes is final. A cached no is re-probed once the sqlite3
+		# binary is newer than the answer -- the fast path stays fork-free for
+		# everyone whose sqlite3 has FTS5, which is everyone on Arch.
+		if [ "$FTS_ENABLED" = "1" ] || fts_answer_is_current; then
+			return 0
+		fi
+		probe_fts
 		return 0
 	fi
 
@@ -310,14 +412,7 @@ ensure_schema() {
 	migrate_schema
 	base_schema | run_raw >/dev/null || die "could not open or create $DB_PATH"
 
-	if fts_schema | run_raw >/dev/null 2>&1; then
-		FTS_ENABLED=1
-	else
-		FTS_ENABLED=0
-		drop_fts_triggers >/dev/null 2>&1 || true
-	fi
-
-	printf '%s\n' "$FTS_ENABLED" >"$STATE_DIR/.fts"
+	probe_fts
 	# The stamp is per-version, so an upgraded binary always takes the slow
 	# path once and runs its migrations. Older stamps are dead weight.
 	rm -f -- "$STATE_DIR"/.schema-v*
@@ -352,8 +447,14 @@ fts_query_for() {
 	# shellcheck disable=SC2086
 	set -- $cleaned
 	set +f
+	# Every token is quoted, always. fts5 reads a bare AND/OR/NOT/NEAR as an
+	# operator, so searching for "NOT NULL" used to be a syntax error, which
+	# dropped the whole query to the LIKE path -- where the *tokenised* term no
+	# longer matched anything and the user saw an empty list. A quoted token is
+	# a string in every case; the tokens are alphanumeric by construction, so
+	# there is nothing inside them to escape.
 	for token in "$@"; do
-		out="${out:+$out AND }${token}*"
+		out="${out:+$out AND }\"${token}\"*"
 	done
 	REPLY_SQL="$out"
 }
@@ -424,12 +525,12 @@ cmd_list() {
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--limit)
-			require_id "${2:-}"
+			require_count "${2:-}"
 			limit="$2"
 			shift 2
 			;;
 		--offset)
-			require_id "${2:-}"
+			require_count "${2:-}"
 			offset="$2"
 			shift 2
 			;;
@@ -515,10 +616,41 @@ cmd_count() {
 	                            'filtered', (SELECT count(*) $REPLY_SQL));"
 }
 
+# Rewrites $1 in place with every byte that is not valid UTF-8 removed.
+# SQLite stores whatever bytes it is given, json_object() hands them straight
+# back out, and QML's JSON.parse then rejects the *whole* page -- one clip
+# copied out of a latin-1 terminal used to blank the entire history.
+scrub_utf8() {
+	local clean
+	mktempfile
+	clean="$REPLY_TMPFILE"
+	# glibc's iconv exits 1 when -c dropped anything -- which is precisely the
+	# case this exists for -- so its status cannot gate the result. (macOS
+	# iconv exits 0 there, which is how a status-gated version passed its own
+	# test on a Mac and stripped every accented letter on Arch.) Trust the
+	# output whenever iconv ran at all and produced something from a non-empty
+	# input; fall back only when it is absent or failed outright.
+	if command -v iconv >/dev/null 2>&1; then
+		iconv -c -f UTF-8 -t UTF-8 <"$1" >"$clean" 2>/dev/null || true
+		if [ -s "$clean" ]; then
+			cat -- "$clean" >"$1"
+			return 0
+		fi
+	fi
+	# No iconv (a busybox or otherwise minimal userland): drop every byte
+	# outside ASCII rather than let an invalid sequence through. Lossy, but a
+	# readable clip beats an unparseable page.
+	LC_ALL=C tr -d '\200-\377' <"$1" >"$clean"
+	cat -- "$clean" >"$1"
+}
+
 cmd_insert() {
 	local payload sql out
-	payload=$(mktempfile)
+	mktempfile
+	payload="$REPLY_TMPFILE"
 	cat >"$payload"
+	[ -s "$payload" ] || die "insert: empty payload on stdin"
+	scrub_utf8 "$payload"
 	[ -s "$payload" ] || die "insert: empty payload on stdin"
 	sql_quote "$payload"
 
@@ -537,7 +669,16 @@ cmd_insert() {
 			           ELSE collapsed END, ''),
 			    CASE kind WHEN 'image' THEN 'Image' WHEN 'files' THEN 'Files' ELSE '' END
 			  ) AS preview,
-			  COALESCE(NULLIF(hash_in, ''), kind || char(10) || COALESCE(text, preview_in, '')) AS hash,
+			  -- Single line, always. The copy subcommand writes this hash to the
+			  -- suppression file and the watcher reads it back, so a char(10)
+			  -- in the fallback hash used to hand the watcher a truncated token
+			  -- and self-capture suppression silently stopped working. char(31)
+			  -- (unit separator) keeps the same shape without the newline.
+			  COALESCE(
+			    NULLIF(hash_in, ''),
+			    kind || char(31) || replace(replace(
+			      COALESCE(text, preview_in, ''), char(10), char(31)), char(13), char(31))
+			  ) AS hash,
 			  source_app,
 			  created_at,
 			  image_path,
@@ -656,41 +797,62 @@ cmd_flag() {
 # Collects the on-disk assets a doomed set of rows owns, deletes the rows, then
 # unlinks any asset no surviving row still references. Order matters: reading
 # after the DELETE would find nothing.
+#
+# The row count lands in REPLY_DELETED rather than on stdout: a `$(delete_where
+# ...)` caller would run the whole thing in a subshell, where the temp file it
+# registers for cleanup dies with the subshell and is never unlinked.
+REPLY_DELETED=0
 delete_where() {
-	local predicate="$1" doomed count asset still
-	doomed=$(mktempfile)
+	local predicate="$1" doomed out count hexline asset q_doomed
+	mktempfile
+	doomed="$REPLY_TMPFILE"
+	sql_quote "$doomed"
+	q_doomed="$REPLY_QUOTED"
 
-	run_sql "SELECT image_path FROM clips WHERE ($predicate) AND image_path IS NOT NULL
-	         UNION
-	         SELECT thumb_path FROM clips WHERE ($predicate) AND thumb_path IS NOT NULL;" \
-		>"$doomed" || die "delete failed"
-
-	count=$(run_sql "DELETE FROM clips WHERE $predicate;
-	                 SELECT changes();") || die "delete failed"
+	# One sqlite3, not one per asset. The old shape asked "is anything else
+	# still pointing at this file?" in its own process for every doomed row,
+	# which is ~13 s to clear a thousand image clips; EXCEPT answers the same
+	# question for the whole set in a single statement, after the DELETE.
+	#
+	# The survivors come back hex-encoded, one per line, because a path is
+	# allowed to contain a newline and a line-delimited list would silently
+	# never unlink it. hex() output is [0-9A-F] and nothing else.
+	out=$(run_sql "
+	  CREATE TEMP TABLE doomed AS
+	    SELECT image_path AS path FROM clips WHERE ($predicate) AND image_path IS NOT NULL
+	    UNION
+	    SELECT thumb_path FROM clips WHERE ($predicate) AND thumb_path IS NOT NULL;
+	  DELETE FROM clips WHERE $predicate;
+	  SELECT changes();
+	  SELECT writefile($q_doomed, COALESCE((
+	    SELECT group_concat(hex(path), char(10)) FROM (
+	      SELECT path FROM doomed
+	      EXCEPT SELECT image_path FROM clips WHERE image_path IS NOT NULL
+	      EXCEPT SELECT thumb_path FROM clips WHERE thumb_path IS NOT NULL)), ''));
+	  ") || die "delete failed"
+	# changes() is printed first; writefile()'s byte count follows it.
+	count=${out%%$'\n'*}
 
 	if [ -s "$doomed" ]; then
-		while IFS= read -r asset; do
-			[ -n "$asset" ] || continue
+		while IFS= read -r hexline || [ -n "$hexline" ]; do
+			[ -n "$hexline" ] || continue
+			hex_decode "$hexline"
+			asset="$REPLY_SQL"
 			# Only ever unlink inside our own asset directories, so a
 			# hand-edited or imported row can never point the cleanup at
 			# something the user cares about.
 			case "$asset" in
-			"$IMAGE_DIR"/* | "$THUMB_DIR"/*) ;;
-			*) continue ;;
+			"$IMAGE_DIR"/* | "$THUMB_DIR"/*) rm -f -- "$asset" ;;
 			esac
-			sql_quote "$asset"
-			still=$(run_sql "SELECT count(*) FROM clips
-			                 WHERE image_path = $REPLY_QUOTED OR thumb_path = $REPLY_QUOTED;") || still=1
-			[ "$still" = "0" ] && rm -f -- "$asset"
 		done <"$doomed"
 	fi
 
-	printf '%s' "${count:-0}"
+	REPLY_DELETED="${count:-0}"
 }
 
 cmd_delete() {
 	require_id "${1:-}"
-	delete_where "id = $1" >/dev/null
+	delete_where "id = $1"
 	printf '{"ok":true}\n'
 }
 
@@ -699,7 +861,8 @@ cmd_clear() {
 	if [ "${1:-}" = "--all" ]; then
 		predicate='1'
 	fi
-	deleted=$(delete_where "$predicate")
+	delete_where "$predicate"
+	deleted="$REPLY_DELETED"
 	printf '{"ok":true,"deleted":%s}\n' "$deleted"
 }
 
@@ -708,7 +871,7 @@ cmd_prune() {
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--max)
-			require_id "${2:-}"
+			require_count "${2:-}"
 			max="$2"
 			shift 2
 			;;
@@ -720,11 +883,12 @@ cmd_prune() {
 	# Pinned and saved clips are exempt from the rolling cap and do not count
 	# against it, so "keep 200" means 200 unpinned/unsaved clips plus however
 	# many the user explicitly kept.
-	deleted=$(delete_where "id IN (
+	delete_where "id IN (
 	    SELECT id FROM clips WHERE pinned = 0 AND saved = 0
 	    ORDER BY created_at DESC, id DESC
 	    LIMIT -1 OFFSET $max
-	  )")
+	  )"
+	deleted="$REPLY_DELETED"
 	printf '{"deleted":%s}\n' "$deleted"
 }
 
@@ -766,9 +930,12 @@ cmd_copy() {
 	kind=$(run_sql "SELECT kind FROM clips WHERE id = $1;") || die "copy failed"
 	[ -n "$kind" ] || die "no clip with id $1"
 
-	hash_file=$(mktempfile)
-	path_file=$(mktempfile)
-	mime_file=$(mktempfile)
+	mktempfile
+	hash_file="$REPLY_TMPFILE"
+	mktempfile
+	path_file="$REPLY_TMPFILE"
+	mktempfile
+	mime_file="$REPLY_TMPFILE"
 	sql_quote "$hash_file"
 	q_hash="$REPLY_QUOTED"
 	sql_quote "$path_file"
@@ -780,14 +947,22 @@ cmd_copy() {
 	                writefile($q_path, COALESCE(image_path, '')),
 	                writefile($q_mime, COALESCE(mime, ''))
 	         FROM clips WHERE id = $1;" >/dev/null || die "copy failed"
-	IFS= read -r hash <"$hash_file" || true
-	IFS= read -r image_path <"$path_file" || true
-	IFS= read -r mime <"$mime_file" || true
+	# Read to EOF, not to the first newline: the fallback hash is single-line by
+	# construction now, but a hand-written row's is whatever somebody put there,
+	# and a token truncated at a newline silently disarms self-capture
+	# suppression -- the clip comes straight back in as a brand new one.
+	IFS= read -r -d '' hash <"$hash_file" || true
+	IFS= read -r -d '' image_path <"$path_file" || true
+	IFS= read -r -d '' mime <"$mime_file" || true
+	hash=${hash%$'\n'}
+	image_path=${image_path%$'\n'}
+	mime=${mime%$'\n'}
 
 	mkdir -p "$STATE_DIR"
 	printf '%s\n' "$hash" >"$SUPPRESS_FILE"
 
-	payload=$(mktempfile)
+	mktempfile
+	payload="$REPLY_TMPFILE"
 	sql_quote "$payload"
 	q_payload="$REPLY_QUOTED"
 
@@ -797,11 +972,25 @@ cmd_copy() {
 		"$WL_COPY_BIN" --type "${mime:-image/png}" <"$image_path" || die "wl-copy failed"
 		;;
 	files)
-		run_sql "SELECT writefile($q_payload, COALESCE((
-		           SELECT group_concat('file://' || json_extract(value, '\$.path'), char(10))
-		           FROM clips, json_each(clips.files_json) WHERE clips.id = $1), ''));" \
-			>/dev/null || die "copy failed"
-		[ -s "$payload" ] || die "clip $1 has no file paths"
+		# A text/uri-list carries URIs, not paths: a space or a '%' in a file
+		# name has to be percent-encoded on the way out or the receiving app
+		# gets a different path back -- and clipbasket-capture, which decodes
+		# what it is handed, hashes a re-copied list to something that no
+		# longer matches the clip it came from. hex() keeps the paths intact
+		# across the shell (a path may contain a newline); the encoder maps
+		# each byte to the RFC 3986 unreserved set, leaving '/' alone.
+		local hexes hexline uris=''
+		hexes=$(run_sql "SELECT hex(json_extract(value, '\$.path'))
+		                 FROM clips, json_each(clips.files_json)
+		                 WHERE clips.id = $1;") || die "copy failed"
+		while IFS= read -r hexline || [ -n "$hexline" ]; do
+			[ -n "$hexline" ] || continue
+			hex_to_uri_path "$hexline"
+			uris="${uris}file://${REPLY_SQL}"$'\n'
+		done <<<"$hexes"
+		uris=${uris%$'\n'}
+		[ -n "$uris" ] || die "clip $1 has no file paths"
+		printf '%s' "$uris" >"$payload"
 		"$WL_COPY_BIN" --type text/uri-list <"$payload" || die "wl-copy failed"
 		;;
 	*)
@@ -840,7 +1029,8 @@ cmd_markdown() {
 	[ -n "$has" ] || die "no clip with id $id"
 	[ "$has" = "1" ] || die "clip $id has no HTML flavour to convert"
 
-	html_file=$(mktempfile)
+	mktempfile
+	html_file="$REPLY_TMPFILE"
 	sql_quote "$html_file"
 	q_html="$REPLY_QUOTED"
 	run_sql "SELECT writefile($q_html, html) FROM clips WHERE id = $id;" >/dev/null ||
@@ -856,7 +1046,8 @@ cmd_markdown() {
 		                FROM clips WHERE id = $id;") || base=''
 	fi
 
-	md_file=$(mktempfile)
+	mktempfile
+	md_file="$REPLY_TMPFILE"
 	if [ -n "$base" ]; then
 		"$HTML2MD" --base-url "$base" <"$html_file" >"$md_file" || die "markdown conversion failed"
 	else
@@ -873,6 +1064,10 @@ cmd_markdown() {
 
 cmd_info() {
 	local total fts
+	# `info` is the diagnostic, so it never reports a stale "no FTS5": it pays
+	# for a fresh probe rather than repeating a cached answer that a sqlite3
+	# upgrade may already have made wrong.
+	[ "$FTS_ENABLED" = "1" ] || probe_fts
 	total=$(run_sql "SELECT count(*) FROM clips;") || total=0
 	if [ "$FTS_ENABLED" = "1" ]; then fts=true; else fts=false; fi
 	printf '{"app":%s,"db":%s,"state_dir":%s,"schema_version":%s,"fts5":%s,"clips":%s,"sqlite":%s}\n' \
@@ -891,7 +1086,13 @@ cmd_selftest() {
 	# Deliberately not `local`: the EXIT trap runs after this function's scope
 	# is gone and still has to find the directory it must remove.
 	SELFTEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/clipbasket-selftest.XXXXXX")
-	trap 'rm -rf "${SELFTEST_ROOT:-}"; cleanup' EXIT
+	selftest_cleanup() {
+		rm -rf "${SELFTEST_ROOT:-}"
+		cleanup
+	}
+	trap selftest_cleanup EXIT
+	trap 'selftest_cleanup; trap - INT; kill -s INT $$' INT
+	trap 'selftest_cleanup; trap - TERM; kill -s TERM $$' TERM
 
 	STATE_DIR="$SELFTEST_ROOT"
 	DB_PATH="$SELFTEST_ROOT/clips.db"
@@ -1139,7 +1340,8 @@ tab	here"
 	check 'count honours --filter' '{"total":4,"filtered":1}' "$out"
 
 	# --- huge payload -----------------------------------------------------
-	big=$(mktempfile)
+	mktempfile
+	big="$REPLY_TMPFILE"
 	{
 		printf '{"kind":"text","hash":"h-big","preview":"big","text":"'
 		awk 'BEGIN { for (i = 0; i < 60000; i++) printf "abcdefghij" }'
@@ -1203,7 +1405,8 @@ tab	here"
 
 	# --- the html flavour and the markdown pipeline -----------------------
 	local html_payload id_html
-	html_payload=$(mktempfile)
+	mktempfile
+	html_payload="$REPLY_TMPFILE"
 	cat >"$html_payload" <<-'JSON'
 		{"kind":"text","preview":"Heading","hash":"h-html",
 		 "text":"Heading\none\nlink",
@@ -1305,9 +1508,165 @@ file:///tmp/b.txt' "$(cat "$stdin_file")"
 	out=$(cmd_copy 999999 2>/dev/null) || true
 	check_contains 'copy on a missing id is a JSON error' '"error"' "$out"
 
+	# A text/uri-list carries URIs. An unencoded space or '%' reaches the
+	# receiving app as a different path, and the watcher's decode of it hashes
+	# to something the clip it came from no longer matches.
+	printf '{"kind":"files","preview":"a b.txt","hash":"h-copy-enc","files":[{"path":"/tmp/a b.txt","name":"a b.txt"},{"path":"/tmp/100%%.txt","name":"100%%.txt"},{"path":"/tmp/caf\\u00e9.txt","name":"caf\\u00e9.txt"}]}\n' |
+		cmd_insert >/dev/null
+	cmd_copy "$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-enc';")" >/dev/null
+	check 'copy percent-encodes spaces, percents and UTF-8 in file URIs' \
+		'file:///tmp/a%20b.txt
+file:///tmp/100%25.txt
+file:///tmp/caf%C3%A9.txt' "$(cat "$stdin_file")"
+
+	# The fallback hash used to contain a newline, which truncated the token
+	# `copy` writes for self-capture suppression -- the clip came straight back
+	# in as a brand new one.
+	local id_nl hash_probe="$SELFTEST_ROOT/hash.probe"
+	printf '{"kind":"text","preview":"two lines","text":"line one\\nline two"}\n' |
+		cmd_insert >/dev/null
+	id_nl=$(run_sql "SELECT id FROM clips WHERE preview = 'two lines';")
+	check 'a generated hash never contains a newline' '0' \
+		"$(run_sql "SELECT instr(hash, char(10)) FROM clips WHERE id = $id_nl;")"
+	cmd_copy "$id_nl" >/dev/null
+	sql_quote "$hash_probe"
+	run_sql "SELECT writefile($REPLY_QUOTED, hash) FROM clips WHERE id = $id_nl;" >/dev/null
+	check 'the suppression token is the clip hash in full' \
+		"$(cat "$hash_probe")" "$(cat "$SUPPRESS_FILE")"
+
 	run_sql "DELETE FROM clips WHERE hash LIKE 'h-copy-%' OR hash LIKE 'h-html%';" >/dev/null
 	rm -f -- "$IMAGE_DIR/h-copy-img.png"
 	WL_COPY_BIN="$keep_copy"
+
+	# --- asset cleanup ----------------------------------------------------
+	# Orphans only: the still-referenced set is now computed in one statement
+	# rather than one sqlite3 per asset, and the answer has to stay the same.
+	local shared="$IMAGE_DIR/shared.png"
+	: >"$shared"
+	printf '{"kind":"image","preview":"Image","hash":"h-share-a","image_path":"%s"}\n' "$shared" |
+		cmd_insert >/dev/null
+	printf '{"kind":"image","preview":"Image","hash":"h-share-b","image_path":"%s"}\n' "$shared" |
+		cmd_insert >/dev/null
+	cmd_delete "$(run_sql "SELECT id FROM clips WHERE hash = 'h-share-a';")" >/dev/null
+	check 'an asset another clip still references survives the delete' 'present' \
+		"$([ -e "$shared" ] && printf present || printf gone)"
+	cmd_delete "$(run_sql "SELECT id FROM clips WHERE hash = 'h-share-b';")" >/dev/null
+	check 'the last reference gone, the asset is unlinked' 'gone' \
+		"$([ -e "$shared" ] && printf present || printf gone)"
+
+	# A path may contain a newline; the line-delimited doomed list never
+	# unlinked one, so the file stayed on disk forever.
+	local nl_asset="$IMAGE_DIR/two"$'\n'"lines.png"
+	: >"$nl_asset"
+	printf '{"kind":"image","preview":"Image","hash":"h-nl-asset","image_path":"%s/two\\nlines.png"}\n' \
+		"$IMAGE_DIR" | cmd_insert >/dev/null
+	cmd_delete "$(run_sql "SELECT id FROM clips WHERE hash = 'h-nl-asset';")" >/dev/null
+	check 'delete unlinks an asset whose path contains a newline' 'gone' \
+		"$([ -e "$nl_asset" ] && printf present || printf gone)"
+
+	# --- fts5 query syntax ------------------------------------------------
+	# fts5 reads a bare AND/OR/NOT as an operator: an unquoted token turned
+	# these into a syntax error, which dropped to the LIKE path -- where the
+	# already-tokenised term matched nothing at all.
+	printf '{"kind":"text","preview":"NOT NULL","text":"alter table t add column x NOT NULL","hash":"h-fts-not"}\n' |
+		cmd_insert >/dev/null
+	printf '{"kind":"text","preview":"a AND b","text":"alpha AND beta together","hash":"h-fts-and"}\n' |
+		cmd_insert >/dev/null
+	out=$(cmd_list --limit 50 --query 'NOT NULL')
+	check_contains 'a query containing NOT finds its clip' '"hash":"h-fts-not"' "$out"
+	out=$(cmd_list --limit 50 --query 'alpha AND beta')
+	check_contains 'a query containing AND finds its clip' '"hash":"h-fts-and"' "$out"
+	out=$(cmd_count --query 'NOT')
+	check_contains 'count honours a query that is one fts5 operator' '"filtered":1' "$out"
+
+	# --- invalid UTF-8 ----------------------------------------------------
+	# Invalid bytes used to reach the database and then the JSON, where QML's
+	# JSON.parse rejects the whole page rather than the one bad clip.
+	local dirty utf8_expected='café  tail'
+	command -v iconv >/dev/null 2>&1 || utf8_expected='caf  tail'
+	mktempfile
+	dirty="$REPLY_TMPFILE"
+	printf '{"kind":"text","hash":"h-utf8","preview":"utf8","text":"caf\xc3\xa9 \xff tail"}\n' >"$dirty"
+	cmd_insert <"$dirty" >/dev/null
+	check 'insert drops invalid UTF-8 and keeps the valid bytes' "$utf8_expected" \
+		"$(run_sql "SELECT text FROM clips WHERE hash = 'h-utf8';")"
+	out=$(cmd_list --limit 50 --query 'tail')
+	check 'the listing that carries it is valid UTF-8' 'valid' \
+		"$(printf '%s' "$out" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 && printf valid || printf invalid)"
+
+	# --- numeric arguments ------------------------------------------------
+	# --limit reaches bash arithmetic, where an over-long number is a shell
+	# error on stderr instead of the JSON document the caller is parsing.
+	out=$(cmd_list --limit 99999999999999999999 2>/dev/null) || true
+	check_contains 'an out-of-range --limit is a JSON error' '"error"' "$out"
+	out=$(cmd_prune --max 99999999999999999999 2>/dev/null) || true
+	check_contains 'an out-of-range --max is a JSON error' '"error"' "$out"
+	out=$(cmd_list --offset 99999999999999999999 2>/dev/null) || true
+	check_contains 'an out-of-range --offset is a JSON error' '"error"' "$out"
+
+	# --- the cached FTS5 answer -------------------------------------------
+	if [ "$FTS_ENABLED" = "1" ]; then
+		local keep_fts_flag="$FTS_ENABLED"
+		printf '0\n' >"$STATE_DIR/.fts"
+		touch -t 197001020000 "$STATE_DIR/.fts"
+		FTS_ENABLED=0
+		ensure_schema
+		check 'a stale "no FTS5" answer is re-probed after a sqlite3 upgrade' '1' "$FTS_ENABLED"
+		printf '0\n' >"$STATE_DIR/.fts"
+		FTS_ENABLED=0
+		ensure_schema
+		check 'a "no FTS5" answer newer than sqlite3 is trusted as it stands' '0' "$FTS_ENABLED"
+		out=$(cmd_info)
+		check_contains 'info re-probes rather than repeat a cached no' '"fts5":true' "$out"
+		FTS_ENABLED="$keep_fts_flag"
+		printf '%s\n' "$FTS_ENABLED" >"$STATE_DIR/.fts"
+	fi
+
+	# --- signals ----------------------------------------------------------
+	# EXIT alone is not enough: a signal with no handler kills bash outright
+	# and the EXIT trap never runs, so an interrupted run used to leave the
+	# clipboard payload sitting in $TMPDIR for anyone to read.
+	local sigdir="$SELFTEST_ROOT/signal" sigpid tries=0
+	mkdir -p "$sigdir"
+	mkfifo "$sigdir/fifo"
+	# Opened read-write so neither end of the fifo blocks on open.
+	exec 8<>"$sigdir/fifo"
+	# 8>&- so the child does not inherit the parent's write end and hold the
+	# fifo open against itself.
+	TMPDIR="$sigdir" CLIPBASKET_STATE_DIR="$SELFTEST_ROOT" CLIPBASKET_DB="$DB_PATH" \
+		"$SCRIPT_DIR/clipbasket-db" insert <"$sigdir/fifo" 8>&- >/dev/null 2>&1 &
+	sigpid=$!
+	while [ "$tries" -lt 400 ]; do
+		set -- "$sigdir"/clipbasket.*
+		[ -f "$1" ] && break
+		tries=$((tries + 1))
+		sleep 0.01
+	done
+	kill -TERM "$sigpid" 2>/dev/null || true
+	exec 8>&-
+	tries=0
+	while kill -0 "$sigpid" 2>/dev/null && [ "$tries" -lt 400 ]; do
+		tries=$((tries + 1))
+		sleep 0.01
+	done
+	kill -KILL "$sigpid" 2>/dev/null || true
+	wait "$sigpid" 2>/dev/null || true
+	set -- "$sigdir"/clipbasket.*
+	check 'a signalled run leaves no clipboard payload behind' 'clean' \
+		"$([ -f "$1" ] && printf 'left behind: %s' "$1" || printf clean)"
+
+	# And the other half of the same bug: mktempfile registered its file inside
+	# a command substitution, so the array cleanup reads was always empty and
+	# even an ordinary run left the payload in $TMPDIR.
+	rm -f -- "$sigdir"/clipbasket.*
+	printf '{"kind":"text","text":"leak check","hash":"h-leak"}\n' |
+		TMPDIR="$sigdir" CLIPBASKET_STATE_DIR="$SELFTEST_ROOT" CLIPBASKET_DB="$DB_PATH" \
+			"$SCRIPT_DIR/clipbasket-db" insert >/dev/null 2>&1 || true
+	set -- "$sigdir"/clipbasket.*
+	check 'a normal run leaves no clipboard payload behind' 'clean' \
+		"$([ -f "$1" ] && printf 'left behind: %s' "$1" || printf clean)"
+
+	run_sql "DELETE FROM clips WHERE hash <> 'h-touch';" >/dev/null
 
 	# --- performance ------------------------------------------------------
 	printf '\nPopulating 10000 clips to check latency...\n'

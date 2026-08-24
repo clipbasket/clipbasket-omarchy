@@ -166,12 +166,107 @@ overwritten, not coalesced: the dedupe hash covers the plain text only, so a
 re-copy of the same words from a source that offers no markup must clear the
 stale flavour rather than keep it attached to different provenance.
 
+`insert` scrubs invalid UTF-8 out of the payload before any of it reaches
+SQLite (`iconv -c -f UTF-8 -t UTF-8`, or an `LC_ALL=C` byte filter when iconv is
+missing). SQLite stores whatever bytes it is handed and `json_object()` hands
+them straight back, so one clip copied out of a latin-1 terminal would otherwise
+make `JSON.parse` reject the entire page in the panel.
+
+When no `hash` is supplied the fallback is `kind || char(31) || text`, with any
+newline or carriage return in the text replaced by `char(31)` as well. It is
+deliberately single-line: `copy` writes the hash to the suppression file and
+the watcher reads it back, and a token truncated at a newline silently disarms
+self-capture suppression.
+
+### Search
+
+A search term is split on non-alphanumerics and every token becomes a *quoted*
+prefix term: `a AND b` becomes `"a"* AND "and"* AND "b"*`. The quoting is not
+optional — fts5 reads a bare `AND`, `OR`, `NOT` or `NEAR` as an operator, so an
+unquoted token turned `NOT NULL` into a syntax error, which fell back to the
+LIKE path where the already-tokenised term matched nothing at all. When a term
+yields no tokens (punctuation only) the LIKE path is used directly.
+
+The FTS5 probe is cached in `$STATE_DIR/.fts`. A cached *yes* is final; a
+cached *no* is re-probed as soon as the `sqlite3` binary is newer than the
+cache file, and `info` always re-probes, so an upgraded sqlite3 turns search
+back on without the user deleting state by hand.
+
+### File URIs
+
+`copy` on a `files` clip emits one `file://` URI per line, each path
+percent-encoded to the RFC 3986 unreserved set (`A-Z a-z 0-9 - . _ ~`) with `/`
+left alone as the path separator. `/tmp/a b.txt` goes out as
+`file:///tmp/a%20b.txt` and `/tmp/100%.txt` as `file:///tmp/100%25.txt`.
+
+`clipbasket-capture` decodes the same way: a `%` followed by exactly two hex
+digits is one byte, and any other `%` is the literal character. That pairing is
+what makes a re-copied file list hash back to the clip it came from — an
+unencoded space or `%` reached the receiving app as a different path, and the
+watcher then recorded the echo as a brand new clip.
+
+Internally the decoded list is NUL-delimited, never newline-delimited: `%0A` is
+a legal escape and decodes to a newline inside a file name, which a
+line-delimited list splits into two bogus paths and miscounts. The same applies
+to `delete`'s doomed-asset list, which comes out of SQLite hex-encoded for the
+same reason.
+
 ### Others
 
 `pin`/`save` → `{"ok":true}` · `delete` → `{"ok":true}` ·
 `clear` → `{"ok":true,"deleted":N}` · `count` → `{"total":N,"filtered":N}` ·
 `prune --max N` → `{"deleted":N}` · `copy`/`touch`/`suppress` → `{"ok":true}` ·
 `info` → app name, paths, `schema_version`, `fts5`, clip count, sqlite version.
+
+---
+
+## Capture
+
+### `capture_files` status contract
+
+`clipbasket-capture` runs two `wl-paste --watch` processes over the same
+clipboard change, and only the offer's MIME list says which of them owns it.
+`capture_files` reports which case it is in:
+
+| status | meaning | caller |
+| --- | --- | --- |
+| `1` | not a local file list | fall through to the next kind |
+| `0` | recorded, or deliberately skipped | this change is ours; stop |
+| `2` | it *is* a file list and recording failed | this change is ours; stop |
+
+Only `1` falls through. A failed insert used to be indistinguishable from "not
+a file list", so the text watcher recorded the plain-text rendering of the same
+paths as a second clip — with the one-shot suppression token already spent by
+the file path that had just given up. Every capture path now consumes that
+token immediately before its insert, once it knows it is the recorder.
+
+When `wl-paste --list-types` returns nothing at all, the image watcher exits
+without recording: both watchers are handed the same bytes on stdin, and with
+no MIME list there is nothing that says those bytes are an image. The text
+watcher still records them as text.
+
+### Confidential offers
+
+Password managers mark an offer with an extra MIME type rather than an env var
+(`x-kde-passwordManagerHint`, and the `org.nspasteboard.*` markers on offers
+bridged from macOS). Every marker is matched case-insensitively.
+
+`CLIPBASKET_IGNORE_CONFIDENTIAL` defaults to `1`, which skips those offers. Set
+it to `0` to record them anyway; the service passes the user's setting through.
+
+### The pixel guard
+
+Before any thumbnail is generated, the image's dimensions are read from the
+header — `magick identify -ping -format '%w %h'` when ImageMagick is installed,
+otherwise the PNG IHDR at bytes 16–23. An image over
+`CLIPBASKET_MAX_IMAGE_DIMENSION` (16384, mirroring the desktop app's
+`CLIPBOARD_IMAGE_MAX_DIMENSION`) on either side is not recorded. The byte cap
+is not enough on its own: 64 MiB of PNG can still decode to a 100000×100000
+bitmap, and the thumbnailer is the step that would decode it.
+
+The image and its thumbnail are written under staging names and renamed into
+`images/` and `thumbs/` only once `record` has succeeded, so a failed insert
+cannot leave an asset that no row references and no cleanup would ever find.
 
 ---
 
@@ -286,8 +381,10 @@ lose content.
 ## Testing
 
 ```
-bin/clipbasket-db selftest        # 103 cases, incl. migration, has_html, markdown, copy
-bin/clipbasket-html2md --selftest # ~55 cases, one per supported element
+bin/clipbasket-db selftest        # 122 cases, incl. migration, has_html, markdown, copy
+bin/clipbasket-html2md --selftest # ~66 cases, one per supported element
+bin/clipbasket-capture --selftest #  37 cases, against stubbed wl-paste/wl-copy
+bin/clipbasket-omarchy selftest   #  25 cases, against a sandboxed bindings.lua
 ```
 
 `clipbasket-db selftest` runs entirely in a temp directory and never touches the
@@ -313,4 +410,7 @@ the image's **file bytes** on `--type image/png` rather than its preview string.
 | `CLIPBASKET_MAX_HTML_BYTES` | 8388608 |
 | `CLIPBASKET_MAX_IMAGE_BYTES` | 67108864 |
 | `CLIPBASKET_MAX_FILE_ITEMS` | 1024 |
+| `CLIPBASKET_MAX_IMAGE_DIMENSION` | 16384 |
 | `CLIPBASKET_MAX_CLIPS` | 1000 |
+| `CLIPBASKET_IGNORE_CONFIDENTIAL` | 1 (`0` records confidential offers) |
+| `CLIPBASKET_WL_PASTE` | `wl-paste` |
