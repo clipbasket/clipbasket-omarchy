@@ -115,6 +115,20 @@ safe_unlink() {
 	[ "$rc" -eq 0 ] || die "refusing to remove $1/$2 (clipbasket-safefile exit $rc)"
 }
 
+# Renames one asset to a new name inside the same verified directory. Returns 1
+# (not die) when the source is already gone, so a caller that renames an image
+# and its thumbnail can carry on if only one of them is present.
+safe_rename() {
+	# $1 dir, $2 old name, $3 new name
+	local rc=0
+	"$SAFEFILE" rename "$1" "$2" "$3" || rc=$?
+	case "$rc" in
+	0) return 0 ;;
+	2) return 1 ;;
+	*) die "refusing to rename $1/$2 (clipbasket-safefile exit $rc)" ;;
+	esac
+}
+
 safe_ensure_dir() {
 	# $1 path, $2 mode. Creates missing components with O_NOFOLLOW at each step.
 	local rc=0
@@ -1325,6 +1339,111 @@ cmd_ocr_pending() {
 	printf '%s\n' "${out:-[]}"
 }
 
+# rename-image <id> --slug <slug>
+#
+# Renames an image clip's stored file (and its thumbnail) from the opaque
+# content hash to a human-readable name derived from what the image shows, and
+# updates image_path/thumb_path to match so copy, the lightbox and asset GC all
+# follow. The name is `<slug>-<hash12>.<ext>`: the slug is readable, the 12 hex
+# of the content hash keep it unique and stable, so re-running is idempotent and
+# two different images that read the same words never collide. Renames go
+# through clipbasket-safefile (descriptor-bound), and only a file that is a
+# direct child of images/ (or thumbs/) is ever touched. A no-op, not an error,
+# when the clip is not an image, has no usable slug, or its file is elsewhere.
+cmd_rename_image() {
+	local id slug='' row hash image_path thumb_path kind
+	local img_base ext hash12 new_img_name new_thumb_name
+	local new_image_path new_thumb_path did=0 q_img q_thumb
+	require_id "${1:-}"
+	id="$1"
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--slug)
+			slug="${2:-}"
+			shift 2
+			;;
+		*) die "rename-image: unknown option $1" ;;
+		esac
+	done
+
+	# Fetched with separate queries rather than one delimited row: the sqlite3
+	# CLI renders a control character (char(31) and friends) in caret notation in
+	# its output, so no such byte survives to split on. kind and hash are a single
+	# safe token each; the paths are captured whole, one query apiece.
+	row=$(run_sql "SELECT COALESCE(kind,'')||' '||COALESCE(hash,'') FROM clips WHERE id = $id;") ||
+		die "rename-image failed"
+	read -r kind hash <<<"$row"
+	image_path=$(run_sql "SELECT COALESCE(image_path,'') FROM clips WHERE id = $id;") || die "rename-image failed"
+	thumb_path=$(run_sql "SELECT COALESCE(thumb_path,'') FROM clips WHERE id = $id;") || die "rename-image failed"
+
+	[ "$kind" = "image" ] && [ -n "$image_path" ] || {
+		printf '{"ok":true,"renamed":false}\n'
+		return 0
+	}
+	# Only rename a file that actually lives in images/.
+	case "$image_path" in "$IMAGE_DIR"/*) ;; *) printf '{"ok":true,"renamed":false}\n'; return 0 ;; esac
+	img_base=${image_path##*/}
+	case "$img_base" in */* | '' | . | ..) printf '{"ok":true,"renamed":false}\n'; return 0 ;; esac
+
+	# Defensive slug hygiene (the caller already slugifies): keep [a-z0-9-],
+	# collapse and trim separators, cap the length.
+	slug=$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' |
+		sed -E 's/-+/-/g; s/^-+//; s/-+$//')
+	slug=${slug:0:48}
+	slug=${slug%-}
+	[ -n "$slug" ] || { printf '{"ok":true,"renamed":false}\n'; return 0; }
+
+	ext=''
+	case "$img_base" in *.*) ext=${img_base##*.} ;; esac
+	hash12=$(printf '%s' "$hash" | tr -cd 'a-f0-9')
+	hash12=${hash12:0:12}
+	[ -n "$hash12" ] || hash12=$(printf '%s' "$id")
+	new_img_name="${slug}-${hash12}${ext:+.$ext}"
+	new_thumb_name="${slug}-${hash12}.png"
+
+	new_image_path="$IMAGE_DIR/$new_img_name"
+	if [ "$img_base" != "$new_img_name" ]; then
+		if safe_rename "$IMAGE_DIR" "$img_base" "$new_img_name"; then
+			did=1
+		else
+			# The image file is gone; leave the row pointing where it was rather
+			# than at a name that does not exist.
+			new_image_path="$image_path"
+		fi
+	fi
+
+	# Thumbnail: three shapes. When it is the original image itself (no separate
+	# thumb was made) it simply follows the image to its new path. When it is a
+	# real file under thumbs/, rename it too. Anything else is left untouched.
+	new_thumb_path="$thumb_path"
+	if [ -n "$thumb_path" ] && [ "$thumb_path" = "$image_path" ]; then
+		new_thumb_path="$new_image_path"
+	elif [ -n "$thumb_path" ]; then
+		case "$thumb_path" in
+		"$THUMB_DIR"/*)
+			local thumb_base=${thumb_path##*/}
+			if [ "$thumb_base" != "$new_thumb_name" ] &&
+				safe_rename "$THUMB_DIR" "$thumb_base" "$new_thumb_name"; then
+				new_thumb_path="$THUMB_DIR/$new_thumb_name"
+				did=1
+			elif [ "$thumb_base" = "$new_thumb_name" ]; then
+				new_thumb_path="$THUMB_DIR/$new_thumb_name"
+			fi
+			;;
+		esac
+	fi
+
+	sql_quote "$new_image_path"
+	q_img="$REPLY_QUOTED"
+	sql_quote "$new_thumb_path"
+	q_thumb="$REPLY_QUOTED"
+	run_sql "UPDATE clips SET image_path = $q_img, thumb_path = $q_thumb WHERE id = $id;" >/dev/null ||
+		die "rename-image failed"
+	printf '{"ok":true,"renamed":%s,"image_path":%s}\n' \
+		"$([ "$did" = 1 ] && printf true || printf false)" "$(json_string "$new_image_path")"
+}
+
 cmd_info() {
 	local total fts
 	# `info` is the diagnostic, so it never reports a stale "no FTS5": it pays
@@ -1697,6 +1816,39 @@ tab	here"
 		"$(run_sql "SELECT ocr_text FROM clips WHERE hash = 'h-ocr';")"
 	out=$(cmd_set_ocr 999999 2>/dev/null) || true
 	check_contains 'set-ocr on a missing id is a JSON error' '"error"' "$out"
+
+	# --- rename-image: name the file after what the image shows ------------
+	safe_ensure_dir "$IMAGE_DIR" 755
+	safe_ensure_dir "$THUMB_DIR" 755
+	local rn_hash="feed0011223344556677889900aabbccddeeff00112233445566778899aabbcc"
+	printf 'imgbytes' | safe_write "$IMAGE_DIR" "$rn_hash.png" 644 1048576
+	printf 'thumbbytes' | safe_write "$THUMB_DIR" "$rn_hash.png" 644 1048576
+	printf '{"kind":"image","hash":"%s","preview":"Image","image_path":"%s/%s.png","thumb_path":"%s/%s.png","mime":"image/png"}\n' \
+		"$rn_hash" "$IMAGE_DIR" "$rn_hash" "$THUMB_DIR" "$rn_hash" | cmd_insert >/dev/null
+	local rn_id
+	rn_id=$(run_sql "SELECT id FROM clips WHERE hash = '$rn_hash';")
+	out=$(cmd_rename_image "$rn_id" --slug 'Quarterly Report FINAL')
+	check_contains 'rename-image reports the readable new path' 'quarterly-report-final-feed00112233.png' "$out"
+	check 'the image file is renamed on disk' 'present' \
+		"$( [ -f "$IMAGE_DIR/quarterly-report-final-feed00112233.png" ] && echo present || echo absent )"
+	check 'the thumbnail is renamed too' 'present' \
+		"$( [ -f "$THUMB_DIR/quarterly-report-final-feed00112233.png" ] && echo present || echo absent )"
+	check 'the opaque hash name is gone' 'absent' \
+		"$( [ -e "$IMAGE_DIR/$rn_hash.png" ] && echo present || echo absent )"
+	out=$(cmd_get "$rn_id")
+	check_contains 'the row image_path follows the rename' 'quarterly-report-final-feed00112233.png' "$out"
+	out=$(cmd_rename_image "$rn_id" --slug 'quarterly report final')
+	check_contains 'rename-image is idempotent' '"renamed":false' "$out"
+	out=$(cmd_rename_image "$rn_id" --slug '!!!')
+	check_contains 'an empty slug leaves the name alone' '"renamed":false' "$out"
+	# delete cleans up the renamed assets, proving GC follows image_path.
+	cmd_delete "$rn_id" >/dev/null
+	check 'delete removes the renamed image asset' 'absent' \
+		"$( [ -e "$IMAGE_DIR/quarterly-report-final-feed00112233.png" ] && echo present || echo absent )"
+	check 'delete removes the renamed thumbnail' 'absent' \
+		"$( [ -e "$THUMB_DIR/quarterly-report-final-feed00112233.png" ] && echo present || echo absent )"
+	out=$(cmd_rename_image 999999 --slug 'x' 2>/dev/null) || true
+	check_contains 'rename-image on a non-image/missing id is a clean no-op' '"renamed":false' "$out"
 
 	# --- error handling ---------------------------------------------------
 	out=$(cmd_get abc 2>/dev/null) || true
@@ -2120,6 +2272,7 @@ usage() {
 		  suppress <hash>            (extension: arm self-capture suppression)
 		  set-ocr <id>               (store an image's recognised text; text on stdin)
 		  ocr-pending [--limit N]    (image clips still awaiting OCR)
+		  rename-image <id> --slug S (rename an image's file to a readable name)
 		  info
 		  selftest
 	TXT
@@ -2156,6 +2309,7 @@ main() {
 	suppress) cmd_suppress "$@" ;;
 	set-ocr) cmd_set_ocr "$@" ;;
 	ocr-pending) cmd_ocr_pending "$@" ;;
+	rename-image) cmd_rename_image "$@" ;;
 	info) cmd_info "$@" ;;
 	*) die "unknown subcommand: $subcommand" ;;
 	esac

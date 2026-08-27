@@ -114,6 +114,25 @@ recognise() {
 			END { if (started) printf "\n" }'
 }
 
+# Turns recognised text into a short, filesystem-safe slug: lowercased, only
+# [a-z0-9], the first few meaningful words joined with hyphens. Empty when the
+# text has nothing usable, which is the caller's signal to leave the hash name.
+slugify() {
+	printf '%s' "$1" |
+		tr '[:upper:]' '[:lower:]' |
+		tr -c 'a-z0-9' ' ' |
+		awk '{
+			n = 0; out = "";
+			for (i = 1; i <= NF; i++) {
+				if (length($i) < 2 && $i !~ /[0-9]/) continue;   # drop lone letters
+				out = out (n ? "-" : "") $i; n++;
+				if (n >= 6) break;                               # first few words
+			}
+			print substr(out, 1, 48);
+		}' |
+		sed -E 's/-+$//'
+}
+
 # OCR one image clip and store the result. Reads the clip's image_path from the
 # database, verifies it is a direct child of images/, streams the bytes out
 # through clipbasket-safefile, recognises them, and writes the text back through
@@ -159,6 +178,15 @@ ocr_one() {
 	# result is still stored so the clip is marked done.
 	printf '%s' "$text" | "$DB_CLI" set-ocr "$id" >/dev/null ||
 		{ log "storing OCR for $id failed"; return 1; }
+
+	# Rename the stored file from its opaque hash to what the image shows, so
+	# the image is recognisable on disk, in the lightbox and anywhere the path
+	# surfaces. Best-effort: a failure here never undoes the searchable text.
+	local slug
+	slug=$(slugify "$text")
+	if [ -n "$slug" ]; then
+		"$DB_CLI" rename-image "$id" --slug "$slug" >/dev/null 2>&1 || true
+	fi
 	return 0
 }
 
@@ -276,6 +304,12 @@ selftest() {
 	out=$(TESSERACT_BIN="$bindir/tesseract" OCR_CONF_MIN=5 recognise "$root/x")
 	check 'a lower floor keeps the third word, on a new line' "$(printf 'Meeting roadmap\nblurry')" "$out"
 
+	# slugify: lowercased, hyphenated, punctuation and lone letters dropped, capped.
+	check 'slugify makes a readable slug' 'meeting-moved-to-3pm' "$(slugify 'Meeting Moved To 3pm!!')"
+	check 'slugify drops lone letters and caps the word count' 'invoice-acme-corp-total-99-now' \
+		"$(slugify 'A Invoice: ACME Corp total 99 x now please today')"
+	check 'slugify is empty when there is nothing usable' '' "$(slugify '!!! ... @@@')"
+
 	# require_tesseract exits 0 (never 1) when the binary is missing, so a box
 	# without tesseract degrades silently rather than erroring.
 	out=$( (CLIPBASKET_TESSERACT="$root/no-such-tesseract" "$0" 999 >/dev/null 2>&1; echo "exit=$?") )
@@ -287,9 +321,10 @@ selftest() {
 	mkdir -p "$state/images"
 	# A tiny valid PNG (1x1) so safefile read yields bytes; the stub ignores it.
 	printf '\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\000\000\000\001\010\002\000\000\000\220wS\336\000\000\000\014IDATx\234c\370\317\300\360\037\000\005\005\002\000\015\012\333\337\000\000\000\000IEND\256B`\202' >"$state/images/deadbeef.png"
+	local chash="abc123def4560000000000000000000000000000000000000000000000000000"
 	out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" \
 		"$DB_CLI" insert <<-JSON
-		{"kind":"image","hash":"h-ocr","preview":"Image 1x1","image_path":"$state/images/deadbeef.png","source_app":"grim"}
+		{"kind":"image","hash":"$chash","preview":"Image 1x1","image_path":"$state/images/deadbeef.png","thumb_path":"$state/images/deadbeef.png","source_app":"grim"}
 		JSON
 	)
 	local id
@@ -304,6 +339,14 @@ selftest() {
 	out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" \
 		"$DB_CLI" ocr-pending)
 	check 'and the clip is no longer pending' '[]' "$out"
+
+	# The stored file is renamed from its opaque hash to what the image shows.
+	check 'the image file is renamed to a readable name' 'meeting-roadmap-abc123def456.png' \
+		"$(ls "$state/images")"
+	check 'the old hash-named file is gone' 'absent' \
+		"$( [ -e "$state/images/deadbeef.png" ] && echo present || echo absent )"
+	out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" "$DB_CLI" get "$id")
+	check_contains 'and the row points at the renamed file' 'meeting-roadmap-abc123def456.png' "$out"
 
 	# image_path outside images/ is refused rather than read.
 	out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" \

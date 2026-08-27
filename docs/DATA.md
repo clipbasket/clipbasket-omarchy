@@ -236,6 +236,21 @@ A JSON array of `{id, image_path}` for image clips that have never been OCR'd
 newest first, default limit 1000: `[{"id":12,"image_path":"…/images/ab.png"}]`.
 The optional OCR worker uses it to backfill images that predate the feature.
 
+### `rename-image <id> --slug <slug>`
+
+`{"ok":true,"renamed":true,"image_path":"…/images/quarterly-report-final-feed00112233.png"}`.
+Renames an image clip's stored file (and its thumbnail) from the opaque content
+hash to a readable name derived from what the image shows, and updates
+`image_path`/`thumb_path` so copy, the lightbox and asset GC all follow. The
+name is `<slug>-<hash12>.<ext>`: the slug is human-readable and the first 12 hex
+of the content hash keep it unique and stable, so re-running is idempotent
+(`"renamed":false`) and two images that read the same words never collide. The
+slug is re-sanitised to `[a-z0-9-]` here regardless of the caller. Renames go
+through `clipbasket-safefile rename` (descriptor-bound, `renameat` inside the
+verified directory), and only a direct child of `images/`/`thumbs/` is ever
+touched. A no-op `"renamed":false` — never an error — when the clip is not an
+image, has no usable slug, or its file lives elsewhere.
+
 ### Others
 
 `pin`/`save` → `{"ok":true}` · `delete` → `{"ok":true}` ·
@@ -424,6 +439,13 @@ no-op otherwise — nothing is installed on the user's behalf, nothing leaves th
 machine. `pacman -S tesseract tesseract-data-eng` turns it on; `clipbasket-omarchy
 doctor` reports whether it is present and for which languages.
 
+After storing the text, the worker also **renames the stored file** from its
+opaque hash to a slug of what the image shows (`clipbasket-db rename-image`), so
+a screenshot lands on disk as `meeting-moved-to-3pm-a1b2c3d4e5f6.png` rather
+than `a1b2c3….png`. The slug is the first few recognised words, lowercased and
+hyphenated; the trailing 12 hex of the content hash keep the name unique and
+the rename idempotent. An image with no recognised text keeps its hash name.
+
 The rules that matter:
 
 * **Off the hot path.** `clipbasket-capture` records the image clip first, then
@@ -503,7 +525,7 @@ means the attacker owns a directory nobody is writing to.
 | `clips.db`, and its `-wal` / `-shm` | **CWD pinning**: `clipbasket-db` `cd -P`s into the state directory once, confirms `$PWD` came back equal to the path it asked for (so no component was a symlink) and that `.` is owned by us, then opens the database as `./clips.db`. sqlite3 resolves against the held working directory, and the journal files follow the database into it. |
 | `.fts-enabled`, `.fts-disabled`, `.schema-vN` markers | `safefile write` / `unlink`. The hot path never opens marker content: non-symlink, owned, regular-file existence is only an untrusted cache hint, so the FTS-enabled path stays fork-free without following a planted marker. The legacy `.fts` name is removed through `unlinkat`. |
 | `suppress` (write and consume) | `safefile write` / `read` / `unlink` |
-| `images/<hash>.<ext>`, `thumbs/<hash>.png` | Staged in `$TMPDIR`, published with `safefile write` |
+| `images/<hash>.<ext>`, `thumbs/<hash>.png` | Staged in `$TMPDIR`, published with `safefile write`; renamed in place to `<slug>-<hash12>.<ext>` by the OCR pass with `safefile rename` |
 | `settings.json` (CLI and panel) | `safefile write`, with jq still doing the merge |
 | `make-default.json`, `backups/bindings.lua.*` | `safefile write` |
 | `globalShortcut` mirrored into `settings.json` | `safefile write`, best-effort: a refusal warns rather than failing the keybinding change it followed |
@@ -572,8 +594,8 @@ records how far it got: it is cut off within a pipe buffer of the limit rather
 than draining, the clip is rejected by the existing check, and a producer that
 never closes is shown to return rather than hang.
 
-`clipbasket-safefile --selftest` covers the descriptor binding: 29 cases including planted symlinks
-at a directory component, at a write destination and at an unlink target,
+`clipbasket-safefile --selftest` covers the descriptor binding: 35 cases including planted symlinks
+at a directory component, at a write, rename or unlink target,
 wrong-owner refusal, exact modes under a restrictive `umask`, private
 intermediate directories, bounded streaming, temp-file cleanup on both the
 success and the refusal path, and an assertion that nothing appears behind any planted link. Each of
@@ -584,10 +606,11 @@ exist and requiring the write to fail.
 ## Testing
 
 ```
-bin/clipbasket-db selftest        # 152 cases, incl. migration, OCR, copy/GC exploit regressions
+bin/clipbasket-safefile --selftest #  35 cases, incl. planted-symlink rename refusals
+bin/clipbasket-db selftest        # 162 cases, incl. migration, OCR, rename-image, copy/GC regressions
 bin/clipbasket-html2md --selftest #  65 cases, one per supported element
 bin/clipbasket-capture --selftest #  69 cases, against stubbed producers and ImageMagick
-bin/clipbasket-ocr --selftest     #   9 cases, against a stubbed tesseract and a real db
+bin/clipbasket-ocr --selftest     #  15 cases, against a stubbed tesseract and a real db
 bin/clipbasket-omarchy selftest   #  33 cases, against a sandboxed bindings.lua
 ```
 

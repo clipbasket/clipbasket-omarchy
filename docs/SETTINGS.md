@@ -110,7 +110,8 @@ Defaults on. A privacy default should never need to be discovered.
 
 Search text inside images. When a copied image is recorded, its text is read out
 in the background so a screenshot becomes findable by what it shows — not just by
-its size.
+its size — and the stored file is renamed from its opaque hash to that content
+(for example `meeting-moved-to-3pm-a1b2c3d4e5f6.png`).
 
 This runs entirely on your machine and needs the `tesseract` OCR engine
 (`pacman -S tesseract tesseract-data-eng`). Exactly like `pandoc` for **Copy as
