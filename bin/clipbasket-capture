@@ -658,22 +658,25 @@ record() {
 	"$DB_CLI" prune --max "$MAX_CLIPS" >/dev/null 2>&1 || true
 }
 
-# Hands a freshly recorded image clip to the optional OCR worker, detached and
-# at low priority so recognising the text never delays the next clipboard
-# event. A no-op unless OCR is enabled, the worker and tesseract are both
-# present, and the row is genuinely new (a deduped re-copy was already handed
+# Hands a freshly recorded image clip to the optional analysis worker, detached
+# and at low priority so it never delays the next clipboard event. The worker
+# reads the image's text (tesseract) and/or its perceptual hash (ImageMagick),
+# so this fires when either tool is present. A no-op unless enabled, the worker
+# exists, and the row is genuinely new (a deduped re-copy was already handed
 # over the first time). Confidential offers never reach here -- they are dropped
-# before any capture_* runs -- so an image that is OCR'd is one already stored.
+# before any capture_* runs -- so an image analysed is one already stored.
 maybe_ocr_image() {
 	local id="$1" deduped="${2:-0}"
 	[ "$OCR_ENABLED" = "1" ] || return 0
 	[ "$deduped" = "1" ] && return 0
 	case "$id" in '' | *[!0-9]*) return 0 ;; esac
 	# The selftest drives capture_* in-process against a stubbed DB; it must not
-	# fork a real OCR worker at the live tesseract.
+	# fork a real worker at the live tools.
 	[ -z "${SELFTEST_ROOT:-}" ] || return 0
 	[ -x "$OCR_CLI" ] || return 0
-	command -v "$TESSERACT_BIN" >/dev/null 2>&1 || return 0
+	command -v "$TESSERACT_BIN" >/dev/null 2>&1 ||
+		command -v magick >/dev/null 2>&1 ||
+		command -v convert >/dev/null 2>&1 || return 0
 	setsid nice -n 19 "$OCR_CLI" "$id" >/dev/null 2>&1 &
 	disown 2>/dev/null || true
 	return 0
