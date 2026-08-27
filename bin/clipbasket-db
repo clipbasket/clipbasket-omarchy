@@ -1407,10 +1407,16 @@ cmd_set_caption() {
 	sql_quote "$caption"
 	q_caption="$REPLY_QUOTED"
 
+	# Title the image with its caption only while the title is still the plain
+	# "Image WxH" placeholder — i.e. OCR found no words to title it with. A real
+	# OCR title (any other preview) is more specific and is left to win, even
+	# when a photo also produced a few spurious OCR characters.
 	run_sql "UPDATE clips SET
 	           caption = NULLIF($q_caption, ''),
 	           preview = CASE
-	             WHEN (ocr_text IS NULL OR ocr_text = '') AND TRIM($q_caption) <> ''
+	             WHEN TRIM($q_caption) <> '' AND (
+	                    preview IS NULL OR preview = '' OR preview = 'Image'
+	                    OR preview GLOB 'Image [0-9]*x[0-9]*')
 	             THEN substr(TRIM(replace(replace(replace($q_caption,
 	                    char(10), ' '), char(13), ' '), char(9), ' ')), 1, $PREVIEW_CHARS)
 	             ELSE preview
