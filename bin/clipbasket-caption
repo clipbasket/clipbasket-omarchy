@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# clipbasket-caption — optional image captioning for Clipbasket.
+#
+#   clipbasket-caption caption [--all] [--id N] [--limit N]
+#   clipbasket-caption pending
+#   clipbasket-caption status
+#
+# Describes an image in a short sentence ("a dog running on a grassy field") so a
+# photo with no text becomes keyword-searchable and gets a readable title. It is
+# the opt-in third tier of image search, alongside OCR (text in the image) and
+# CLIP semantic search (meaning). It needs a Python with `transformers` +
+# `optimum[onnxruntime]` + `torch` (CPU); a stock Clipbasket install ships none
+# of that, so the whole feature is a clean no-op until it is installed.
+#
+# It shares the semantic add-on's interpreter, found at $CLIPBASKET_EMBED_PYTHON,
+# else the default venv at $XDG_DATA_HOME/clipbasket/clip-venv. Enable with:
+#
+#   ~/.local/share/clipbasket/clip-venv/bin/pip install \
+#       "optimum[onnxruntime]" transformers torch
+#
+# (fastembed, from the semantic add-on, already brings onnxruntime.)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+EMBED_PY="${CLIPBASKET_EMBED_PYTHON:-$DATA_HOME/clipbasket/clip-venv/bin/python}"
+CAPTION_MODULE="${CLIPBASKET_CAPTION_MODULE:-$SCRIPT_DIR/clipbasket_caption.py}"
+# The engine writes through clipbasket-db so the title/searchable logic stays in
+# one place; tell it where that CLI is.
+export CLIPBASKET_DB_CLI="${CLIPBASKET_DB_CLI:-$SCRIPT_DIR/clipbasket-db}"
+
+if [ "${1:-}" = "status" ]; then
+	if [ -x "$EMBED_PY" ] && "$EMBED_PY" -c 'import optimum.onnxruntime, transformers, torch' >/dev/null 2>&1; then
+		printf '{"ok":true,"python":%s}\n' "\"$EMBED_PY\""
+		exit 0
+	fi
+	printf '{"ok":false,"error":"caption add-on not installed","python":%s}\n' "\"$EMBED_PY\""
+	exit 3
+fi
+
+if [ ! -x "$EMBED_PY" ]; then
+	printf '{"ok":false,"error":"clipbasket-caption is not installed (no python at %s)"}\n' "$EMBED_PY" >&2
+	exit 3
+fi
+
+# Serialise captioning: model load is heavy, so a burst of copies queues behind
+# a single captioner rather than fan-forking. The lock rides through the exec.
+if [ "${1:-}" = "caption" ]; then
+	STATE_DIR="${CLIPBASKET_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/clipbasket}"
+	lock="$STATE_DIR/.caption.lock"
+	if command -v flock >/dev/null 2>&1 && mkdir -p "$STATE_DIR" 2>/dev/null && { : >"$lock"; } 2>/dev/null; then
+		exec {lockfd}>>"$lock" || true
+		flock -w 600 "$lockfd" 2>/dev/null || true
+	fi
+fi
+
+exec "$EMBED_PY" "$CAPTION_MODULE" "$@"

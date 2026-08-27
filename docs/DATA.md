@@ -43,6 +43,10 @@ with `CLIPBASKET_DB`.
 | `files_json` | TEXT | JSON array of `{path, name, extension, is_directory}` |
 | `mime` | TEXT | the offer's MIME type, for images and file lists |
 | `size_bytes` | INTEGER | payload size for images |
+| `ocr_text` | TEXT | the text an optional OCR pass read out of an image; `NULL` until OCR runs, `''` once it ran and found nothing |
+| `phash` | TEXT | 64-bit perceptual hash (16 hex) of an image, for visual-similarity search; `NULL` until the background worker computes it |
+| `clip_embed` | BLOB | optional CLIP image embedding (512 float32) for semantic search; written only by the opt-in embed add-on |
+| `caption` | TEXT | optional natural-language description of an image; written only by the opt-in caption add-on |
 | `searchable` | TEXT | the concatenation search runs over |
 
 Search uses an FTS5 external-content table (`clips_fts`) kept in sync by three
@@ -60,6 +64,10 @@ reports it.
 | --- | --- |
 | 1 | initial schema |
 | 2 | added `clips.html` |
+| 3 | added `clips.ocr_text` |
+| 4 | added `clips.phash` |
+| 5 | added `clips.clip_embed` |
+| 6 | added `clips.caption` |
 
 Migrations are **additive and in place**. A user's history is already on disk,
 so no step may drop or rebuild the `clips` table. The sequence on every run is:
@@ -124,10 +132,13 @@ The same object with the full `text`, `text_truncated` always `false`, and one
 extra field:
 
 ```json
-{ "…": "…", "has_html": true, "html": "<h1>Wikipedia</h1>…" }
+{ "…": "…", "has_html": true, "html": "<h1>Wikipedia</h1>…", "ocr_text": "Meeting moved to 3pm" }
 ```
 
-`null` for an id that does not exist.
+`ocr_text` is `null` on an image that has not been OCR'd (or on any non-image),
+and the recognised text otherwise. Like `html`, it is **never** returned by
+`list` — a listing stays small and the panel asks `get` for it when the user
+opens the clip. `null` for an id that does not exist.
 
 ### `markdown <id> [--base-url URL]`
 
@@ -210,6 +221,79 @@ a legal escape and decodes to a newline inside a file name, which a
 line-delimited list splits into two bogus paths and miscounts. The same applies
 to `delete`'s doomed-asset list, which comes out of SQLite hex-encoded for the
 same reason.
+
+### `set-ocr <id>` (recognised text on stdin)
+
+`{"ok":true}`. Stores an image clip's OCR reading in `ocr_text` and re-derives
+`searchable` from the clip's own columns plus that reading, so the FTS index
+(via the `AFTER UPDATE OF searchable` trigger) now finds the image by the words
+inside it. The text is bounded at `CLIPBASKET_MAX_OCR_BYTES` and UTF-8 scrubbed
+exactly like an inserted clip, because it too is produced by a tool the plugin
+does not control. Empty input is stored as `''` rather than `NULL`: that marks
+the clip "OCR done, nothing found" so `ocr-pending` does not hand it out again.
+A re-record of the same image keeps `ocr_text` (the insert payload never carries
+it) and folds it back into `searchable`. For an image, the recognised text also
+becomes the clip's `preview` — the one line the panel shows as the clip's title
+— so a screenshot reads as what it shows (`ZEC $792.88 …`) instead of `Image
+3024x1964`; the dimensions stay in the detail view, and an image with no
+readable text keeps its `Image WxH` title. Errors in the CLI's usual shape:
+`{"ok":false,"error":"no clip with id 12"}`.
+
+### `ocr-pending [--limit N]`
+
+A JSON array of `{id, image_path}` for image clips that have never been OCR'd
+(`ocr_text IS NULL`, so a clip already read and found empty is not re-offered),
+newest first, default limit 1000: `[{"id":12,"image_path":"…/images/ab.png"}]`.
+The optional OCR worker uses it to backfill images that predate the feature.
+
+### `set-caption <id> --caption <text>`
+
+`{"ok":true}`. Stores a natural-language description of an image, folds it into
+`searchable` (so a photo is keyword-findable by what it depicts), and — when the
+image has no OCR text of its own — makes it the clip's title. OCR text, when
+present, still wins the title. Errors on a non-image or missing id. Written by
+the opt-in caption add-on (`clipbasket-caption`).
+
+### `caption-pending [--limit N]`
+
+Image clips with no caption yet (`caption IS NULL`), `{id, image_path}`, newest
+first — the caption add-on's backfill list.
+
+### `set-phash <id> <hex>`
+
+`{"ok":true}`. Stores the 64-bit perceptual hash (16 lowercase hex chars) the
+worker computed for an image, so `similar` can rank look-alikes. A non-hex value
+is rejected; a non-image id is a no-op.
+
+### `phash-pending [--limit N]`
+
+Like `ocr-pending`, but for image clips with no perceptual hash yet
+(`phash IS NULL`). The worker unions this with `ocr-pending` so one `--all`
+pass fills in whichever piece each image is missing.
+
+### `similar <id> [--max-distance N] [--limit K]`
+
+A JSON array of `{id, distance, kind, preview, thumb_path, image_path}` for the
+images visually closest to the given one, nearest first — Hamming distance
+between perceptual hashes, `distance <= N` (default 12 of 64 bits), at most `K`
+(default 20). This finds near-duplicates and look-alikes, **including photos
+with no text**, which OCR alone cannot. Empty when the clip is not an image or
+has no hash yet. The query image itself is never in the results.
+
+### `rename-image <id> --slug <slug>`
+
+`{"ok":true,"renamed":true,"image_path":"…/images/quarterly-report-final-feed00112233.png"}`.
+Renames an image clip's stored file (and its thumbnail) from the opaque content
+hash to a readable name derived from what the image shows, and updates
+`image_path`/`thumb_path` so copy, the lightbox and asset GC all follow. The
+name is `<slug>-<hash12>.<ext>`: the slug is human-readable and the first 12 hex
+of the content hash keep it unique and stable, so re-running is idempotent
+(`"renamed":false`) and two images that read the same words never collide. The
+slug is re-sanitised to `[a-z0-9-]` here regardless of the caller. Renames go
+through `clipbasket-safefile rename` (descriptor-bound, `renameat` inside the
+verified directory), and only a direct child of `images/`/`thumbs/` is ever
+touched. A no-op `"renamed":false` — never an error — when the clip is not an
+image, has no usable slug, or its file lives elsewhere.
 
 ### Others
 
@@ -378,6 +462,86 @@ lose content.
 
 ---
 
+## Content-aware image search (OCR)
+
+Without this, an image's whole searchable surface is `Image 1600x900 <app>
+image/png` — nothing about what the picture shows, so a copied screenshot of an
+error, a receipt or a chat cannot be found by any word visible in it.
+`bin/clipbasket-ocr` closes that: it reads the text out of a stored image and
+hands it to `clipbasket-db set-ocr`, which folds it into `searchable`.
+
+```
+clipbasket-ocr <id>               # OCR one image clip
+clipbasket-ocr --all [--limit N]  # backfill every image clip with no OCR yet
+clipbasket-ocr --selftest         # against a stubbed tesseract, no model needed
+```
+
+It is built like `clipbasket-html2md`: **`tesseract` is used only if it is
+already installed** (and ImageMagick, when present, downscales and grayscales
+the image first for a cleaner, faster read), and the whole feature is a clean
+no-op otherwise — nothing is installed on the user's behalf, nothing leaves the
+machine. `pacman -S tesseract tesseract-data-eng` turns it on; `clipbasket-omarchy
+doctor` reports whether it is present and for which languages.
+
+After storing the text, the worker also **renames the stored file** from its
+opaque hash to a slug of what the image shows (`clipbasket-db rename-image`), so
+a screenshot lands on disk as `meeting-moved-to-3pm-a1b2c3d4e5f6.png` rather
+than `a1b2c3….png`. The slug is the first few recognised words, lowercased and
+hyphenated; the trailing 12 hex of the content hash keep the name unique and
+the rename idempotent. An image with no recognised text keeps its hash name.
+
+The rules that matter:
+
+* **Off the hot path.** `clipbasket-capture` records the image clip first, then
+  forks `clipbasket-ocr` **detached and `nice`d**, so recognising text never
+  delays the next clipboard event. An OCR crash, timeout, or missing binary
+  cannot affect capture latency or lose a clip.
+* **Bounded compute.** A wall-clock `timeout` (`CLIPBASKET_OCR_TIMEOUT`) plus
+  the same ImageMagick decoder envelope the rest of the plugin uses (memory 256
+  MiB, map 256 MiB, area 64 MP, time 10 s) plus a downscale to
+  `CLIPBASKET_OCR_MAX_DIM` on the long edge mean a hostile or enormous image
+  cannot pin a core.
+* **One at a time.** A `flock` in the state directory serialises workers, so a
+  burst of copies queues behind a single `tesseract` rather than fan-forking.
+* **Descriptor-bound reads.** The image bytes are streamed out of `images/`
+  through `clipbasket-safefile` (`O_NOFOLLOW`, `fstat` regular-and-owned),
+  never by handing a pathname to `tesseract`; only a direct child of `images/`
+  is accepted, so a planted symlink or an `images/../secret` value yields no
+  bytes. The recognised text is then bounded and UTF-8 scrubbed by
+  `clipbasket-db set-ocr` before it reaches SQLite.
+* **Confidential offers are never OCR'd.** They are dropped before any
+  `capture_*` runs, so an image that reaches OCR is one already stored; the
+  worker also honours the `CLIPBASKET_OCR` toggle the service passes through.
+* **Low-confidence words are dropped.** `tesseract` runs in `tsv` mode and
+  words below `CLIPBASKET_OCR_CONF_MIN` are discarded, so the stored text is
+  the words it was reasonably sure of, reassembled into readable lines.
+
+Measured on a CPU-only aarch64 box, a screenshot OCRs in roughly 0.3–1.1 s
+— comfortably a background job, with the 41 MB `eng` model already on disk.
+
+### Visual similarity (perceptual hash)
+
+OCR can only find images that contain text. To find images by their **visual**
+content — near-duplicates, re-encodings, and look-alike photos that carry no
+text — the same background worker also computes a **perceptual hash** (dHash):
+ImageMagick shrinks the image to a 9×8 grayscale, and each of the 8 rows
+contributes 8 bits comparing adjacent pixels, for a 64-bit fingerprint stored
+in `clips.phash`. Two visually similar images differ in only a few of those 64
+bits, so `clipbasket-db similar <id>` ranks candidates by Hamming distance.
+
+It is ImageMagick-if-present, exactly like OCR is tesseract-if-present: the
+worker runs when **either** tool is installed, does whichever piece each image
+lacks, and `--all` backfills both. Hashing a screenshot is a few milliseconds,
+so backfilling a whole history is seconds.
+
+This is the dependency-light realisation of the research plan's “Phase 2”
+(semantic image search). A full cross-modal model (CLIP/MobileCLIP via ONNX)
+would add natural-language *text→image* search of no-text photos, but its
+runtime is not in the Arch repos and would break “git clone and run”; a
+perceptual hash gives find-by-example visual similarity with no new dependency.
+
+---
+
 ## Writing to predictable paths
 
 Everything above lives at a path anyone can guess: `~/.local/state/clipbasket`
@@ -426,7 +590,7 @@ means the attacker owns a directory nobody is writing to.
 | `clips.db`, and its `-wal` / `-shm` | **CWD pinning**: `clipbasket-db` `cd -P`s into the state directory once, confirms `$PWD` came back equal to the path it asked for (so no component was a symlink) and that `.` is owned by us, then opens the database as `./clips.db`. sqlite3 resolves against the held working directory, and the journal files follow the database into it. |
 | `.fts-enabled`, `.fts-disabled`, `.schema-vN` markers | `safefile write` / `unlink`. The hot path never opens marker content: non-symlink, owned, regular-file existence is only an untrusted cache hint, so the FTS-enabled path stays fork-free without following a planted marker. The legacy `.fts` name is removed through `unlinkat`. |
 | `suppress` (write and consume) | `safefile write` / `read` / `unlink` |
-| `images/<hash>.<ext>`, `thumbs/<hash>.png` | Staged in `$TMPDIR`, published with `safefile write` |
+| `images/<hash>.<ext>`, `thumbs/<hash>.png` | Staged in `$TMPDIR`, published with `safefile write`; renamed in place to `<slug>-<hash12>.<ext>` by the OCR pass with `safefile rename` |
 | `settings.json` (CLI and panel) | `safefile write`, with jq still doing the merge |
 | `make-default.json`, `backups/bindings.lua.*` | `safefile write` |
 | `globalShortcut` mirrored into `settings.json` | `safefile write`, best-effort: a refusal warns rather than failing the keybinding change it followed |
@@ -495,8 +659,8 @@ records how far it got: it is cut off within a pipe buffer of the limit rather
 than draining, the clip is rejected by the existing check, and a producer that
 never closes is shown to return rather than hang.
 
-`clipbasket-safefile --selftest` covers the descriptor binding: 29 cases including planted symlinks
-at a directory component, at a write destination and at an unlink target,
+`clipbasket-safefile --selftest` covers the descriptor binding: 35 cases including planted symlinks
+at a directory component, at a write, rename or unlink target,
 wrong-owner refusal, exact modes under a restrictive `umask`, private
 intermediate directories, bounded streaming, temp-file cleanup on both the
 success and the refusal path, and an assertion that nothing appears behind any planted link. Each of
@@ -507,11 +671,17 @@ exist and requiring the write to fail.
 ## Testing
 
 ```
-bin/clipbasket-db selftest        # 138 cases, incl. migration, copy/GC exploit regressions
-bin/clipbasket-html2md --selftest #  66 cases, one per supported element
+bin/clipbasket-safefile --selftest #  35 cases, incl. planted-symlink rename refusals
+bin/clipbasket-db selftest        # 179 cases, incl. migration, OCR, rename-image, phash/similar, GC regressions
+bin/clipbasket-html2md --selftest #  65 cases, one per supported element
 bin/clipbasket-capture --selftest #  69 cases, against stubbed producers and ImageMagick
+bin/clipbasket-ocr --selftest     #  21 cases, against a stubbed tesseract, ImageMagick and a real db
 bin/clipbasket-omarchy selftest   #  33 cases, against a sandboxed bindings.lua
 ```
+
+`clipbasket-db selftest` now also covers phash/`similar`, the `semantic`
+passthrough (add-on absent), and captions (a no-text photo titled by its
+caption, OCR text still winning the title, and both staying searchable).
 
 `clipbasket-db selftest` runs entirely in a temp directory and never touches the
 real history. It needs no Wayland session: `copy` is exercised through a stub
@@ -541,4 +711,12 @@ the image's **file bytes** on `--type image/png` rather than its preview string.
 | `CLIPBASKET_MAX_IMAGE_DIMENSION` | 16384 |
 | `CLIPBASKET_MAX_CLIPS` | 1000 |
 | `CLIPBASKET_IGNORE_CONFIDENTIAL` | 1 (`0` records confidential offers) |
+| `CLIPBASKET_OCR` | 1 (`0` disables handing images to OCR; no-op anyway without tesseract) |
+| `CLIPBASKET_MAX_OCR_BYTES` | 65536 |
+| `CLIPBASKET_OCR_LANGS` | `eng` (tesseract `-l`, e.g. `eng+deu`) |
+| `CLIPBASKET_OCR_PSM` | 3 (automatic page segmentation; screenshots are scattered UI text) |
+| `CLIPBASKET_OCR_CONF_MIN` | 55 (drop words below this confidence) |
+| `CLIPBASKET_OCR_TIMEOUT` | 25 (wall-clock seconds per image) |
+| `CLIPBASKET_OCR_MAX_DIM` | 2600 (downscale a larger image's long edge first) |
+| `CLIPBASKET_TESSERACT` | `tesseract` |
 | `CLIPBASKET_WL_PASTE` | `wl-paste` |
