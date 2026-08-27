@@ -72,13 +72,41 @@ Each result is `{id, score, kind, preview, image_path, thumb_path}`, best match
 first. `score` is cosine similarity in the CLIP space (roughly 0.2–0.35 for a
 good match on screenshots; real photos separate much more strongly).
 
+## Captioning (a further opt-in)
+
+A companion add-on, `clipbasket-caption`, writes a short **description** of each
+image ("a beach with a clear blue sky and a body of water"). Unlike CLIP search
+(which ranks images against a query without ever putting words on them), a
+caption is stored text, so it:
+
+- **titles a photo that has no text of its own** — instead of "Image 640x426"
+  the clip reads as what it shows (a screenshot with OCR text keeps its OCR
+  title; captions never override that);
+- **is keyword-searchable** through the normal search box — typing "beach"
+  finds the photo via FTS, no query embedding needed.
+
+It needs `transformers` + `optimum[onnxruntime]` + `torch` (CPU) in the same
+venv, and a small captioning model (ViT‑GPT2, ~250 MB) that downloads once:
+
+```sh
+~/.local/share/clipbasket/clip-venv/bin/pip install "optimum[onnxruntime]" transformers torch
+clipbasket-caption caption --all      # describe every image (backfill)
+clipbasket-caption pending            # {"images":N,"captioned":M,"pending":…}
+```
+
+Captioning is the heaviest add-on and screenshots are already covered by OCR, so
+it is **off at capture time by default**; run the backfill above, or set
+`CLIPBASKET_CAPTION=1` to caption new images automatically in the background.
+`clipbasket-omarchy doctor` shows `Image captioning  add-on ready` once installed.
+
 ## How it fits together
 
 | axis | tool | finds |
 | --- | --- | --- |
 | text in the image | `tesseract` (OCR) | screenshots by their words |
 | visual look-alikes | ImageMagick (dHash) | near-duplicates, re-encodings |
-| **what it depicts** | **this add-on (CLIP)** | **images by natural-language meaning** |
+| what it depicts (ranked) | CLIP embed add-on | images by natural-language meaning |
+| a readable description | caption add-on | titles & keyword-search for no-text photos |
 
 - Embeddings are 512 float32, L2-normalised, stored in `clips.clip_embed`
   (schema v5). Search is a brute-force cosine over the stored images — for a
