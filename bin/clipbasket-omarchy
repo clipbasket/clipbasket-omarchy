@@ -762,6 +762,13 @@ cmd_doctor() {
   else
     check_info "Semantic image search (CLIP)" "optional — see docs/SEMANTIC.md to enable natural-language photo search"
   fi
+  local caption_cli="$PLUGIN_DIR/bin/clipbasket-caption"
+  [ -x "$caption_cli" ] || caption_cli="$(dirname "$0")/clipbasket-caption"
+  if [ -x "$caption_cli" ] && "$caption_cli" status >/dev/null 2>&1; then
+    check_pass "Image captioning" "add-on ready"
+  else
+    check_info "Image captioning" "optional — see docs/SEMANTIC.md to describe & title no-text photos"
+  fi
   if have omarchy; then check_pass "omarchy CLI" "$(command -v omarchy)"; else check_fail "omarchy CLI" "not found"; fi
   if have omarchy-shell; then check_pass "omarchy-shell CLI" "$(command -v omarchy-shell)"; else check_fail "omarchy-shell CLI" "not found"; fi
 

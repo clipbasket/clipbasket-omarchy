@@ -71,6 +71,12 @@ EMBED_ENABLED="${CLIPBASKET_EMBED:-1}"
 EMBED_CLI="${CLIPBASKET_EMBED_CLI:-$SCRIPT_DIR/clipbasket-embed}"
 EMBED_PYTHON="${CLIPBASKET_EMBED_PYTHON:-${XDG_DATA_HOME:-$HOME/.local/share}/clipbasket/clip-venv/bin/python}"
 
+# Optional image captioning (heavier: a torch model). Off by default because it
+# is the most expensive add-on and screenshots are already covered by OCR; set
+# CLIPBASKET_CAPTION=1 (or run `clipbasket-caption caption --all`) to enable.
+CAPTION_ENABLED="${CLIPBASKET_CAPTION:-0}"
+CAPTION_CLI="${CLIPBASKET_CAPTION_CLI:-$SCRIPT_DIR/clipbasket-caption}"
+
 WL_PASTE_BIN="${CLIPBASKET_WL_PASTE:-wl-paste}"
 
 TMPFILES=()
@@ -933,6 +939,23 @@ capture_image() {
 	# background so it becomes searchable by content. Never on the hot path.
 	maybe_ocr_image "$LAST_INSERT_ID" "$LAST_INSERT_DEDUPED"
 	maybe_embed_image "$LAST_INSERT_ID" "$LAST_INSERT_DEDUPED"
+	maybe_caption_image "$LAST_INSERT_ID" "$LAST_INSERT_DEDUPED"
+	return 0
+}
+
+# Hands a freshly recorded image to the opt-in captioner so a photo with no text
+# gets a readable, searchable description. Off unless CLIPBASKET_CAPTION=1 and
+# the add-on's Python is present; detached, low priority, lock-serialised.
+maybe_caption_image() {
+	local id="$1" deduped="${2:-0}"
+	[ "$CAPTION_ENABLED" = "1" ] || return 0
+	[ "$deduped" = "1" ] && return 0
+	case "$id" in '' | *[!0-9]*) return 0 ;; esac
+	[ -z "${SELFTEST_ROOT:-}" ] || return 0
+	[ -x "$CAPTION_CLI" ] || return 0
+	[ -x "$EMBED_PYTHON" ] || return 0
+	setsid nice -n 19 "$CAPTION_CLI" caption --id "$id" >/dev/null 2>&1 &
+	disown 2>/dev/null || true
 	return 0
 }
 

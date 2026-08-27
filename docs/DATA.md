@@ -45,6 +45,8 @@ with `CLIPBASKET_DB`.
 | `size_bytes` | INTEGER | payload size for images |
 | `ocr_text` | TEXT | the text an optional OCR pass read out of an image; `NULL` until OCR runs, `''` once it ran and found nothing |
 | `phash` | TEXT | 64-bit perceptual hash (16 hex) of an image, for visual-similarity search; `NULL` until the background worker computes it |
+| `clip_embed` | BLOB | optional CLIP image embedding (512 float32) for semantic search; written only by the opt-in embed add-on |
+| `caption` | TEXT | optional natural-language description of an image; written only by the opt-in caption add-on |
 | `searchable` | TEXT | the concatenation search runs over |
 
 Search uses an FTS5 external-content table (`clips_fts`) kept in sync by three
@@ -64,6 +66,8 @@ reports it.
 | 2 | added `clips.html` |
 | 3 | added `clips.ocr_text` |
 | 4 | added `clips.phash` |
+| 5 | added `clips.clip_embed` |
+| 6 | added `clips.caption` |
 
 Migrations are **additive and in place**. A user's history is already on disk,
 so no step may drop or rebuild the `clips` table. The sequence on every run is:
@@ -241,6 +245,19 @@ A JSON array of `{id, image_path}` for image clips that have never been OCR'd
 (`ocr_text IS NULL`, so a clip already read and found empty is not re-offered),
 newest first, default limit 1000: `[{"id":12,"image_path":"…/images/ab.png"}]`.
 The optional OCR worker uses it to backfill images that predate the feature.
+
+### `set-caption <id> --caption <text>`
+
+`{"ok":true}`. Stores a natural-language description of an image, folds it into
+`searchable` (so a photo is keyword-findable by what it depicts), and — when the
+image has no OCR text of its own — makes it the clip's title. OCR text, when
+present, still wins the title. Errors on a non-image or missing id. Written by
+the opt-in caption add-on (`clipbasket-caption`).
+
+### `caption-pending [--limit N]`
+
+Image clips with no caption yet (`caption IS NULL`), `{id, image_path}`, newest
+first — the caption add-on's backfill list.
 
 ### `set-phash <id> <hex>`
 
@@ -661,6 +678,10 @@ bin/clipbasket-capture --selftest #  69 cases, against stubbed producers and Ima
 bin/clipbasket-ocr --selftest     #  21 cases, against a stubbed tesseract, ImageMagick and a real db
 bin/clipbasket-omarchy selftest   #  33 cases, against a sandboxed bindings.lua
 ```
+
+`clipbasket-db selftest` now also covers phash/`similar`, the `semantic`
+passthrough (add-on absent), and captions (a no-text photo titled by its
+caption, OCR text still winning the title, and both staying searchable).
 
 `clipbasket-db selftest` runs entirely in a temp directory and never touches the
 real history. It needs no Wayland session: `copy` is exercised through a stub

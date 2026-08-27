@@ -32,7 +32,10 @@ set -euo pipefail
 # 4 -> 5 added clips.clip_embed, an optional CLIP image embedding (float32 blob)
 #        for natural-language semantic image search. Written by the opt-in
 #        clipbasket-embed helper; absent unless that add-on is installed.
-SCHEMA_VERSION=5
+# 5 -> 6 added clips.caption, a natural-language description of an image so a
+#        photo with no text becomes keyword-searchable and gets a readable
+#        title. Written by the opt-in clipbasket-caption helper.
+SCHEMA_VERSION=6
 
 # The recognised-text payload is bounded before it reaches SQLite, exactly like
 # every other producer read: a hostile or enormous image must not be able to
@@ -393,6 +396,7 @@ base_schema() {
 		  ocr_text     TEXT,
 		  phash        TEXT,
 		  clip_embed   BLOB,
+		  caption      TEXT,
 		  searchable   TEXT    NOT NULL DEFAULT ''
 		);
 		CREATE INDEX IF NOT EXISTS idx_clips_order
@@ -486,7 +490,7 @@ build_projections() {
 	CLIP_JSON_FULL=${template/\%TEXT\%/c.text}
 	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%TRUNCATED\%/\'false\'}
 	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%HTML\%/,$'\n'"	  'html',           c.html"}
-	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%OCR\%/,$'\n'"	  'ocr_text',       c.ocr_text,"$'\n'"	  'phash',          c.phash"}
+	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%OCR\%/,$'\n'"	  'ocr_text',       c.ocr_text,"$'\n'"	  'phash',          c.phash,"$'\n'"	  'caption',        c.caption"}
 }
 
 # Adds a column to an existing table, once. Checking pragma_table_info rather
@@ -542,6 +546,11 @@ migrate_schema() {
 	# ever writes it, so it is simply absent on a stock install.
 	if [ "$from" -lt 5 ]; then
 		add_column clips clip_embed BLOB
+	fi
+	# v5 -> v6: the image caption. Nullable; only the opt-in caption add-on writes
+	# it. Folds into searchable, and titles a photo that has no text of its own.
+	if [ "$from" -lt 6 ]; then
+		add_column clips caption TEXT
 	fi
 }
 
@@ -959,7 +968,9 @@ cmd_insert() {
 			  -- re-read off the clipboard on shell start. A not-yet-OCR'd image
 			  -- still takes the fresh preview, and OCR titles it shortly after.
 			  preview      = CASE
-			    WHEN clips.kind = 'image' AND clips.ocr_text IS NOT NULL AND clips.ocr_text <> ''
+			    WHEN clips.kind = 'image'
+			         AND ((clips.ocr_text IS NOT NULL AND clips.ocr_text <> '')
+			              OR (clips.caption IS NOT NULL AND clips.caption <> ''))
 			    THEN clips.preview ELSE excluded.preview END,
 			  text         = excluded.text,
 			  -- Not COALESCEd: the dedupe hash covers the plain text only, so
@@ -983,7 +994,8 @@ cmd_insert() {
 			  -- reading already made. It is folded back into searchable here so the
 			  -- recomputed index does not lose the recognised words until the next
 			  -- OCR pass.
-			  searchable   = TRIM(excluded.searchable || ' ' || COALESCE(clips.ocr_text, ''));
+			  searchable   = TRIM(excluded.searchable || ' ' || COALESCE(clips.ocr_text, '')
+			                      || ' ' || COALESCE(clips.caption, ''));
 
 			SELECT json_object(
 			  'id',      (SELECT id FROM clips WHERE hash = (SELECT hash FROM p)),
@@ -1363,10 +1375,80 @@ cmd_set_ocr() {
 	                  THEN 'image ' || COALESCE(image_width, '') || ' ' || COALESCE(image_height, '')
 	                  ELSE '' END || ' ' ||
 	             COALESCE(replace(replace(replace(files_json, '\"', ' '), '{', ' '), '}', ' '), '') || ' ' ||
-	             COALESCE(CAST(readfile($q_text) AS TEXT), '')
+	             COALESCE(CAST(readfile($q_text) AS TEXT), '') || ' ' || COALESCE(caption, '')
 	           )
 	         WHERE id = $id;" >/dev/null || die "set-ocr failed"
 	printf '{"ok":true}\n'
+}
+
+# set-caption <id> --caption TEXT
+#
+# Stores a natural-language description of an image, folds it into `searchable`
+# (so a photo is keyword-findable by what it depicts), and — when the image has
+# no OCR text of its own — makes it the clip's title. OCR text, when present,
+# still wins the title, because words actually in the image are more specific.
+cmd_set_caption() {
+	local id caption='' q_caption
+	require_id "${1:-}"
+	id="$1"
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--caption)
+			caption="${2:-}"
+			shift 2
+			;;
+		*) die "set-caption: unknown option $1" ;;
+		esac
+	done
+	local out
+	out=$(run_sql "SELECT count(*) FROM clips WHERE id = $id AND kind = 'image';") || die "set-caption failed"
+	[ "${out:-0}" = "1" ] || die "no image clip with id $id"
+	sql_quote "$caption"
+	q_caption="$REPLY_QUOTED"
+
+	run_sql "UPDATE clips SET
+	           caption = NULLIF($q_caption, ''),
+	           preview = CASE
+	             WHEN (ocr_text IS NULL OR ocr_text = '') AND TRIM($q_caption) <> ''
+	             THEN substr(TRIM(replace(replace(replace($q_caption,
+	                    char(10), ' '), char(13), ' '), char(9), ' ')), 1, $PREVIEW_CHARS)
+	             ELSE preview
+	           END,
+	           searchable = TRIM(
+	             COALESCE(text, '') || ' ' || preview || ' ' ||
+	             COALESCE(source_app, '') || ' ' || COALESCE(url_domain, '') || ' ' ||
+	             COALESCE(url_title, '') || ' ' || COALESCE(mime, '') || ' ' ||
+	             CASE WHEN kind = 'image'
+	                  THEN 'image ' || COALESCE(image_width, '') || ' ' || COALESCE(image_height, '')
+	                  ELSE '' END || ' ' ||
+	             COALESCE(ocr_text, '') || ' ' || $q_caption
+	           )
+	         WHERE id = $id;" >/dev/null || die "set-caption failed"
+	printf '{"ok":true}\n'
+}
+
+# caption-pending [--limit N]
+#
+# Image clips with no caption yet ({id, image_path}, newest first), for the
+# opt-in caption add-on to backfill.
+cmd_caption_pending() {
+	local limit=1000 out
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--limit)
+			require_count "${2:-}"
+			limit="$2"
+			shift 2
+			;;
+		*) die "caption-pending: unknown option $1" ;;
+		esac
+	done
+	out=$(run_sql "SELECT COALESCE(json_group_array(json_object('id', id, 'image_path', image_path)), '[]')
+	               FROM (SELECT id, image_path FROM clips
+	                     WHERE kind = 'image' AND caption IS NULL AND image_path IS NOT NULL
+	                     ORDER BY created_at DESC LIMIT $limit);") || die "caption-pending failed"
+	printf '%s\n' "${out:-[]}"
 }
 
 # ocr-pending [--limit N]
@@ -1759,6 +1841,7 @@ cmd_selftest() {
 		check 'a v1 database has no ocr_text column' '0' "$(column_count ocr_text)"
 		check 'a v1 database has no phash column' '0' "$(column_count phash)"
 		check 'a v1 database has no clip_embed column' '0' "$(column_count clip_embed)"
+		check 'a v1 database has no caption column' '0' "$(column_count caption)"
 		check 'a v1 database reports user_version 1' '1' \
 			"$(printf 'PRAGMA user_version;\n' | run_raw)"
 
@@ -1768,6 +1851,7 @@ cmd_selftest() {
 		check 'migration adds ocr_text to the existing table' '1' "$(column_count ocr_text)"
 		check 'migration adds phash to the existing table' '1' "$(column_count phash)"
 		check 'migration adds clip_embed to the existing table' '1' "$(column_count clip_embed)"
+		check 'migration adds caption to the existing table' '1' "$(column_count caption)"
 		check 'migration stamps the new schema version' "$SCHEMA_VERSION" \
 			"$(printf 'PRAGMA user_version;\n' | run_raw)"
 		check 'migration keeps every existing row' '2' "$(run_sql 'SELECT count(*) FROM clips;')"
@@ -2089,6 +2173,32 @@ tab	here"
 	check_contains 'set-phash rejects a non-hex value' '"error"' "$out"
 	out=$(cmd_similar 999999)
 	check 'similar on a missing/hashless clip is []' '[]' "$out"
+
+	# --- captions: describe & title no-text photos ------------------------
+	printf '{"kind":"image","hash":"cap-photo","preview":"Image 640x480","image_path":"%s/cap1.png","mime":"image/png"}\n' "$IMAGE_DIR" | cmd_insert >/dev/null
+	local cap_photo
+	cap_photo=$(run_sql "SELECT id FROM clips WHERE hash='cap-photo';")
+	out=$(cmd_caption_pending)
+	check_contains 'a fresh image is pending a caption' "\"id\":$cap_photo" "$out"
+	cmd_set_caption "$cap_photo" --caption 'a dog running on a grassy field' >/dev/null
+	check 'a no-text photo is titled by its caption' 'a dog running on a grassy field' \
+		"$(run_sql "SELECT preview FROM clips WHERE id = $cap_photo;")"
+	out=$(cmd_list --limit 50 --query 'grassy')
+	check_contains 'a caption word makes the photo findable' '"kind":"image"' "$out"
+	out=$(cmd_caption_pending)
+	case "$out" in *"\"id\":$cap_photo"*) fail=$((fail + 1)); printf 'FAIL: captioned image still pending\n' >&2 ;; *) pass=$((pass + 1)) ;; esac
+	# A screenshot with OCR text keeps the OCR title; the caption only adds search.
+	printf '{"kind":"image","hash":"cap-shot","preview":"Image 800x600","image_path":"%s/cap2.png","mime":"image/png"}\n' "$IMAGE_DIR" | cmd_insert >/dev/null
+	local cap_shot
+	cap_shot=$(run_sql "SELECT id FROM clips WHERE hash='cap-shot';")
+	printf 'Quarterly revenue report' | cmd_set_ocr "$cap_shot" --title 'Quarterly revenue report' >/dev/null
+	cmd_set_caption "$cap_shot" --caption 'a screenshot of a spreadsheet' >/dev/null
+	check 'OCR text wins the title over a caption' 'Quarterly revenue report' \
+		"$(run_sql "SELECT preview FROM clips WHERE id = $cap_shot;")"
+	out=$(cmd_list --limit 50 --query 'spreadsheet')
+	check_contains 'but the caption is still searchable on a screenshot' '"kind":"image"' "$out"
+	out=$(cmd_set_caption 999999 --caption 'x' 2>&1) || true
+	check_contains 'set-caption on a non-image/missing id is an error' '"error"' "$out"
 
 	# --- semantic search passthrough (add-on forced absent) ---------------
 	# `|| true` sits OUTSIDE the $(): die exits, which bypasses an inner || and
@@ -2526,6 +2636,8 @@ usage() {
 		  rename-image <id> --slug S (rename an image's file to a readable name)
 		  set-phash <id> <hex>       (store an image's 64-bit perceptual hash)
 		  phash-pending [--limit N]  (image clips with no perceptual hash yet)
+		  set-caption <id> --caption S (store an image's description; titles no-text photos)
+		  caption-pending [--limit N]  (image clips with no caption yet)
 		  similar <id> [--max-distance N] [--limit K]
 		                             (images visually close to this one)
 		  semantic <query> [--limit K] [--min-score S]
@@ -2569,6 +2681,8 @@ main() {
 	rename-image) cmd_rename_image "$@" ;;
 	set-phash) cmd_set_phash "$@" ;;
 	phash-pending) cmd_phash_pending "$@" ;;
+	set-caption) cmd_set_caption "$@" ;;
+	caption-pending) cmd_caption_pending "$@" ;;
 	similar) cmd_similar "$@" ;;
 	semantic) cmd_semantic "$@" ;;
 	info) cmd_info "$@" ;;
