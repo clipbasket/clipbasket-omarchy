@@ -29,7 +29,10 @@ set -euo pipefail
 # 3 -> 4 added clips.phash, a 64-bit perceptual hash of an image so visually
 #        similar and near-duplicate images can be found — including photos with
 #        no text for OCR to read.
-SCHEMA_VERSION=4
+# 4 -> 5 added clips.clip_embed, an optional CLIP image embedding (float32 blob)
+#        for natural-language semantic image search. Written by the opt-in
+#        clipbasket-embed helper; absent unless that add-on is installed.
+SCHEMA_VERSION=5
 
 # The recognised-text payload is bounded before it reaches SQLite, exactly like
 # every other producer read: a hostile or enormous image must not be able to
@@ -50,6 +53,7 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 # relative $0 stops resolving the moment it does.
 SELF_BIN="$SCRIPT_DIR/$(basename -- "$0")"
 HTML2MD="${CLIPBASKET_HTML2MD:-$SCRIPT_DIR/clipbasket-html2md}"
+EMBED_CLI="${CLIPBASKET_EMBED_CLI:-$SCRIPT_DIR/clipbasket-embed}"
 SAFEFILE="${CLIPBASKET_SAFEFILE:-$SCRIPT_DIR/clipbasket-safefile}"
 
 # The state, image and thumbnail directories sit at predictable paths, so
@@ -388,6 +392,7 @@ base_schema() {
 		  size_bytes   INTEGER,
 		  ocr_text     TEXT,
 		  phash        TEXT,
+		  clip_embed   BLOB,
 		  searchable   TEXT    NOT NULL DEFAULT ''
 		);
 		CREATE INDEX IF NOT EXISTS idx_clips_order
@@ -532,6 +537,11 @@ migrate_schema() {
 	# background worker that does OCR, and simply absent until then.
 	if [ "$from" -lt 4 ]; then
 		add_column clips phash TEXT
+	fi
+	# v4 -> v5: the CLIP embedding blob. Nullable; only the opt-in embed add-on
+	# ever writes it, so it is simply absent on a stock install.
+	if [ "$from" -lt 5 ]; then
+		add_column clips clip_embed BLOB
 	fi
 }
 
@@ -1602,6 +1612,27 @@ cmd_similar() {
 		die "similar failed"
 }
 
+# semantic <query> [--limit K] [--min-score S]
+#
+# Natural-language image search: ranks images by how well their CLIP embedding
+# matches the query, so "a photo of a beach" finds beach pictures that carry no
+# text. Passes through to the opt-in clipbasket-embed add-on; a clear error
+# (not a crash) when that runtime is not installed.
+cmd_semantic() {
+	local query rc=0 out
+	query="${1:-}"
+	[ -n "$query" ] || die "semantic: expected a query"
+	shift
+	[ -x "$EMBED_CLI" ] || die "semantic search add-on is not installed (see docs/SEMANTIC.md)"
+	out=$("$EMBED_CLI" search "$query" "$@" 2>/dev/null) || rc=$?
+	case "$rc" in
+	0) ;;
+	3) die "semantic search add-on is not installed (see docs/SEMANTIC.md)" ;;
+	*) die "semantic search failed" ;;
+	esac
+	printf '%s\n' "$out"
+}
+
 cmd_info() {
 	local total fts
 	# `info` is the diagnostic, so it never reports a stale "no FTS5": it pays
@@ -1727,6 +1758,7 @@ cmd_selftest() {
 		check 'a v1 database has no html column' '0' "$(column_count html)"
 		check 'a v1 database has no ocr_text column' '0' "$(column_count ocr_text)"
 		check 'a v1 database has no phash column' '0' "$(column_count phash)"
+		check 'a v1 database has no clip_embed column' '0' "$(column_count clip_embed)"
 		check 'a v1 database reports user_version 1' '1' \
 			"$(printf 'PRAGMA user_version;\n' | run_raw)"
 
@@ -1735,6 +1767,7 @@ cmd_selftest() {
 		check 'migration adds html to the existing table' '1' "$(column_count html)"
 		check 'migration adds ocr_text to the existing table' '1' "$(column_count ocr_text)"
 		check 'migration adds phash to the existing table' '1' "$(column_count phash)"
+		check 'migration adds clip_embed to the existing table' '1' "$(column_count clip_embed)"
 		check 'migration stamps the new schema version' "$SCHEMA_VERSION" \
 			"$(printf 'PRAGMA user_version;\n' | run_raw)"
 		check 'migration keeps every existing row' '2' "$(run_sql 'SELECT count(*) FROM clips;')"
@@ -2056,6 +2089,17 @@ tab	here"
 	check_contains 'set-phash rejects a non-hex value' '"error"' "$out"
 	out=$(cmd_similar 999999)
 	check 'similar on a missing/hashless clip is []' '[]' "$out"
+
+	# --- semantic search passthrough (add-on forced absent) ---------------
+	# `|| true` sits OUTSIDE the $(): die exits, which bypasses an inner || and
+	# would trip set -e on the assignment.
+	local keep_embed="$EMBED_CLI"
+	EMBED_CLI="$SELFTEST_ROOT/no-embed"
+	out=$(cmd_semantic 'a beach' 2>&1) || true
+	check_contains 'semantic errors clearly when the add-on is absent' 'not installed' "$out"
+	out=$(cmd_semantic 2>&1) || true
+	check_contains 'semantic requires a query' 'expected a query' "$out"
+	EMBED_CLI="$keep_embed"
 
 	# --- error handling ---------------------------------------------------
 	out=$(cmd_get abc 2>/dev/null) || true
@@ -2484,6 +2528,8 @@ usage() {
 		  phash-pending [--limit N]  (image clips with no perceptual hash yet)
 		  similar <id> [--max-distance N] [--limit K]
 		                             (images visually close to this one)
+		  semantic <query> [--limit K] [--min-score S]
+		                             (natural-language image search; opt-in add-on)
 		  info
 		  selftest
 	TXT
@@ -2524,6 +2570,7 @@ main() {
 	set-phash) cmd_set_phash "$@" ;;
 	phash-pending) cmd_phash_pending "$@" ;;
 	similar) cmd_similar "$@" ;;
+	semantic) cmd_semantic "$@" ;;
 	info) cmd_info "$@" ;;
 	*) die "unknown subcommand: $subcommand" ;;
 	esac
