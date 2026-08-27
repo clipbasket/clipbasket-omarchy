@@ -116,6 +116,37 @@ recognise() {
 			END { if (started) printf "\n" }'
 }
 
+# Picks the single most content-bearing line of the recognised text as a
+# concise title, so a full-screen screenshot reads as its actual subject
+# instead of a dump of the status bar, clock, prices and icons. The winning
+# line is the one with the most real words (>=3 letters); ties go to the longer
+# line. Pure number/symbol/price/time tokens and lone letters are then stripped
+# and the result is capped. Empty when nothing qualifies, so a textless or
+# chrome-only screenshot keeps its "Image WxH" title rather than getting noise.
+core_title() {
+	awk '
+		{
+			line = $0
+			gsub(/\t/, " ", line); gsub(/^ +| +$/, "", line); gsub(/  +/, " ", line)
+			if (line == "") next
+			tmp = line; n = 0
+			while (match(tmp, /[A-Za-z][A-Za-z][A-Za-z]+/)) { n++; tmp = substr(tmp, RSTART + RLENGTH) }
+			if (n > bestn || (n == bestn && length(line) > length(best))) { bestn = n; best = line }
+		}
+		END {
+			if (bestn < 2) exit                       # nothing with real words
+			m = split(best, a, " "); out = ""; c = 0
+			for (i = 1; i <= m; i++) {
+				w = a[i]; t = w; nl = gsub(/[A-Za-z]/, "", t)
+				if (nl < 2) continue                  # drop numbers, prices, times, symbols
+				if (nl * 2 < length(w)) continue      # drop tokens that are mostly non-letters
+				out = out (c ? " " : "") w; c++
+				if (length(out) >= 60) break
+			}
+			print out
+		}'
+}
+
 # Turns recognised text into a short, filesystem-safe slug: lowercased, only
 # [a-z0-9], the first few meaningful words joined with hyphens. Empty when the
 # text has nothing usable, which is the caller's signal to leave the hash name.
@@ -176,16 +207,21 @@ ocr_one() {
 	[ -s "$tmp_img" ] || { log "image for $id is empty; skipping"; return 0; }
 
 	text=$(recognise "$tmp_img" || true)
+	# The full text is stored for search (so the image is still findable by any
+	# word in it), but the clip's title is just the core content line.
+	local title
+	title=$(printf '%s' "$text" | core_title)
 	# set-ocr bounds and scrubs the text and re-derives the FTS index. An empty
 	# result is still stored so the clip is marked done.
-	printf '%s' "$text" | "$DB_CLI" set-ocr "$id" >/dev/null ||
+	printf '%s' "$text" | "$DB_CLI" set-ocr "$id" --title "$title" >/dev/null ||
 		{ log "storing OCR for $id failed"; return 1; }
 
-	# Rename the stored file from its opaque hash to what the image shows, so
-	# the image is recognisable on disk, in the lightbox and anywhere the path
-	# surfaces. Best-effort: a failure here never undoes the searchable text.
+	# Name the stored file after the same core content that titles the clip, so
+	# a screenshot is recognisable on disk and in the lightbox. A screenshot with
+	# no core text keeps its hash name rather than getting a noisy one.
+	# Best-effort: a failure here never undoes the searchable text.
 	local slug
-	slug=$(slugify "$text")
+	slug=$(slugify "$title")
 	if [ -n "$slug" ]; then
 		"$DB_CLI" rename-image "$id" --slug "$slug" >/dev/null 2>&1 || true
 	fi
@@ -311,6 +347,15 @@ selftest() {
 	check 'slugify drops lone letters and caps the word count' 'invoice-acme-corp-total-99-now' \
 		"$(slugify 'A Invoice: ACME Corp total 99 x now please today')"
 	check 'slugify is empty when there is nothing usable' '' "$(slugify '!!! ... @@@')"
+
+	# core_title: pick the most content-bearing line, skip the status-bar noise.
+	out=$(printf '0012 3 4 n ZEC $792.88 0 & \xc2\xa9 3 19:30\nX For you\nWe recently identified unauthorised external access to records\n:56\n' | core_title)
+	check 'core_title picks the content line over the status bar' \
+		'We recently identified unauthorised external access to records' "$out"
+	out=$(printf 'ZEC $786.13 18:43\n0O & 3%%\nHey there it is too crazy not to do\n' | core_title)
+	check 'core_title drops prices, times and symbols' 'Hey there it is too crazy not to do' "$out"
+	out=$(printf 'Image 2976x1852\n@ 3 19:30\n0012\n' | core_title)
+	check 'core_title is empty for a chrome-only screenshot' '' "$out"
 
 	# require_tesseract exits 0 (never 1) when the binary is missing, so a box
 	# without tesseract degrades silently rather than erroring.

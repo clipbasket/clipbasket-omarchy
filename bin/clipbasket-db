@@ -1288,9 +1288,19 @@ cmd_markdown() {
 # again on every backfill. The payload is bounded and UTF-8 scrubbed exactly
 # like an inserted clip, because it too is produced by a tool we do not control.
 cmd_set_ocr() {
-	local id text_file q_text out
+	local id title='' text_file q_text q_title out
 	require_id "${1:-}"
 	id="$1"
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--title)
+			title="${2:-}"
+			shift 2
+			;;
+		*) die "set-ocr: unknown option $1" ;;
+		esac
+	done
 
 	out=$(run_sql "SELECT count(*) FROM clips WHERE id = $id;") || die "set-ocr failed"
 	[ "${out:-0}" = "1" ] || die "no clip with id $id"
@@ -1303,25 +1313,27 @@ cmd_set_ocr() {
 	scrub_utf8 "$text_file"
 	sql_quote "$text_file"
 	q_text="$REPLY_QUOTED"
+	# The concise core-content title the OCR worker picked. Already cleaned, but
+	# whitespace is flattened and it is capped defensively below.
+	sql_quote "$title"
+	q_title="$REPLY_QUOTED"
 
 	# searchable is recomputed from the clip's own columns plus the new reading,
 	# mirroring the expression cmd_insert builds. This is the authoritative
 	# rebuild whenever the OCR text changes.
-	# For an image, the recognised text also becomes the clip's `preview` — the
-	# one line the panel shows as its title — so a screenshot reads as what it
-	# shows ("ZEC $792.88 …") instead of "Image 3024x1964". The dimensions stay
-	# available in the detail view. An image with no readable text keeps its
-	# "Image WxH" preview. Whitespace is flattened to single spaces; the panel
-	# collapses any remaining runs at render time.
+	# For an image with a title, that core-content line becomes the clip's
+	# `preview` — the one line the panel shows — so a screenshot reads as its
+	# subject, not a dump of the status bar, clock and prices. The full text
+	# still goes into ocr_text/searchable, so search finds the image by any word
+	# in it. The dimensions stay in the detail view; an image with no core text
+	# (empty title) keeps its "Image WxH" preview.
 	run_sql "UPDATE clips SET
 	           ocr_text = COALESCE(CAST(readfile($q_text) AS TEXT), ''),
 	           preview = CASE
 	             WHEN kind = 'image' AND TRIM(replace(replace(replace(
-	                    COALESCE(CAST(readfile($q_text) AS TEXT), ''),
-	                    char(10), ' '), char(13), ' '), char(9), ' ')) <> ''
+	                    $q_title, char(10), ' '), char(13), ' '), char(9), ' ')) <> ''
 	             THEN substr(TRIM(replace(replace(replace(
-	                    COALESCE(CAST(readfile($q_text) AS TEXT), ''),
-	                    char(10), ' '), char(13), ' '), char(9), ' ')), 1, $PREVIEW_CHARS)
+	                    $q_title, char(10), ' '), char(13), ' '), char(9), ' ')), 1, $PREVIEW_CHARS)
 	             ELSE preview
 	           END,
 	           searchable = TRIM(
@@ -1813,7 +1825,7 @@ tab	here"
 	check_contains 'a fresh image clip is pending OCR' "\"id\":$ocr_id" "$out"
 	out=$(cmd_list --limit 50 --query 'kangaroo')
 	check 'before OCR the image is not found by an image word' '[]' "$out"
-	printf 'a leaping kangaroo diagram' | cmd_set_ocr "$ocr_id" >/dev/null
+	printf 'a leaping kangaroo diagram' | cmd_set_ocr "$ocr_id" --title 'a leaping kangaroo diagram' >/dev/null
 	out=$(cmd_list --limit 50 --query 'kangaroo')
 	check_contains 'after set-ocr the image is found by its recognised text' '"kind":"image"' "$out"
 	out=$(cmd_get "$ocr_id")
@@ -1834,8 +1846,21 @@ tab	here"
 		"$(run_sql "SELECT preview FROM clips WHERE id = $ocr_id;")"
 	out=$(cmd_ocr_pending)
 	check 'and an empty-OCR clip is not re-offered as pending' '[]' "$out"
+	# The title is the concise line the worker passes with --title; the full text
+	# on stdin still feeds search, so a word only in the body is still found while
+	# the title stays short.
+	printf 'quarterly earnings up 12 percent kangaroo' | cmd_set_ocr "$ocr_id" --title 'quarterly earnings' >/dev/null
+	check 'the title is the --title line, not the whole text' 'quarterly earnings' \
+		"$(run_sql "SELECT preview FROM clips WHERE id = $ocr_id;")"
+	out=$(cmd_list --limit 50 --query 'percent')
+	check_contains 'but a body-only word still finds the image' '"kind":"image"' "$out"
+	# set-ocr with no --title leaves the existing title untouched.
+	printf 'body words only here' | cmd_set_ocr "$ocr_id" >/dev/null
+	check 'set-ocr without --title does not change the title' 'quarterly earnings' \
+		"$(run_sql "SELECT preview FROM clips WHERE id = $ocr_id;")"
+
 	# A re-record of the same image keeps its recognised text indexed.
-	printf 'a leaping kangaroo diagram' | cmd_set_ocr "$ocr_id" >/dev/null
+	printf 'a leaping kangaroo diagram' | cmd_set_ocr "$ocr_id" --title 'a leaping kangaroo diagram' >/dev/null
 	run_sql "UPDATE clips SET created_at = 1 WHERE id = $ocr_id;" >/dev/null
 	printf '{"kind":"image","hash":"h-ocr","preview":"Image 800x600","image_path":"%s/h-ocr.png","image_width":800,"image_height":600,"mime":"image/png","source_app":"grim"}\n' \
 		"$IMAGE_DIR" | cmd_insert >/dev/null
