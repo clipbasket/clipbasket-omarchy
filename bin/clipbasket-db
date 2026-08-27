@@ -933,7 +933,15 @@ cmd_insert() {
 			WHERE (SELECT recent FROM d) = 0
 			ON CONFLICT(hash) DO UPDATE SET
 			  kind         = excluded.kind,
-			  preview      = excluded.preview,
+			  -- Keep the OCR-derived title when re-recording an image that has
+			  -- already been read: capture always offers a plain "Image WxH"
+			  -- preview, and letting it win here would wipe the content title
+			  -- (its recognised text) every time the same screenshot is re-copied or
+			  -- re-read off the clipboard on shell start. A not-yet-OCR'd image
+			  -- still takes the fresh preview, and OCR titles it shortly after.
+			  preview      = CASE
+			    WHEN clips.kind = 'image' AND clips.ocr_text IS NOT NULL AND clips.ocr_text <> ''
+			    THEN clips.preview ELSE excluded.preview END,
 			  text         = excluded.text,
 			  -- Not COALESCEd: the dedupe hash covers the plain text only, so
 			  -- a re-copy of the same text from a source that offers no HTML
@@ -1835,6 +1843,8 @@ tab	here"
 	check_contains 'a re-recorded image keeps its OCR words searchable' '"kind":"image"' "$out"
 	check 'and its ocr_text survives the re-record' 'a leaping kangaroo diagram' \
 		"$(run_sql "SELECT ocr_text FROM clips WHERE hash = 'h-ocr';")"
+	check 'and the re-record keeps the OCR title, not the plain Image WxH' 'a leaping kangaroo diagram' \
+		"$(run_sql "SELECT preview FROM clips WHERE hash = 'h-ocr';")"
 	out=$(cmd_set_ocr 999999 2>/dev/null) || true
 	check_contains 'set-ocr on a missing id is a JSON error' '"error"' "$out"
 
