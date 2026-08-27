@@ -33,6 +33,20 @@ Check it over afterwards with:
 | ![Lightbox](docs/screenshots/04-lightbox.png) | ![Settings](docs/screenshots/07-settings.png) |
 | *The lightbox* | *Settings that mean something on Wayland — and nothing that doesn't* |
 
+## Keyboard shortcuts
+
+While the basket panel is open:
+
+| Key | Action |
+|---|---|
+| Type anything | Search as you type |
+| `ALT + K` | Jump focus to the search bar and select the current query |
+| `↑` / `↓` | Move the selection |
+| `Enter` | Copy the selected clip |
+| `→` / `i` | Inspect the selected clip |
+| `Esc` | Close the panel |
+| `Tab` | Switch bar panels |
+
 ## Requirements
 
 Everything is in the Arch repositories; Omarchy already ships most of it.

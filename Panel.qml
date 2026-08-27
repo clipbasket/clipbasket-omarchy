@@ -1202,6 +1202,17 @@ Panel {
       }
       return false;
     }
+    // ALT+K jumps focus to the search field from anywhere in the panel and
+    // selects any existing query, so the user can immediately retype. Handled
+    // before the settings/detail guards so it works in every panel view, and
+    // guarded on Alt so it never eats a plain `k` typed into the search box.
+    if (event.key === Qt.Key_K && (event.modifiers & Qt.AltModifier)) {
+      if (root.settingsOpen) root.settingsOpen = false;
+      if (root.detailOpen) root.closeDetail();
+      searchInput.forceActiveFocus();
+      searchInput.selectAll();
+      return true;
+    }
     if (root.settingsOpen) return root.handleSettingsKey(event);
     if (root.detailOpen) return root.handleDetailKey(event);
     switch (event.key) {
