@@ -1851,6 +1851,33 @@ Panel {
                 }
               }
             }
+
+            // A quiet keycap hint that ALT+K jumps focus here. Only shown while
+            // the field is idle -- empty and unfocused -- so it never sits on
+            // top of a query or competes with the caret once the user is
+            // typing. handleNavKey owns the shortcut itself.
+            Rectangle {
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              visible: !searchInput.activeFocus && searchInput.text.length === 0
+              height: Style.space(18)
+              width: hintText.implicitWidth + Style.space(12)
+              radius: Style.space(4)
+              color: root.fg(0.06)
+              border.width: 1
+              border.color: root.fg(0.12)
+
+              Text {
+                id: hintText
+                anchors.centerIn: parent
+                text: "ALT + K"
+                color: root.barForeground
+                opacity: 0.45
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+            }
           }
 
           Row {
