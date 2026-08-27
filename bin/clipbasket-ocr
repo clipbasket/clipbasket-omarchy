@@ -166,23 +166,60 @@ slugify() {
 		sed -E 's/-+$//'
 }
 
-# OCR one image clip and store the result. Reads the clip's image_path from the
-# database, verifies it is a direct child of images/, streams the bytes out
-# through clipbasket-safefile, recognises them, and writes the text back through
-# clipbasket-db set-ocr. Storing even an empty result marks the clip done.
+# Computes a 64-bit perceptual hash (dHash) of an image: ImageMagick shrinks it
+# to a 9x8 grayscale, and each of the 8 rows contributes 8 bits comparing
+# adjacent pixels. Two visually similar images differ in only a few of those 64
+# bits, so Hamming distance ranks look-alikes and near-duplicates — including
+# photos that carry no text. Empty when ImageMagick is absent or the decode
+# fails, so the clip simply carries no hash.
+compute_phash() {
+	local mg=''
+	if command -v magick >/dev/null 2>&1; then mg=magick
+	elif command -v convert >/dev/null 2>&1; then mg=convert
+	else return 0; fi
+	"$mg" -limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10 \
+		"${1}[0]" -resize '9x8!' -colorspace Gray -depth 8 gray:- 2>/dev/null |
+		python3 -c '
+import sys
+d = sys.stdin.buffer.read()
+W, H = 9, 8
+if len(d) < W * H:
+    sys.exit(1)
+b = 0
+for y in range(H):
+    row = y * W
+    for x in range(W - 1):
+        b = (b << 1) | (1 if d[row + x] < d[row + x + 1] else 0)
+sys.stdout.write("%016x" % b)
+' 2>/dev/null || true
+}
+
+# Analyses one image clip: reads the recognised text (if tesseract is present
+# and it has none yet) and/or its perceptual hash (if ImageMagick is present and
+# it has none yet). Reads the image_path from the database, verifies it is a
+# direct child of images/, and streams the bytes out through clipbasket-safefile.
+# A missing/gone clip is a benign no-op, not an error.
 ocr_one() {
 	local id="$1" force="${2:-0}" clip image_path base tmp_img text rc
+	local have_tess=0 have_magick=0 need_ocr=0 need_phash=0
 	case "$id" in '' | *[!0-9]*) log "not a numeric id: $id"; return 1 ;; esac
 
-	clip=$("$DB_CLI" get "$id" 2>/dev/null) || { log "get $id failed"; return 1; }
-	[ -n "$clip" ] && [ "$clip" != "null" ] || { log "no clip with id $id"; return 1; }
+	clip=$("$DB_CLI" get "$id" 2>/dev/null) || return 0
+	[ -n "$clip" ] && [ "$clip" != "null" ] || return 0
 	case "$clip" in *'"kind":"image"'*) ;; *) return 0 ;; esac
 
-	# Already read? Skip unless forced. `"ocr_text":null` means never OCR'd; any
-	# other value (including "") means it has been, and re-reading wastes a core.
-	if [ "$force" != "1" ]; then
-		case "$clip" in *'"ocr_text":null'*) ;; *) return 0 ;; esac
+	command -v "$TESSERACT_BIN" >/dev/null 2>&1 && have_tess=1 || true
+	{ command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1; } && have_magick=1 || true
+
+	# `"ocr_text":null` / `"phash":null` mean the work was never done; any other
+	# value means it has been, and redoing it wastes a core. --force redoes both.
+	if [ "$have_tess" = 1 ]; then
+		if [ "$force" = 1 ]; then need_ocr=1; else case "$clip" in *'"ocr_text":null'*) need_ocr=1 ;; esac; fi
 	fi
+	if [ "$have_magick" = 1 ]; then
+		if [ "$force" = 1 ]; then need_phash=1; else case "$clip" in *'"phash":null'*) need_phash=1 ;; esac; fi
+	fi
+	[ "$need_ocr" = 1 ] || [ "$need_phash" = 1 ] || return 0
 
 	image_path=${clip#*\"image_path\":\"}
 	image_path=${image_path%%\"*}
@@ -206,37 +243,49 @@ ocr_one() {
 	esac
 	[ -s "$tmp_img" ] || { log "image for $id is empty; skipping"; return 0; }
 
-	text=$(recognise "$tmp_img" || true)
-	# The full text is stored for search (so the image is still findable by any
-	# word in it), but the clip's title is just the core content line.
-	local title
-	title=$(printf '%s' "$text" | core_title)
-	# set-ocr bounds and scrubs the text and re-derives the FTS index. An empty
-	# result is still stored so the clip is marked done.
-	printf '%s' "$text" | "$DB_CLI" set-ocr "$id" --title "$title" >/dev/null ||
-		{ log "storing OCR for $id failed"; return 1; }
+	if [ "$need_ocr" = 1 ]; then
+		text=$(recognise "$tmp_img" || true)
+		# The full text is stored for search (so the image is still findable by any
+		# word in it), but the clip's title is just the core content line.
+		local title
+		title=$(printf '%s' "$text" | core_title)
+		# set-ocr bounds and scrubs the text and re-derives the FTS index. An empty
+		# result is still stored so the clip is marked done.
+		printf '%s' "$text" | "$DB_CLI" set-ocr "$id" --title "$title" >/dev/null ||
+			{ log "storing OCR for $id failed"; return 1; }
 
-	# Name the stored file after the same core content that titles the clip, so
-	# a screenshot is recognisable on disk and in the lightbox. A screenshot with
-	# no core text keeps its hash name rather than getting a noisy one.
-	# Best-effort: a failure here never undoes the searchable text.
-	local slug
-	slug=$(slugify "$title")
-	if [ -n "$slug" ]; then
-		"$DB_CLI" rename-image "$id" --slug "$slug" >/dev/null 2>&1 || true
+		# Name the stored file after the same core content that titles the clip, so
+		# a screenshot is recognisable on disk and in the lightbox. A screenshot
+		# with no core text keeps its hash name rather than getting a noisy one.
+		# Best-effort: a failure here never undoes the searchable text.
+		local slug
+		slug=$(slugify "$title")
+		if [ -n "$slug" ]; then
+			"$DB_CLI" rename-image "$id" --slug "$slug" >/dev/null 2>&1 || true
+		fi
+	fi
+
+	if [ "$need_phash" = 1 ]; then
+		local hex
+		hex=$(compute_phash "$tmp_img")
+		if [ -n "$hex" ]; then
+			"$DB_CLI" set-phash "$id" "$hex" >/dev/null 2>&1 || true
+		fi
 	fi
 	return 0
 }
 
-# Backfill every image clip that has no recognised text yet.
+# Backfill every image clip still missing its recognised text or perceptual
+# hash. Both pending lists are unioned so one pass over the history handles
+# whichever piece each image lacks.
 ocr_all() {
-	local limit="${1:-1000}" pending ids id
-	pending=$("$DB_CLI" ocr-pending --limit "$limit" 2>/dev/null) || {
-		log "ocr-pending failed"
-		return 1
-	}
-	# Extract the ids without a JSON parser: one "id":N per array element.
-	ids=$(printf '%s' "$pending" | grep -o '"id":[0-9]*' | grep -o '[0-9]*') || true
+	local limit="${1:-1000}" ids id
+	ids=$(
+		{
+			"$DB_CLI" ocr-pending --limit "$limit" 2>/dev/null
+			"$DB_CLI" phash-pending --limit "$limit" 2>/dev/null
+		} | grep -o '"id":[0-9]*' | grep -o '[0-9]*' | sort -n -u
+	) || true
 	[ -n "$ids" ] || return 0
 	for id in $ids; do
 		ocr_one "$id" 0 || true
@@ -248,9 +297,14 @@ ocr_all() {
 # entry point (single-flight)
 # ---------------------------------------------------------------------------
 
-require_tesseract() {
+# The worker has something to do if it can read text (tesseract) or compute a
+# perceptual hash (ImageMagick). With neither it is a clean no-op, exactly like
+# the rest of the plugin degrades when an optional tool is absent.
+require_capability() {
 	command -v "$TESSERACT_BIN" >/dev/null 2>&1 && return 0
-	log "tesseract not installed; image text search is off"
+	command -v magick >/dev/null 2>&1 && return 0
+	command -v convert >/dev/null 2>&1 && return 0
+	log "neither tesseract nor ImageMagick installed; image analysis is off"
 	exit 0
 }
 
@@ -263,9 +317,9 @@ main() {
 		;;
 	esac
 
-	require_tesseract
+	require_capability
 
-	# Serialise workers: one tesseract at a time so a burst of copies queues
+	# Serialise workers: one at a time so a burst of copies queues
 	# behind a single process rather than fan-forking. Best-effort -- if the
 	# state dir or flock is unavailable we simply run without the lock.
 	local lock="$STATE_DIR/.ocr.lock"
@@ -366,8 +420,16 @@ selftest() {
 	# clip with a planted asset gets its recognised text stored and indexed.
 	local state="$root/state"
 	mkdir -p "$state/images"
-	# A tiny valid PNG (1x1) so safefile read yields bytes; the stub ignores it.
-	printf '\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\000\000\000\001\010\002\000\000\000\220wS\336\000\000\000\014IDATx\234c\370\317\300\360\037\000\005\005\002\000\015\012\333\337\000\000\000\000IEND\256B`\202' >"$state/images/deadbeef.png"
+	# An image so safefile read yields bytes; the stub tesseract ignores its
+	# content. A real one when ImageMagick is present so compute_phash has a
+	# clean 9x8 to work on; otherwise a tiny raw PNG (phash checks are skipped).
+	if command -v magick >/dev/null 2>&1; then
+		magick -size 16x16 gradient:black-white "$state/images/deadbeef.png" 2>/dev/null
+	elif command -v convert >/dev/null 2>&1; then
+		convert -size 16x16 gradient:black-white "$state/images/deadbeef.png" 2>/dev/null
+	else
+		printf '\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\000\000\000\001\010\002\000\000\000\220wS\336\000\000\000\014IDATx\234c\370\317\300\360\037\000\005\005\002\000\015\012\333\337\000\000\000\000IEND\256B`\202' >"$state/images/deadbeef.png"
+	fi
 	local chash="abc123def4560000000000000000000000000000000000000000000000000000"
 	out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" \
 		"$DB_CLI" insert <<-JSON
@@ -394,6 +456,19 @@ selftest() {
 		"$( [ -e "$state/images/deadbeef.png" ] && echo present || echo absent )"
 	out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" "$DB_CLI" get "$id")
 	check_contains 'and the row points at the renamed file' 'meeting-roadmap-abc123def456.png' "$out"
+
+	# Perceptual hash: computed from the same read when ImageMagick is present.
+	if command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1; then
+		out=$(compute_phash "$state/images/meeting-roadmap-abc123def456.png")
+		check 'compute_phash yields 16 hex chars' '16' "${#out}"
+		out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" "$DB_CLI" get "$id")
+		case "$out" in
+		*'"phash":"'[0-9a-f]*) pass=$((pass + 1)) ;;
+		*) fail=$((fail + 1)); printf 'FAIL: phash not stored for the image\n' >&2 ;;
+		esac
+		out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" "$DB_CLI" phash-pending)
+		check 'the image is no longer phash-pending' '[]' "$out"
+	fi
 
 	# image_path outside images/ is refused rather than read.
 	out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" \
