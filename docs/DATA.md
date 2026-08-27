@@ -44,6 +44,7 @@ with `CLIPBASKET_DB`.
 | `mime` | TEXT | the offer's MIME type, for images and file lists |
 | `size_bytes` | INTEGER | payload size for images |
 | `ocr_text` | TEXT | the text an optional OCR pass read out of an image; `NULL` until OCR runs, `''` once it ran and found nothing |
+| `phash` | TEXT | 64-bit perceptual hash (16 hex) of an image, for visual-similarity search; `NULL` until the background worker computes it |
 | `searchable` | TEXT | the concatenation search runs over |
 
 Search uses an FTS5 external-content table (`clips_fts`) kept in sync by three
@@ -62,6 +63,7 @@ reports it.
 | 1 | initial schema |
 | 2 | added `clips.html` |
 | 3 | added `clips.ocr_text` |
+| 4 | added `clips.phash` |
 
 Migrations are **additive and in place**. A user's history is already on disk,
 so no step may drop or rebuild the `clips` table. The sequence on every run is:
@@ -239,6 +241,27 @@ A JSON array of `{id, image_path}` for image clips that have never been OCR'd
 (`ocr_text IS NULL`, so a clip already read and found empty is not re-offered),
 newest first, default limit 1000: `[{"id":12,"image_path":"…/images/ab.png"}]`.
 The optional OCR worker uses it to backfill images that predate the feature.
+
+### `set-phash <id> <hex>`
+
+`{"ok":true}`. Stores the 64-bit perceptual hash (16 lowercase hex chars) the
+worker computed for an image, so `similar` can rank look-alikes. A non-hex value
+is rejected; a non-image id is a no-op.
+
+### `phash-pending [--limit N]`
+
+Like `ocr-pending`, but for image clips with no perceptual hash yet
+(`phash IS NULL`). The worker unions this with `ocr-pending` so one `--all`
+pass fills in whichever piece each image is missing.
+
+### `similar <id> [--max-distance N] [--limit K]`
+
+A JSON array of `{id, distance, kind, preview, thumb_path, image_path}` for the
+images visually closest to the given one, nearest first — Hamming distance
+between perceptual hashes, `distance <= N` (default 12 of 64 bits), at most `K`
+(default 20). This finds near-duplicates and look-alikes, **including photos
+with no text**, which OCR alone cannot. Empty when the clip is not an image or
+has no hash yet. The query image itself is never in the results.
 
 ### `rename-image <id> --slug <slug>`
 
@@ -479,6 +502,27 @@ The rules that matter:
 Measured on a CPU-only aarch64 box, a screenshot OCRs in roughly 0.3–1.1 s
 — comfortably a background job, with the 41 MB `eng` model already on disk.
 
+### Visual similarity (perceptual hash)
+
+OCR can only find images that contain text. To find images by their **visual**
+content — near-duplicates, re-encodings, and look-alike photos that carry no
+text — the same background worker also computes a **perceptual hash** (dHash):
+ImageMagick shrinks the image to a 9×8 grayscale, and each of the 8 rows
+contributes 8 bits comparing adjacent pixels, for a 64-bit fingerprint stored
+in `clips.phash`. Two visually similar images differ in only a few of those 64
+bits, so `clipbasket-db similar <id>` ranks candidates by Hamming distance.
+
+It is ImageMagick-if-present, exactly like OCR is tesseract-if-present: the
+worker runs when **either** tool is installed, does whichever piece each image
+lacks, and `--all` backfills both. Hashing a screenshot is a few milliseconds,
+so backfilling a whole history is seconds.
+
+This is the dependency-light realisation of the research plan's “Phase 2”
+(semantic image search). A full cross-modal model (CLIP/MobileCLIP via ONNX)
+would add natural-language *text→image* search of no-text photos, but its
+runtime is not in the Arch repos and would break “git clone and run”; a
+perceptual hash gives find-by-example visual similarity with no new dependency.
+
 ---
 
 ## Writing to predictable paths
@@ -611,10 +655,10 @@ exist and requiring the write to fail.
 
 ```
 bin/clipbasket-safefile --selftest #  35 cases, incl. planted-symlink rename refusals
-bin/clipbasket-db selftest        # 162 cases, incl. migration, OCR, rename-image, copy/GC regressions
+bin/clipbasket-db selftest        # 179 cases, incl. migration, OCR, rename-image, phash/similar, GC regressions
 bin/clipbasket-html2md --selftest #  65 cases, one per supported element
 bin/clipbasket-capture --selftest #  69 cases, against stubbed producers and ImageMagick
-bin/clipbasket-ocr --selftest     #  15 cases, against a stubbed tesseract and a real db
+bin/clipbasket-ocr --selftest     #  21 cases, against a stubbed tesseract, ImageMagick and a real db
 bin/clipbasket-omarchy selftest   #  33 cases, against a sandboxed bindings.lua
 ```
 
