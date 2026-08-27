@@ -61,6 +61,7 @@ Everything is in the Arch repositories; Omarchy already ships most of it.
 | `imagemagick` | Image thumbnails; without it the full image is shown | no |
 | `wtype` | Types a picked clip straight into the focused window (the on-by-default "paste immediately" setting) | no |
 | `pandoc` | Used for HTML → Markdown when present; the built-in converter is the fallback | no |
+| `tesseract` (+ `tesseract-data-eng`) | Reads text out of copied images so a screenshot is searchable by what it shows; without it image text search is simply off | no |
 
 Nothing is downloaded, compiled, or run as root at any point.
 

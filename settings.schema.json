@@ -11,7 +11,7 @@
     "databasePath": "~/.local/state/clipbasket/clips.db",
     "groups": [
       { "id": "general",  "title": "General",  "properties": ["globalShortcut"] },
-      { "id": "history",  "title": "History",  "properties": ["maxClips", "ignoreConfidentialCopies"] },
+      { "id": "history",  "title": "History",  "properties": ["maxClips", "ignoreConfidentialCopies", "ocrImages"] },
       { "id": "behavior", "title": "Behavior", "properties": ["closePanelAfterAction", "pasteSelectedClipImmediately"] }
     ],
     "notInThisPort": [
@@ -89,6 +89,19 @@
         "group": "history",
         "help": "On Wayland this means skipping offers carrying the x-kde-passwordManagerHint MIME type, and copies made while CLIPBOARD_STATE=sensitive. Defaults on: a privacy default should never need to be discovered.",
         "wayland": ["x-kde-passwordManagerHint", "CLIPBOARD_STATE=sensitive"]
+      }
+    },
+
+    "ocrImages": {
+      "type": "boolean",
+      "default": true,
+      "title": "Search text inside images",
+      "description": "Read the text out of a copied image so a screenshot is findable by what it shows, not just by its size. Runs entirely on your machine, in the background, after the image is saved.",
+      "x-clipbasket": {
+        "group": "history",
+        "requiresBinaries": ["tesseract"],
+        "help": "On by default, but the feature is a no-op unless the `tesseract` OCR engine is installed (pacman -S tesseract tesseract-data-eng) — exactly like pandoc for Copy as Markdown, it is used-if-present and never installed on your behalf. OCR runs off the capture hot path, at low priority and one image at a time, and honours the confidential-copy skip. Reaches capture as CLIPBASKET_OCR. The panel should present it as unavailable, not merely off, when tesseract is missing.",
+        "unavailableLabel": "Install tesseract to search text inside images"
       }
     },
 
