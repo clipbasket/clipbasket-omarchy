@@ -226,7 +226,11 @@ exactly like an inserted clip, because it too is produced by a tool the plugin
 does not control. Empty input is stored as `''` rather than `NULL`: that marks
 the clip "OCR done, nothing found" so `ocr-pending` does not hand it out again.
 A re-record of the same image keeps `ocr_text` (the insert payload never carries
-it) and folds it back into `searchable`. Errors in the CLI's usual shape:
+it) and folds it back into `searchable`. For an image, the recognised text also
+becomes the clip's `preview` — the one line the panel shows as the clip's title
+— so a screenshot reads as what it shows (`ZEC $792.88 …`) instead of `Image
+3024x1964`; the dimensions stay in the detail view, and an image with no
+readable text keeps its `Image WxH` title. Errors in the CLI's usual shape:
 `{"ok":false,"error":"no clip with id 12"}`.
 
 ### `ocr-pending [--limit N]`

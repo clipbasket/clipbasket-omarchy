@@ -1299,8 +1299,23 @@ cmd_set_ocr() {
 	# searchable is recomputed from the clip's own columns plus the new reading,
 	# mirroring the expression cmd_insert builds. This is the authoritative
 	# rebuild whenever the OCR text changes.
+	# For an image, the recognised text also becomes the clip's `preview` — the
+	# one line the panel shows as its title — so a screenshot reads as what it
+	# shows ("ZEC $792.88 …") instead of "Image 3024x1964". The dimensions stay
+	# available in the detail view. An image with no readable text keeps its
+	# "Image WxH" preview. Whitespace is flattened to single spaces; the panel
+	# collapses any remaining runs at render time.
 	run_sql "UPDATE clips SET
 	           ocr_text = COALESCE(CAST(readfile($q_text) AS TEXT), ''),
+	           preview = CASE
+	             WHEN kind = 'image' AND TRIM(replace(replace(replace(
+	                    COALESCE(CAST(readfile($q_text) AS TEXT), ''),
+	                    char(10), ' '), char(13), ' '), char(9), ' ')) <> ''
+	             THEN substr(TRIM(replace(replace(replace(
+	                    COALESCE(CAST(readfile($q_text) AS TEXT), ''),
+	                    char(10), ' '), char(13), ' '), char(9), ' ')), 1, $PREVIEW_CHARS)
+	             ELSE preview
+	           END,
 	           searchable = TRIM(
 	             COALESCE(text, '') || ' ' || preview || ' ' ||
 	             COALESCE(source_app, '') || ' ' || COALESCE(url_domain, '') || ' ' ||
@@ -1795,7 +1810,11 @@ tab	here"
 	check_contains 'after set-ocr the image is found by its recognised text' '"kind":"image"' "$out"
 	out=$(cmd_get "$ocr_id")
 	check_contains 'get returns the ocr_text' '"ocr_text":"a leaping kangaroo diagram"' "$out"
+	# The recognised text becomes the image's title (preview), replacing "Image WxH".
+	check 'set-ocr retitles the image to its recognised text' 'a leaping kangaroo diagram' \
+		"$(run_sql "SELECT preview FROM clips WHERE id = $ocr_id;")"
 	out=$(cmd_list --limit 50 --query 'kangaroo')
+	check_contains 'the new title shows in a listing' '"preview":"a leaping kangaroo diagram"' "$out"
 	check_contains 'list never leaks ocr_text' '' "${out##*ocr_text}"
 	case "$out" in *ocr_text*) fail=$((fail + 1)); printf 'FAIL: list leaked ocr_text\n' >&2 ;; *) pass=$((pass + 1)) ;; esac
 	out=$(cmd_ocr_pending)
@@ -1803,6 +1822,8 @@ tab	here"
 	printf '' | cmd_set_ocr "$ocr_id" >/dev/null
 	check 'an empty OCR result still marks the clip done' '' \
 		"$(run_sql "SELECT ocr_text FROM clips WHERE id = $ocr_id;")"
+	check 'and an empty re-read keeps the existing title, not a blank one' 'a leaping kangaroo diagram' \
+		"$(run_sql "SELECT preview FROM clips WHERE id = $ocr_id;")"
 	out=$(cmd_ocr_pending)
 	check 'and an empty-OCR clip is not re-offered as pending' '[]' "$out"
 	# A re-record of the same image keeps its recognised text indexed.
