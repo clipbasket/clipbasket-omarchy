@@ -64,6 +64,13 @@ OCR_ENABLED="${CLIPBASKET_OCR:-1}"
 OCR_CLI="${CLIPBASKET_OCR_CLI:-$SCRIPT_DIR/clipbasket-ocr}"
 TESSERACT_BIN="${CLIPBASKET_TESSERACT:-tesseract}"
 
+# Optional CLIP semantic-search indexing. Off unless the opt-in embed add-on is
+# installed (a Python with fastembed at the venv path below, or
+# CLIPBASKET_EMBED_PYTHON). Like OCR, it runs detached and never blocks capture.
+EMBED_ENABLED="${CLIPBASKET_EMBED:-1}"
+EMBED_CLI="${CLIPBASKET_EMBED_CLI:-$SCRIPT_DIR/clipbasket-embed}"
+EMBED_PYTHON="${CLIPBASKET_EMBED_PYTHON:-${XDG_DATA_HOME:-$HOME/.local/share}/clipbasket/clip-venv/bin/python}"
+
 WL_PASTE_BIN="${CLIPBASKET_WL_PASTE:-wl-paste}"
 
 TMPFILES=()
@@ -925,6 +932,24 @@ capture_image() {
 	# The image and its row now exist on disk; read the text out of it in the
 	# background so it becomes searchable by content. Never on the hot path.
 	maybe_ocr_image "$LAST_INSERT_ID" "$LAST_INSERT_DEDUPED"
+	maybe_embed_image "$LAST_INSERT_ID" "$LAST_INSERT_DEDUPED"
+	return 0
+}
+
+# Hands a freshly recorded image to the opt-in CLIP indexer so it becomes
+# findable by a natural-language query. A no-op unless the add-on is installed
+# (its Python with fastembed exists); detached and low-priority so it never
+# delays capture. Serialised by a lock inside clipbasket-embed.
+maybe_embed_image() {
+	local id="$1" deduped="${2:-0}"
+	[ "$EMBED_ENABLED" = "1" ] || return 0
+	[ "$deduped" = "1" ] && return 0
+	case "$id" in '' | *[!0-9]*) return 0 ;; esac
+	[ -z "${SELFTEST_ROOT:-}" ] || return 0
+	[ -x "$EMBED_CLI" ] || return 0
+	[ -x "$EMBED_PYTHON" ] || return 0
+	setsid nice -n 19 "$EMBED_CLI" index --id "$id" >/dev/null 2>&1 &
+	disown 2>/dev/null || true
 	return 0
 }
 
