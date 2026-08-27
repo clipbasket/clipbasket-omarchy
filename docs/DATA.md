@@ -645,7 +645,7 @@ the image's **file bytes** on `--type image/png` rather than its preview string.
 | `CLIPBASKET_OCR` | 1 (`0` disables handing images to OCR; no-op anyway without tesseract) |
 | `CLIPBASKET_MAX_OCR_BYTES` | 65536 |
 | `CLIPBASKET_OCR_LANGS` | `eng` (tesseract `-l`, e.g. `eng+deu`) |
-| `CLIPBASKET_OCR_PSM` | 6 (assume a uniform block of text) |
+| `CLIPBASKET_OCR_PSM` | 3 (automatic page segmentation; screenshots are scattered UI text) |
 | `CLIPBASKET_OCR_CONF_MIN` | 55 (drop words below this confidence) |
 | `CLIPBASKET_OCR_TIMEOUT` | 25 (wall-clock seconds per image) |
 | `CLIPBASKET_OCR_MAX_DIM` | 2600 (downscale a larger image's long edge first) |

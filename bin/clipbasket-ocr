@@ -44,7 +44,9 @@ TESSERACT_BIN="${CLIPBASKET_TESSERACT:-tesseract}"
 # Recognition tuning. Every one is overridable, but the defaults are chosen for
 # clipboard screenshots: crisp, high-contrast, mostly Latin UI text.
 OCR_LANGS="${CLIPBASKET_OCR_LANGS:-eng}"
-OCR_PSM="${CLIPBASKET_OCR_PSM:-6}"           # assume a uniform block of text
+OCR_PSM="${CLIPBASKET_OCR_PSM:-3}"           # automatic page segmentation; a
+                                             # screenshot is scattered UI text,
+                                             # not one uniform block (psm 6)
 OCR_CONF_MIN="${CLIPBASKET_OCR_CONF_MIN:-55}" # drop words tesseract is unsure of
 OCR_TIMEOUT="${CLIPBASKET_OCR_TIMEOUT:-25}"   # wall-clock seconds per image
 OCR_MAX_DIM="${CLIPBASKET_OCR_MAX_DIM:-2600}" # downscale a bigger image first
