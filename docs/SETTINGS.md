@@ -40,6 +40,7 @@ downgrading never destroys a newer install's settings.
   "globalShortcut": "",
   "ignoreConfidentialCopies": true,
   "maxClips": 1000,
+  "ocrImages": true,
   "pasteSelectedClipImmediately": false
 }
 ```
@@ -104,6 +105,22 @@ On Wayland that means skipping clipboard offers carrying the
 manager do not land in your history.
 
 Defaults on. A privacy default should never need to be discovered.
+
+### `ocrImages` — boolean, default `true`
+
+Search text inside images. When a copied image is recorded, its text is read out
+in the background so a screenshot becomes findable by what it shows — not just by
+its size.
+
+This runs entirely on your machine and needs the `tesseract` OCR engine
+(`pacman -S tesseract tesseract-data-eng`). Exactly like `pandoc` for **Copy as
+Markdown**, it is used only if it is already installed and is never installed on
+your behalf; with `tesseract` absent the setting is simply inert. OCR runs off
+the capture hot path, at low priority and one image at a time, honours the
+confidential-copy skip above, and reaches capture as `CLIPBASKET_OCR`. The panel
+should present it as unavailable, not merely off, when `tesseract` is missing.
+
+Defaults on. `clipbasket-omarchy doctor` reports whether OCR is available.
 
 ## Behavior
 

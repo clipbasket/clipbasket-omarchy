@@ -368,6 +368,9 @@ Panel {
       hasHtml: clip.has_html === true,
       sourceApp: String(clip.source_app || ""),
       sizeBytes: root.num(clip.size_bytes, 0),
+      // Only `get` carries ocr_text; in a listing it is absent and this is "".
+      // The detail view surfaces it for images the OCR pass has read.
+      ocrText: String(clip.ocr_text || ""),
       createdAt: root.createdMs(clip)
     };
   }
@@ -1021,6 +1024,7 @@ Panel {
   readonly property int detailImageW: root.detailRow ? root.detailRow.imageWidth : 0
   readonly property int detailImageH: root.detailRow ? root.detailRow.imageHeight : 0
   readonly property string detailSourceApp: root.detailRow ? root.detailRow.sourceApp : ""
+  readonly property string detailOcrText: root.detailRow ? root.detailRow.ocrText : ""
   readonly property string detailWhen: root.detailRow ? root.formatAbsolute(root.detailRow.createdAt) : ""
   readonly property bool detailHasMarkdown: root.supportsMarkdown(root.detailRow)
 
@@ -2775,6 +2779,10 @@ Panel {
 
             DetailField { label: "Dimensions"; value: root.detailDimensions }
             DetailField { label: "Type"; value: root.detailMime }
+            // Only present on an image the OCR pass has read; DetailField hides
+            // itself when the value is empty, so it never shows for text, files
+            // or an image that carries no recognised text.
+            DetailField { label: "Recognised text"; value: root.detailOcrText }
 
             // ---- always present
             DetailField { label: "Source app"; value: root.detailSourceApp }

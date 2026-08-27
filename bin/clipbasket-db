@@ -24,7 +24,14 @@
 set -euo pipefail
 
 # 1 -> 2 added clips.html, the text/html clipboard flavour a web copy carries.
-SCHEMA_VERSION=2
+# 2 -> 3 added clips.ocr_text, the text an optional OCR pass reads out of an
+#        image so a screenshot becomes searchable by what it actually shows.
+SCHEMA_VERSION=3
+
+# The recognised-text payload is bounded before it reaches SQLite, exactly like
+# every other producer read: a hostile or enormous image must not be able to
+# push an unbounded string into the database through the OCR path.
+MAX_OCR_BYTES="${CLIPBASKET_MAX_OCR_BYTES:-65536}"
 APP_NAME=Clipbasket
 
 STATE_DIR="${CLIPBASKET_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/clipbasket}"
@@ -362,6 +369,7 @@ base_schema() {
 		  files_json   TEXT,
 		  mime         TEXT,
 		  size_bytes   INTEGER,
+		  ocr_text     TEXT,
 		  searchable   TEXT    NOT NULL DEFAULT ''
 		);
 		CREATE INDEX IF NOT EXISTS idx_clips_order
@@ -443,15 +451,19 @@ build_projections() {
 	                         THEN json(c.files_json) ELSE json('null') END,
 	  'mime',           c.mime,
 	  'size_bytes',     c.size_bytes,
-	  'has_html',       json($has_html_expr)%HTML%
+	  'has_html',       json($has_html_expr)%HTML%%OCR%
 	)"
 
+	# `list` omits both the html payload and the ocr_text: a listing stays small
+	# and the panel asks `get` for either when the user opens a clip.
 	CLIP_JSON_LIST=${template/\%TEXT\%/$text_expr}
 	CLIP_JSON_LIST=${CLIP_JSON_LIST/\%TRUNCATED\%/$truncated_expr}
 	CLIP_JSON_LIST=${CLIP_JSON_LIST/\%HTML\%/}
+	CLIP_JSON_LIST=${CLIP_JSON_LIST/\%OCR\%/}
 	CLIP_JSON_FULL=${template/\%TEXT\%/c.text}
 	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%TRUNCATED\%/\'false\'}
 	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%HTML\%/,$'\n'"	  'html',           c.html"}
+	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%OCR\%/,$'\n'"	  'ocr_text',       c.ocr_text"}
 }
 
 # Adds a column to an existing table, once. Checking pragma_table_info rather
@@ -491,6 +503,12 @@ migrate_schema() {
 	# row is valid as it stands and simply reports has_html:false.
 	if [ "$from" -lt 2 ]; then
 		add_column clips html TEXT
+	fi
+	# v2 -> v3: the OCR reading of an image. Nullable, so every existing image
+	# row is valid as it stands and simply carries no recognised text until the
+	# optional OCR pass (or `ocr --all` backfill) fills it in.
+	if [ "$from" -lt 3 ]; then
+		add_column clips ocr_text TEXT
 	fi
 }
 
@@ -919,7 +937,12 @@ cmd_insert() {
 			  file_count   = excluded.file_count,
 			  mime         = COALESCE(excluded.mime, clips.mime),
 			  size_bytes   = COALESCE(excluded.size_bytes, clips.size_bytes),
-			  searchable   = excluded.searchable;
+			  -- ocr_text is deliberately not overwritten: the insert payload never
+			  -- carries it (OCR runs after the row exists), so a re-record keeps the
+			  -- reading already made. It is folded back into searchable here so the
+			  -- recomputed index does not lose the recognised words until the next
+			  -- OCR pass.
+			  searchable   = TRIM(excluded.searchable || ' ' || COALESCE(clips.ocr_text, ''));
 
 			SELECT json_object(
 			  'id',      (SELECT id FROM clips WHERE hash = (SELECT hash FROM p)),
@@ -1234,6 +1257,74 @@ cmd_markdown() {
 	printf '%s\n' "$out"
 }
 
+# set-ocr <id>  (recognised text on stdin)
+#
+# Stores the OCR reading of an image clip and re-derives `searchable` so the
+# recognised words are indexed by FTS5 (the AFTER UPDATE OF searchable trigger
+# reindexes automatically). Empty input is stored as '' rather than NULL: that
+# marks the clip "OCR done, nothing found" so `ocr-pending` does not hand it out
+# again on every backfill. The payload is bounded and UTF-8 scrubbed exactly
+# like an inserted clip, because it too is produced by a tool we do not control.
+cmd_set_ocr() {
+	local id text_file q_text out
+	require_id "${1:-}"
+	id="$1"
+
+	out=$(run_sql "SELECT count(*) FROM clips WHERE id = $id;") || die "set-ocr failed"
+	[ "${out:-0}" = "1" ] || die "no clip with id $id"
+
+	mktempfile
+	text_file="$REPLY_TMPFILE"
+	# head -c bounds a hostile or runaway OCR producer at ingest, before the
+	# whole stream is buffered, and sends it SIGPIPE when the cap is reached.
+	head -c "$MAX_OCR_BYTES" >"$text_file" || true
+	scrub_utf8 "$text_file"
+	sql_quote "$text_file"
+	q_text="$REPLY_QUOTED"
+
+	# searchable is recomputed from the clip's own columns plus the new reading,
+	# mirroring the expression cmd_insert builds. This is the authoritative
+	# rebuild whenever the OCR text changes.
+	run_sql "UPDATE clips SET
+	           ocr_text = COALESCE(CAST(readfile($q_text) AS TEXT), ''),
+	           searchable = TRIM(
+	             COALESCE(text, '') || ' ' || preview || ' ' ||
+	             COALESCE(source_app, '') || ' ' || COALESCE(url_domain, '') || ' ' ||
+	             COALESCE(url_title, '') || ' ' || COALESCE(mime, '') || ' ' ||
+	             CASE WHEN kind = 'image'
+	                  THEN 'image ' || COALESCE(image_width, '') || ' ' || COALESCE(image_height, '')
+	                  ELSE '' END || ' ' ||
+	             COALESCE(replace(replace(replace(files_json, '\"', ' '), '{', ' '), '}', ' '), '') || ' ' ||
+	             COALESCE(CAST(readfile($q_text) AS TEXT), '')
+	           )
+	         WHERE id = $id;" >/dev/null || die "set-ocr failed"
+	printf '{"ok":true}\n'
+}
+
+# ocr-pending [--limit N]
+#
+# A JSON array of {id, image_path} for image clips that have never been OCR'd
+# (ocr_text IS NULL, so a clip already read and found empty is not re-offered).
+# The optional OCR worker uses it to backfill images that predate the feature.
+cmd_ocr_pending() {
+	local limit=1000 out
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--limit)
+			require_count "${2:-}"
+			limit="$2"
+			shift 2
+			;;
+		*) die "ocr-pending: unknown option $1" ;;
+		esac
+	done
+	out=$(run_sql "SELECT COALESCE(json_group_array(json_object('id', id, 'image_path', image_path)), '[]')
+	               FROM (SELECT id, image_path FROM clips
+	                     WHERE kind = 'image' AND ocr_text IS NULL AND image_path IS NOT NULL
+	                     ORDER BY created_at DESC LIMIT $limit);") || die "ocr-pending failed"
+	printf '%s\n' "${out:-[]}"
+}
+
 cmd_info() {
 	local total fts
 	# `info` is the diagnostic, so it never reports a stale "no FTS5": it pays
@@ -1357,12 +1448,14 @@ cmd_selftest() {
 			       ('url',  'example.com', 'https://example.com/', 'h-legacy-url', 1700000001, 0, 'example.com');
 		SQL
 		check 'a v1 database has no html column' '0' "$(column_count html)"
+		check 'a v1 database has no ocr_text column' '0' "$(column_count ocr_text)"
 		check 'a v1 database reports user_version 1' '1' \
 			"$(printf 'PRAGMA user_version;\n' | run_raw)"
 
 		ensure_schema
 
 		check 'migration adds html to the existing table' '1' "$(column_count html)"
+		check 'migration adds ocr_text to the existing table' '1' "$(column_count ocr_text)"
 		check 'migration stamps the new schema version' "$SCHEMA_VERSION" \
 			"$(printf 'PRAGMA user_version;\n' | run_raw)"
 		check 'migration keeps every existing row' '2' "$(run_sql 'SELECT count(*) FROM clips;')"
@@ -1567,7 +1660,43 @@ tab	here"
 	check 'suppress writes a token' '{"ok":true}' "$out"
 	check 'suppress token is readable by the watcher' 'deadbeef' "$(cat "$SUPPRESS_FILE")"
 	out=$(cmd_info)
-	check_contains 'info reports the schema version' '"schema_version":2' "$out"
+	check_contains 'info reports the schema version' "\"schema_version\":$SCHEMA_VERSION" "$out"
+
+	# --- OCR: content-aware image search ----------------------------------
+	printf '{"kind":"image","hash":"h-ocr","preview":"Image 800x600","image_path":"%s/h-ocr.png","image_width":800,"image_height":600,"mime":"image/png","source_app":"grim"}\n' \
+		"$IMAGE_DIR" | cmd_insert >/dev/null
+	local ocr_id
+	ocr_id=$(run_sql "SELECT id FROM clips WHERE hash = 'h-ocr';")
+	out=$(cmd_ocr_pending)
+	check_contains 'a fresh image clip is pending OCR' "\"id\":$ocr_id" "$out"
+	out=$(cmd_list --limit 50 --query 'kangaroo')
+	check 'before OCR the image is not found by an image word' '[]' "$out"
+	printf 'a leaping kangaroo diagram' | cmd_set_ocr "$ocr_id" >/dev/null
+	out=$(cmd_list --limit 50 --query 'kangaroo')
+	check_contains 'after set-ocr the image is found by its recognised text' '"kind":"image"' "$out"
+	out=$(cmd_get "$ocr_id")
+	check_contains 'get returns the ocr_text' '"ocr_text":"a leaping kangaroo diagram"' "$out"
+	out=$(cmd_list --limit 50 --query 'kangaroo')
+	check_contains 'list never leaks ocr_text' '' "${out##*ocr_text}"
+	case "$out" in *ocr_text*) fail=$((fail + 1)); printf 'FAIL: list leaked ocr_text\n' >&2 ;; *) pass=$((pass + 1)) ;; esac
+	out=$(cmd_ocr_pending)
+	check 'an OCR-processed clip is no longer pending' '[]' "$out"
+	printf '' | cmd_set_ocr "$ocr_id" >/dev/null
+	check 'an empty OCR result still marks the clip done' '' \
+		"$(run_sql "SELECT ocr_text FROM clips WHERE id = $ocr_id;")"
+	out=$(cmd_ocr_pending)
+	check 'and an empty-OCR clip is not re-offered as pending' '[]' "$out"
+	# A re-record of the same image keeps its recognised text indexed.
+	printf 'a leaping kangaroo diagram' | cmd_set_ocr "$ocr_id" >/dev/null
+	run_sql "UPDATE clips SET created_at = 1 WHERE id = $ocr_id;" >/dev/null
+	printf '{"kind":"image","hash":"h-ocr","preview":"Image 800x600","image_path":"%s/h-ocr.png","image_width":800,"image_height":600,"mime":"image/png","source_app":"grim"}\n' \
+		"$IMAGE_DIR" | cmd_insert >/dev/null
+	out=$(cmd_list --limit 50 --query 'kangaroo')
+	check_contains 'a re-recorded image keeps its OCR words searchable' '"kind":"image"' "$out"
+	check 'and its ocr_text survives the re-record' 'a leaping kangaroo diagram' \
+		"$(run_sql "SELECT ocr_text FROM clips WHERE hash = 'h-ocr';")"
+	out=$(cmd_set_ocr 999999 2>/dev/null) || true
+	check_contains 'set-ocr on a missing id is a JSON error' '"error"' "$out"
 
 	# --- error handling ---------------------------------------------------
 	out=$(cmd_get abc 2>/dev/null) || true
@@ -1989,6 +2118,8 @@ usage() {
 		  copy   <id>                (extension: re-copy via wl-copy)
 		  touch  <id>                (extension: bump to top)
 		  suppress <hash>            (extension: arm self-capture suppression)
+		  set-ocr <id>               (store an image's recognised text; text on stdin)
+		  ocr-pending [--limit N]    (image clips still awaiting OCR)
 		  info
 		  selftest
 	TXT
@@ -2023,6 +2154,8 @@ main() {
 	copy) cmd_copy "$@" ;;
 	touch) cmd_touch "$@" ;;
 	suppress) cmd_suppress "$@" ;;
+	set-ocr) cmd_set_ocr "$@" ;;
+	ocr-pending) cmd_ocr_pending "$@" ;;
 	info) cmd_info "$@" ;;
 	*) die "unknown subcommand: $subcommand" ;;
 	esac

@@ -43,6 +43,7 @@ with `CLIPBASKET_DB`.
 | `files_json` | TEXT | JSON array of `{path, name, extension, is_directory}` |
 | `mime` | TEXT | the offer's MIME type, for images and file lists |
 | `size_bytes` | INTEGER | payload size for images |
+| `ocr_text` | TEXT | the text an optional OCR pass read out of an image; `NULL` until OCR runs, `''` once it ran and found nothing |
 | `searchable` | TEXT | the concatenation search runs over |
 
 Search uses an FTS5 external-content table (`clips_fts`) kept in sync by three
@@ -60,6 +61,7 @@ reports it.
 | --- | --- |
 | 1 | initial schema |
 | 2 | added `clips.html` |
+| 3 | added `clips.ocr_text` |
 
 Migrations are **additive and in place**. A user's history is already on disk,
 so no step may drop or rebuild the `clips` table. The sequence on every run is:
@@ -124,10 +126,13 @@ The same object with the full `text`, `text_truncated` always `false`, and one
 extra field:
 
 ```json
-{ "…": "…", "has_html": true, "html": "<h1>Wikipedia</h1>…" }
+{ "…": "…", "has_html": true, "html": "<h1>Wikipedia</h1>…", "ocr_text": "Meeting moved to 3pm" }
 ```
 
-`null` for an id that does not exist.
+`ocr_text` is `null` on an image that has not been OCR'd (or on any non-image),
+and the recognised text otherwise. Like `html`, it is **never** returned by
+`list` — a listing stays small and the panel asks `get` for it when the user
+opens the clip. `null` for an id that does not exist.
 
 ### `markdown <id> [--base-url URL]`
 
@@ -210,6 +215,26 @@ a legal escape and decodes to a newline inside a file name, which a
 line-delimited list splits into two bogus paths and miscounts. The same applies
 to `delete`'s doomed-asset list, which comes out of SQLite hex-encoded for the
 same reason.
+
+### `set-ocr <id>` (recognised text on stdin)
+
+`{"ok":true}`. Stores an image clip's OCR reading in `ocr_text` and re-derives
+`searchable` from the clip's own columns plus that reading, so the FTS index
+(via the `AFTER UPDATE OF searchable` trigger) now finds the image by the words
+inside it. The text is bounded at `CLIPBASKET_MAX_OCR_BYTES` and UTF-8 scrubbed
+exactly like an inserted clip, because it too is produced by a tool the plugin
+does not control. Empty input is stored as `''` rather than `NULL`: that marks
+the clip "OCR done, nothing found" so `ocr-pending` does not hand it out again.
+A re-record of the same image keeps `ocr_text` (the insert payload never carries
+it) and folds it back into `searchable`. Errors in the CLI's usual shape:
+`{"ok":false,"error":"no clip with id 12"}`.
+
+### `ocr-pending [--limit N]`
+
+A JSON array of `{id, image_path}` for image clips that have never been OCR'd
+(`ocr_text IS NULL`, so a clip already read and found empty is not re-offered),
+newest first, default limit 1000: `[{"id":12,"image_path":"…/images/ab.png"}]`.
+The optional OCR worker uses it to backfill images that predate the feature.
 
 ### Others
 
@@ -378,6 +403,58 @@ lose content.
 
 ---
 
+## Content-aware image search (OCR)
+
+Without this, an image's whole searchable surface is `Image 1600x900 <app>
+image/png` — nothing about what the picture shows, so a copied screenshot of an
+error, a receipt or a chat cannot be found by any word visible in it.
+`bin/clipbasket-ocr` closes that: it reads the text out of a stored image and
+hands it to `clipbasket-db set-ocr`, which folds it into `searchable`.
+
+```
+clipbasket-ocr <id>               # OCR one image clip
+clipbasket-ocr --all [--limit N]  # backfill every image clip with no OCR yet
+clipbasket-ocr --selftest         # against a stubbed tesseract, no model needed
+```
+
+It is built like `clipbasket-html2md`: **`tesseract` is used only if it is
+already installed** (and ImageMagick, when present, downscales and grayscales
+the image first for a cleaner, faster read), and the whole feature is a clean
+no-op otherwise — nothing is installed on the user's behalf, nothing leaves the
+machine. `pacman -S tesseract tesseract-data-eng` turns it on; `clipbasket-omarchy
+doctor` reports whether it is present and for which languages.
+
+The rules that matter:
+
+* **Off the hot path.** `clipbasket-capture` records the image clip first, then
+  forks `clipbasket-ocr` **detached and `nice`d**, so recognising text never
+  delays the next clipboard event. An OCR crash, timeout, or missing binary
+  cannot affect capture latency or lose a clip.
+* **Bounded compute.** A wall-clock `timeout` (`CLIPBASKET_OCR_TIMEOUT`) plus
+  the same ImageMagick decoder envelope the rest of the plugin uses (memory 256
+  MiB, map 256 MiB, area 64 MP, time 10 s) plus a downscale to
+  `CLIPBASKET_OCR_MAX_DIM` on the long edge mean a hostile or enormous image
+  cannot pin a core.
+* **One at a time.** A `flock` in the state directory serialises workers, so a
+  burst of copies queues behind a single `tesseract` rather than fan-forking.
+* **Descriptor-bound reads.** The image bytes are streamed out of `images/`
+  through `clipbasket-safefile` (`O_NOFOLLOW`, `fstat` regular-and-owned),
+  never by handing a pathname to `tesseract`; only a direct child of `images/`
+  is accepted, so a planted symlink or an `images/../secret` value yields no
+  bytes. The recognised text is then bounded and UTF-8 scrubbed by
+  `clipbasket-db set-ocr` before it reaches SQLite.
+* **Confidential offers are never OCR'd.** They are dropped before any
+  `capture_*` runs, so an image that reaches OCR is one already stored; the
+  worker also honours the `CLIPBASKET_OCR` toggle the service passes through.
+* **Low-confidence words are dropped.** `tesseract` runs in `tsv` mode and
+  words below `CLIPBASKET_OCR_CONF_MIN` are discarded, so the stored text is
+  the words it was reasonably sure of, reassembled into readable lines.
+
+Measured on a CPU-only aarch64 box, a screenshot OCRs in roughly 0.3–1.1 s
+— comfortably a background job, with the 41 MB `eng` model already on disk.
+
+---
+
 ## Writing to predictable paths
 
 Everything above lives at a path anyone can guess: `~/.local/state/clipbasket`
@@ -507,9 +584,10 @@ exist and requiring the write to fail.
 ## Testing
 
 ```
-bin/clipbasket-db selftest        # 138 cases, incl. migration, copy/GC exploit regressions
-bin/clipbasket-html2md --selftest #  66 cases, one per supported element
+bin/clipbasket-db selftest        # 152 cases, incl. migration, OCR, copy/GC exploit regressions
+bin/clipbasket-html2md --selftest #  65 cases, one per supported element
 bin/clipbasket-capture --selftest #  69 cases, against stubbed producers and ImageMagick
+bin/clipbasket-ocr --selftest     #   9 cases, against a stubbed tesseract and a real db
 bin/clipbasket-omarchy selftest   #  33 cases, against a sandboxed bindings.lua
 ```
 
@@ -541,4 +619,12 @@ the image's **file bytes** on `--type image/png` rather than its preview string.
 | `CLIPBASKET_MAX_IMAGE_DIMENSION` | 16384 |
 | `CLIPBASKET_MAX_CLIPS` | 1000 |
 | `CLIPBASKET_IGNORE_CONFIDENTIAL` | 1 (`0` records confidential offers) |
+| `CLIPBASKET_OCR` | 1 (`0` disables handing images to OCR; no-op anyway without tesseract) |
+| `CLIPBASKET_MAX_OCR_BYTES` | 65536 |
+| `CLIPBASKET_OCR_LANGS` | `eng` (tesseract `-l`, e.g. `eng+deu`) |
+| `CLIPBASKET_OCR_PSM` | 6 (assume a uniform block of text) |
+| `CLIPBASKET_OCR_CONF_MIN` | 55 (drop words below this confidence) |
+| `CLIPBASKET_OCR_TIMEOUT` | 25 (wall-clock seconds per image) |
+| `CLIPBASKET_OCR_MAX_DIM` | 2600 (downscale a larger image's long edge first) |
+| `CLIPBASKET_TESSERACT` | `tesseract` |
 | `CLIPBASKET_WL_PASTE` | `wl-paste` |
