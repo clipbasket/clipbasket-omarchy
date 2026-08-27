@@ -106,14 +106,14 @@
 
     "pasteSelectedClipImmediately": {
       "type": "boolean",
-      "default": false,
+      "default": true,
       "title": "Paste immediately",
-      "description": "After picking a clip, paste it into the focused window instead of only copying it.",
+      "description": "After picking a clip (click or Enter), paste it straight into the focused window instead of only copying it. Text and links are typed in directly, so it works in every app regardless of that app's paste shortcut (a terminal's Ctrl+Shift+V included) and never sends Ctrl+V; images and file lists fall back to a synthetic Ctrl+V.",
       "x-clipbasket": {
         "group": "behavior",
         "requires": { "closePanelAfterAction": true },
         "requiresBinaries": ["wtype"],
-        "help": "Wayland has no system-wide synthetic-input API, so this shells out to wtype (or ydotool with a running daemon). The panel should present it as unavailable, not merely off, when neither is installed.",
+        "help": "On by default. Wayland has no system-wide synthetic-input API, so this shells out to wtype (or ydotool with a running daemon); it is normalised off wherever wtype is missing or the popup is kept open, so the default degrades to a plain copy rather than a broken paste. The panel should present it as unavailable, not merely off, when neither binary is installed.",
         "unavailableLabel": "Install wtype to enable automatic paste"
       }
     }

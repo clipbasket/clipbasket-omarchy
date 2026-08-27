@@ -40,7 +40,7 @@ downgrading never destroys a newer install's settings.
   "globalShortcut": "",
   "ignoreConfidentialCopies": true,
   "maxClips": 1000,
-  "pasteSelectedClipImmediately": false
+  "pasteSelectedClipImmediately": true
 }
 ```
 
@@ -119,15 +119,24 @@ by an older build.
 Turning this off disables auto-paste, which cannot work while the panel still
 holds keyboard focus.
 
-### `pasteSelectedClipImmediately` — boolean, default `false`
+### `pasteSelectedClipImmediately` — boolean, default `true`
 
-After picking a clip, paste it into the focused window rather than only copying
-it.
+After picking a clip — clicking it, or selecting it and pressing `Enter` — paste
+it straight into the window you were working in, rather than only copying it.
+You no longer have to reach for `SUPER + V` or `CTRL + V` afterwards.
+
+Text and links are **typed** directly into the focused window with `wtype -`
+(reading the clip off the clipboard on stdin), so the paste lands in every app
+regardless of the key that app binds paste to — a terminal that pastes on
+`CTRL + SHIFT + V` gets the text just the same, and `CTRL + V` is never sent.
+Images and file lists cannot be typed, so those fall back to a synthetic
+`CTRL + V`, the only way to hand a non-text selection to the window.
 
 Wayland has no system-wide synthetic-input API, so this shells out to
 [`wtype`](https://github.com/atx/wtype) (or `ydotool` with its daemon running).
 If neither is installed the setting is unavailable, not merely off — the panel
-should say so rather than silently doing nothing.
+should say so rather than silently doing nothing, and the default degrades to a
+plain copy instead of a broken paste.
 
 Requires `closePanelAfterAction` to be on. This constraint is ported verbatim
 from the macOS app: pasting while the panel still has focus pastes into the
@@ -142,7 +151,7 @@ a warning on; the macOS app shows one because it owns a window that is still
 there. Reporting it properly needs a desktop notification, which would mean a
 new dependency for one error path, so it is deliberately not done rather than
 overlooked. The clip is still on the clipboard in every case — a failed
-auto-paste costs a Ctrl+V, not the copy.
+auto-paste costs a manual paste, not the copy.
 
 ## Settings that are not here
 

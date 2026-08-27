@@ -42,7 +42,8 @@ While the basket panel is open:
 | Type anything | Search as you type |
 | `ALT + K` | Jump focus to the search bar and select the current query |
 | `↑` / `↓` | Move the selection |
-| `Enter` | Copy the selected clip |
+| `Enter` | Paste the selected clip straight into the focused window (copies only if `wtype` is missing) |
+| `Click` | Same as `Enter` — pastes the clicked clip directly, no `SUPER + V` / `CTRL + V` needed |
 | `→` / `i` | Inspect the selected clip |
 | `Esc` | Close the panel |
 | `Tab` | Switch bar panels |
@@ -58,7 +59,7 @@ Everything is in the Arch repositories; Omarchy already ships most of it.
 | `jq` | JSON in and out of the shell scripts | yes |
 | `python` | HTML → Markdown conversion (standard library only) | yes |
 | `imagemagick` | Image thumbnails; without it the full image is shown | no |
-| `wtype` | The optional "paste immediately after picking" setting | no |
+| `wtype` | Types a picked clip straight into the focused window (the on-by-default "paste immediately" setting) | no |
 | `pandoc` | Used for HTML → Markdown when present; the built-in converter is the fallback | no |
 
 Nothing is downloaded, compiled, or run as root at any point.
