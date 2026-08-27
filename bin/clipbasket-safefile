@@ -24,6 +24,7 @@ adds a file, not a requirement. Standard library only, for the same reason.
     clipbasket-safefile ensure-dir <path> [--mode 700]
     clipbasket-safefile write <dir> <name> [--mode 600] [--max-bytes N]
     clipbasket-safefile read <dir> <name>                 # file -> stdout
+    clipbasket-safefile rename <dir> <oldname> <newname>  # within one verified dir
     clipbasket-safefile unlink <dir> <name>
     clipbasket-safefile --selftest
 
@@ -396,6 +397,53 @@ def cmd_read(dirpath, name):
         os.close(dfd)
 
 
+def cmd_rename(dirpath, oldname, newname):
+    """Rename one regular file to another name inside a single verified dir.
+
+    Both names are resolved relative to the same O_NOFOLLOW-verified directory
+    descriptor, so nothing that happens to the pathname afterwards can redirect
+    the rename. The source must be a regular file we own -- a planted symlink
+    is refused rather than moved -- and a symlink sitting at the destination is
+    refused loudly; the renameat itself replaces the destination atomically and
+    relative to the descriptor, never following it.
+    """
+    _check_name(oldname)
+    _check_name(newname)
+    if oldname == newname:
+        return EXIT_OK
+    try:
+        dfd = open_dir(dirpath, create=False)
+    except Missing:
+        return EXIT_MISSING
+
+    try:
+        try:
+            fd = os.open(oldname, OPEN_FILE_FLAGS, dir_fd=dfd)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                return EXIT_MISSING
+            if exc.errno == errno.ELOOP:
+                raise Refused("%s/%s is a symlink; refusing to rename it" % (dirpath, oldname))
+            raise Failed("cannot open %s/%s: %s" % (dirpath, oldname, exc.strerror))
+        try:
+            _fstat_file(fd, "%s/%s" % (dirpath, oldname))
+        finally:
+            os.close(fd)
+
+        # A symlink or a file we do not own at the destination is refused, the
+        # same rule write applies; an ordinary owned file there is replaced.
+        _refuse_if_dest_unsafe(dfd, newname, dirpath)
+
+        os.rename(oldname, newname, src_dir_fd=dfd, dst_dir_fd=dfd)
+        try:
+            os.fsync(dfd)
+        except OSError:
+            pass
+        return EXIT_OK
+    finally:
+        os.close(dfd)
+
+
 def cmd_unlink(dirpath, name):
     _check_name(name)
     try:
@@ -603,6 +651,50 @@ def _selftest():
               and not os.path.lexists(os.path.join(target, "planted"))
               and open(victim, "rb").read() == b"original")
 
+        # rename moves a regular file to a new name in the same dir
+        with open(os.path.join(target, "hash.png"), "wb") as fh:
+            fh.write(b"img")
+        rc, _, err = run(["rename", target, "hash.png", "meeting-3pm-abc.png"])
+        check("rename moves a regular file",
+              rc == 0
+              and not os.path.exists(os.path.join(target, "hash.png"))
+              and open(os.path.join(target, "meeting-3pm-abc.png"), "rb").read() == b"img",
+              "rc=%d %s" % (rc, err.decode().strip()))
+
+        # rename is EXIT_MISSING when the source is gone
+        rc, _, _ = run(["rename", target, "nope.png", "whatever.png"])
+        check("rename of an absent source is EXIT_MISSING", rc == EXIT_MISSING)
+
+        # rename refuses a symlinked source and does not move it
+        os.symlink(victim, os.path.join(target, "srclink"))
+        rc, _, _ = run(["rename", target, "srclink", "moved"])
+        check("rename refuses a symlinked source",
+              rc == EXIT_REFUSED
+              and os.path.lexists(os.path.join(target, "srclink"))
+              and not os.path.exists(os.path.join(target, "moved")))
+        os.unlink(os.path.join(target, "srclink"))
+
+        # rename refuses a symlinked destination without following it
+        with open(os.path.join(target, "realimg.png"), "wb") as fh:
+            fh.write(b"real")
+        os.symlink(victim, os.path.join(target, "destlink"))
+        rc, _, _ = run(["rename", target, "realimg.png", "destlink"])
+        check("rename refuses a symlinked destination",
+              rc == EXIT_REFUSED and open(victim, "rb").read() == b"original"
+              and os.path.exists(os.path.join(target, "realimg.png")))
+        os.unlink(os.path.join(target, "destlink"))
+
+        # rename replaces an ordinary owned file at the destination
+        with open(os.path.join(target, "stale.png"), "wb") as fh:
+            fh.write(b"stale")
+        rc, _, _ = run(["rename", target, "realimg.png", "stale.png"])
+        check("rename replaces an ordinary destination file",
+              rc == 0 and open(os.path.join(target, "stale.png"), "rb").read() == b"real")
+
+        # rename refuses a name with a separator
+        rc, _, _ = run(["rename", target, "stale.png", "../escape.png"])
+        check("rename refuses a name with a separator", rc == EXIT_ERROR)
+
         # 18: unlink refuses a directory
         os.mkdir(os.path.join(target, "adir"))
         rc, _, _ = run(["unlink", target, "adir"])
@@ -649,6 +741,7 @@ USAGE = """usage:
   clipbasket-safefile ensure-dir <path> [--mode 700]
   clipbasket-safefile write <dir> <name> [--mode 600] [--max-bytes N]
   clipbasket-safefile read <dir> <name>                  # file -> stdout
+  clipbasket-safefile rename <dir> <oldname> <newname>
   clipbasket-safefile unlink <dir> <name>
   clipbasket-safefile --selftest
 """
@@ -718,6 +811,10 @@ def main(argv):
             if len(args) != 2:
                 raise Failed("read takes a directory and a name")
             return cmd_read(args[0], args[1])
+        if command == "rename":
+            if len(args) != 3:
+                raise Failed("rename takes a directory, an old name and a new name")
+            return cmd_rename(args[0], args[1], args[2])
         if command == "unlink":
             if len(args) != 2:
                 raise Failed("unlink takes a directory and a name")
