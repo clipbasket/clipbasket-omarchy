@@ -26,7 +26,10 @@ set -euo pipefail
 # 1 -> 2 added clips.html, the text/html clipboard flavour a web copy carries.
 # 2 -> 3 added clips.ocr_text, the text an optional OCR pass reads out of an
 #        image so a screenshot becomes searchable by what it actually shows.
-SCHEMA_VERSION=3
+# 3 -> 4 added clips.phash, a 64-bit perceptual hash of an image so visually
+#        similar and near-duplicate images can be found — including photos with
+#        no text for OCR to read.
+SCHEMA_VERSION=4
 
 # The recognised-text payload is bounded before it reaches SQLite, exactly like
 # every other producer read: a hostile or enormous image must not be able to
@@ -384,6 +387,7 @@ base_schema() {
 		  mime         TEXT,
 		  size_bytes   INTEGER,
 		  ocr_text     TEXT,
+		  phash        TEXT,
 		  searchable   TEXT    NOT NULL DEFAULT ''
 		);
 		CREATE INDEX IF NOT EXISTS idx_clips_order
@@ -477,7 +481,7 @@ build_projections() {
 	CLIP_JSON_FULL=${template/\%TEXT\%/c.text}
 	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%TRUNCATED\%/\'false\'}
 	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%HTML\%/,$'\n'"	  'html',           c.html"}
-	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%OCR\%/,$'\n'"	  'ocr_text',       c.ocr_text"}
+	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%OCR\%/,$'\n'"	  'ocr_text',       c.ocr_text,"$'\n'"	  'phash',          c.phash"}
 }
 
 # Adds a column to an existing table, once. Checking pragma_table_info rather
@@ -523,6 +527,11 @@ migrate_schema() {
 	# optional OCR pass (or `ocr --all` backfill) fills it in.
 	if [ "$from" -lt 3 ]; then
 		add_column clips ocr_text TEXT
+	fi
+	# v3 -> v4: the perceptual hash of an image. Nullable; filled in by the same
+	# background worker that does OCR, and simply absent until then.
+	if [ "$from" -lt 4 ]; then
+		add_column clips phash TEXT
 	fi
 }
 
@@ -1479,6 +1488,120 @@ cmd_rename_image() {
 		"$([ "$did" = 1 ] && printf true || printf false)" "$(json_string "$new_image_path")"
 }
 
+# set-phash <id> <hex>
+#
+# Stores the 64-bit perceptual hash (16 lowercase hex chars) the worker
+# computed for an image, so `similar` can find visually close images. A no-op
+# for a non-image clip.
+cmd_set_phash() {
+	local id hex
+	require_id "${1:-}"
+	id="$1"
+	hex="${2:-}"
+	case "$hex" in
+	[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+	*) die "set-phash: expected 16 lowercase hex chars, got: ${hex:-<missing>}" ;;
+	esac
+	run_sql "UPDATE clips SET phash = '$hex' WHERE id = $id AND kind = 'image';" >/dev/null ||
+		die "set-phash failed"
+	printf '{"ok":true}\n'
+}
+
+# phash-pending [--limit N]
+#
+# A JSON array of {id, image_path} for image clips that have no perceptual hash
+# yet, newest first. The worker uses it to backfill images that predate the
+# feature, alongside `ocr-pending`.
+cmd_phash_pending() {
+	local limit=1000 out
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--limit)
+			require_count "${2:-}"
+			limit="$2"
+			shift 2
+			;;
+		*) die "phash-pending: unknown option $1" ;;
+		esac
+	done
+	out=$(run_sql "SELECT COALESCE(json_group_array(json_object('id', id, 'image_path', image_path)), '[]')
+	               FROM (SELECT id, image_path FROM clips
+	                     WHERE kind = 'image' AND phash IS NULL AND image_path IS NOT NULL
+	                     ORDER BY created_at DESC LIMIT $limit);") || die "phash-pending failed"
+	printf '%s\n' "${out:-[]}"
+}
+
+# similar <id> [--max-distance N] [--limit K]
+#
+# Finds images visually close to the given one by Hamming distance between
+# their perceptual hashes: a JSON array of {id, distance, kind, preview,
+# thumb_path, image_path}, nearest first, distance <= N (default 12 of 64
+# bits), at most K results (default 20). This finds near-duplicates and
+# look-alikes — including photos with no text — which OCR alone cannot. Empty
+# when the clip is not an image or has no hash yet.
+cmd_similar() {
+	local id maxd=12 limit=20 target rows ranked values
+	require_id "${1:-}"
+	id="$1"
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--max-distance)
+			require_count "${2:-}"
+			maxd="$2"
+			shift 2
+			;;
+		--limit)
+			require_count "${2:-}"
+			limit="$2"
+			shift 2
+			;;
+		*) die "similar: unknown option $1" ;;
+		esac
+	done
+
+	target=$(run_sql "SELECT COALESCE(phash, '') FROM clips WHERE id = $id AND kind = 'image';") ||
+		die "similar failed"
+	[ -n "$target" ] || { printf '[]\n'; return 0; }
+
+	rows=$(run_sql "SELECT id || ' ' || phash FROM clips
+	                WHERE kind = 'image' AND phash IS NOT NULL AND id <> $id;") || die "similar failed"
+	[ -n "$rows" ] || { printf '[]\n'; return 0; }
+
+	# Hamming distance over the 16 hex nibbles: xor each nibble and add its
+	# popcount. gawk has the bitwise xor; the popcount table is 16 entries.
+	ranked=$(printf '%s\n' "$rows" | gawk -v t="$target" -v maxd="$maxd" '
+		BEGIN {
+			for (i = 0; i < 16; i++) { c = 0; v = i; while (v) { c += v % 2; v = int(v / 2) } pc[i] = c }
+			split("0 1 2 3 4 5 6 7 8 9 a b c d e f", hx, " ")
+			for (i = 1; i <= 16; i++) hv[hx[i]] = i - 1
+			n = length(t)
+		}
+		{
+			if (length($2) != n) next
+			d = 0
+			for (i = 1; i <= n; i++) d += pc[xor(hv[substr(t, i, 1)], hv[substr($2, i, 1)])]
+			if (d <= maxd) print d, $1
+		}' | sort -n -k1,1 -k2,2 | head -n "$limit")
+	[ -n "$ranked" ] || { printf '[]\n'; return 0; }
+
+	# Turn the ranked "distance id" lines into a VALUES list joined back to the
+	# clips, so the caller gets rich objects, nearest first.
+	values=''
+	while read -r dist rid; do
+		[ -n "$rid" ] || continue
+		values="${values:+$values,}($rid,$dist)"
+	done <<<"$ranked"
+	[ -n "$values" ] || { printf '[]\n'; return 0; }
+
+	run_sql "WITH d(id, dist) AS (VALUES $values)
+	         SELECT COALESCE(json_group_array(json_object(
+	           'id', c.id, 'distance', j.dist, 'kind', c.kind, 'preview', c.preview,
+	           'thumb_path', c.thumb_path, 'image_path', c.image_path)), '[]')
+	         FROM (SELECT id, dist FROM d ORDER BY dist, id) j JOIN clips c ON c.id = j.id;" ||
+		die "similar failed"
+}
+
 cmd_info() {
 	local total fts
 	# `info` is the diagnostic, so it never reports a stale "no FTS5": it pays
@@ -1603,6 +1726,7 @@ cmd_selftest() {
 		SQL
 		check 'a v1 database has no html column' '0' "$(column_count html)"
 		check 'a v1 database has no ocr_text column' '0' "$(column_count ocr_text)"
+		check 'a v1 database has no phash column' '0' "$(column_count phash)"
 		check 'a v1 database reports user_version 1' '1' \
 			"$(printf 'PRAGMA user_version;\n' | run_raw)"
 
@@ -1610,6 +1734,7 @@ cmd_selftest() {
 
 		check 'migration adds html to the existing table' '1' "$(column_count html)"
 		check 'migration adds ocr_text to the existing table' '1' "$(column_count ocr_text)"
+		check 'migration adds phash to the existing table' '1' "$(column_count phash)"
 		check 'migration stamps the new schema version' "$SCHEMA_VERSION" \
 			"$(printf 'PRAGMA user_version;\n' | run_raw)"
 		check 'migration keeps every existing row' '2' "$(run_sql 'SELECT count(*) FROM clips;')"
@@ -1905,6 +2030,32 @@ tab	here"
 		"$( [ -e "$THUMB_DIR/quarterly-report-final-feed00112233.png" ] && echo present || echo absent )"
 	out=$(cmd_rename_image 999999 --slug 'x' 2>/dev/null) || true
 	check_contains 'rename-image on a non-image/missing id is a clean no-op' '"renamed":false' "$out"
+
+	# --- perceptual hash + similar-image search ---------------------------
+	local ph_a ph_b ph_c
+	printf '{"kind":"image","hash":"ph-a","preview":"Image","image_path":"%s/pa.png","mime":"image/png"}\n' "$IMAGE_DIR" | cmd_insert >/dev/null
+	printf '{"kind":"image","hash":"ph-b","preview":"Image","image_path":"%s/pb.png","mime":"image/png"}\n' "$IMAGE_DIR" | cmd_insert >/dev/null
+	printf '{"kind":"image","hash":"ph-c","preview":"Image","image_path":"%s/pc.png","mime":"image/png"}\n' "$IMAGE_DIR" | cmd_insert >/dev/null
+	ph_a=$(run_sql "SELECT id FROM clips WHERE hash='ph-a';")
+	ph_b=$(run_sql "SELECT id FROM clips WHERE hash='ph-b';")
+	ph_c=$(run_sql "SELECT id FROM clips WHERE hash='ph-c';")
+	out=$(cmd_phash_pending)
+	check_contains 'a fresh image is pending a perceptual hash' "\"id\":$ph_a" "$out"
+	cmd_set_phash "$ph_a" ffff0000ffff0000 >/dev/null
+	cmd_set_phash "$ph_b" ffff0000ffff0011 >/dev/null   # 2 bits from a
+	cmd_set_phash "$ph_c" 0000ffff0000ffff >/dev/null   # far from a
+	out=$(cmd_phash_pending)
+	case "$out" in *"\"id\":$ph_a"*) fail=$((fail + 1)); printf 'FAIL: hashed image still phash-pending\n' >&2 ;; *) pass=$((pass + 1)) ;; esac
+	out=$(cmd_similar "$ph_a")
+	check_contains 'similar finds the near-duplicate' "\"id\":$ph_b,\"distance\":2" "$out"
+	case "$out" in *"\"id\":$ph_c"*) fail=$((fail + 1)); printf 'FAIL: similar returned the far image\n' >&2 ;; *) pass=$((pass + 1)) ;; esac
+	case "$out" in *"\"id\":$ph_a"*) fail=$((fail + 1)); printf 'FAIL: similar returned the query image itself\n' >&2 ;; *) pass=$((pass + 1)) ;; esac
+	out=$(cmd_similar "$ph_a" --max-distance 64)
+	check_contains 'a wide distance reaches the far image too' "\"id\":$ph_c" "$out"
+	out=$(cmd_set_phash "$ph_a" nothex 2>/dev/null) || true
+	check_contains 'set-phash rejects a non-hex value' '"error"' "$out"
+	out=$(cmd_similar 999999)
+	check 'similar on a missing/hashless clip is []' '[]' "$out"
 
 	# --- error handling ---------------------------------------------------
 	out=$(cmd_get abc 2>/dev/null) || true
@@ -2329,6 +2480,10 @@ usage() {
 		  set-ocr <id>               (store an image's recognised text; text on stdin)
 		  ocr-pending [--limit N]    (image clips still awaiting OCR)
 		  rename-image <id> --slug S (rename an image's file to a readable name)
+		  set-phash <id> <hex>       (store an image's 64-bit perceptual hash)
+		  phash-pending [--limit N]  (image clips with no perceptual hash yet)
+		  similar <id> [--max-distance N] [--limit K]
+		                             (images visually close to this one)
 		  info
 		  selftest
 	TXT
@@ -2366,6 +2521,9 @@ main() {
 	set-ocr) cmd_set_ocr "$@" ;;
 	ocr-pending) cmd_ocr_pending "$@" ;;
 	rename-image) cmd_rename_image "$@" ;;
+	set-phash) cmd_set_phash "$@" ;;
+	phash-pending) cmd_phash_pending "$@" ;;
+	similar) cmd_similar "$@" ;;
 	info) cmd_info "$@" ;;
 	*) die "unknown subcommand: $subcommand" ;;
 	esac
