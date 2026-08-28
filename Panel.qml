@@ -488,9 +488,6 @@ Panel {
       searchDebounce.stop();
       root.suspendReloads = false;
       root.refresh();
-      // Focus after the panel window has actually been mapped; forcing it in
-      // the same tick as `opened` lands before the surface exists.
-      Qt.callLater(function () { searchInput.forceActiveFocus(); searchInput.selectAll(); });
     } else {
       root.settingsOpen = false;
       root.resetDetail();
@@ -1665,7 +1662,7 @@ Panel {
     bar: root.bar
     open: root.opened
     centerOnBar: false
-    focusTarget: keyCatcher
+    focusTarget: !root.settingsOpen && !root.detailOpen ? searchInput : keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(400))
     contentHeight: panel.fittedContentHeight(Math.min(Style.space(600),
       root.settingsOpen ? settingsColumn.implicitHeight
