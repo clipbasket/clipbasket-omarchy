@@ -36,6 +36,7 @@ downgrading never destroys a newer install's settings.
 
 ```json
 {
+  "captionImages": false,
   "closePanelAfterAction": true,
   "globalShortcut": "",
   "ignoreConfidentialCopies": true,
@@ -122,6 +123,26 @@ confidential-copy skip above, and reaches capture as `CLIPBASKET_OCR`. The panel
 should present it as unavailable, not merely off, when `tesseract` is missing.
 
 Defaults on. `clipbasket-omarchy doctor` reports whether OCR is available.
+
+### `captionImages` — boolean, default `false`
+
+Describe images that have no text. When a copied photo is recorded, it is
+described in a short sentence ("A large white screen with a picture of a
+person") so an image OCR found no words in still gets a readable title and is
+findable by what it depicts.
+
+Off by default: this is the heaviest add-on, and screenshots — the common case —
+are already covered by `ocrImages`. It needs the optional caption Python
+(`transformers` + `optimum[onnxruntime]` + `torch`, see
+[SEMANTIC.md](SEMANTIC.md)) and is inert without it. Captioning runs off the
+capture hot path, at low priority and one image at a time, honours the
+confidential-copy skip, and reaches capture as `CLIPBASKET_CAPTION`.
+
+A caption only becomes the title while the title is still the plain
+`Image WxH` placeholder; recognised OCR text always wins, because words actually
+in the image are more specific. Backfill existing images with
+`bin/clipbasket-caption caption`, and check the add-on with
+`bin/clipbasket-caption status` or `clipbasket-omarchy doctor`.
 
 ## Behavior
 

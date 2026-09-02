@@ -11,7 +11,7 @@
     "databasePath": "~/.local/state/clipbasket/clips.db",
     "groups": [
       { "id": "general",  "title": "General",  "properties": ["globalShortcut"] },
-      { "id": "history",  "title": "History",  "properties": ["maxClips", "ignoreConfidentialCopies", "ocrImages"] },
+      { "id": "history",  "title": "History",  "properties": ["maxClips", "ignoreConfidentialCopies", "ocrImages", "captionImages"] },
       { "id": "behavior", "title": "Behavior", "properties": ["closePanelAfterAction", "pasteSelectedClipImmediately"] }
     ],
     "notInThisPort": [
@@ -102,6 +102,19 @@
         "requiresBinaries": ["tesseract"],
         "help": "On by default, but the feature is a no-op unless the `tesseract` OCR engine is installed (pacman -S tesseract tesseract-data-eng) — exactly like pandoc for Copy as Markdown, it is used-if-present and never installed on your behalf. OCR runs off the capture hot path, at low priority and one image at a time, and honours the confidential-copy skip. Reaches capture as CLIPBASKET_OCR. The panel should present it as unavailable, not merely off, when tesseract is missing.",
         "unavailableLabel": "Install tesseract to search text inside images"
+      }
+    },
+
+    "captionImages": {
+      "type": "boolean",
+      "default": false,
+      "title": "Describe images with no text",
+      "description": "Describe a copied photo in a short sentence so an image with no text in it still gets a readable title and is findable by what it depicts.",
+      "x-clipbasket": {
+        "group": "history",
+        "requiresBinaries": [],
+        "help": "Off by default: this is the heaviest add-on. It needs the optional caption add-on (a Python with transformers + optimum[onnxruntime] + torch, see docs/SEMANTIC.md) and is a no-op without it. Captioning runs off the capture hot path, at low priority, one image at a time, and only titles an image whose title is still the plain 'Image WxH' placeholder — recognised OCR text always wins the title. Reaches capture as CLIPBASKET_CAPTION.",
+        "unavailableLabel": "Install the caption add-on to describe images"
       }
     },
 
