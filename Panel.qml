@@ -85,7 +85,11 @@ Panel {
   property int maxClips: 1000
   property bool ignoreConfidentialCopies: true
   property bool closePanelAfterAction: true
-  property bool pasteSelectedClipImmediately: false
+  // On by default so picking a clip (click or Enter) pastes it straight into
+  // the focused window. normalizeSettings() turns it back off wherever it
+  // cannot work -- no wtype, or the popup is kept open -- so the default is a
+  // no-op copy on those setups rather than a broken paste.
+  property bool pasteSelectedClipImmediately: true
   // Assumed present until the probe says otherwise, so the row does not flash
   // "install wtype" on every open for the people who have it.
   property bool wtypeAvailable: true
@@ -368,6 +372,9 @@ Panel {
       hasHtml: clip.has_html === true,
       sourceApp: String(clip.source_app || ""),
       sizeBytes: root.num(clip.size_bytes, 0),
+      // Only `get` carries ocr_text; in a listing it is absent and this is "".
+      // The detail view surfaces it for images the OCR pass has read.
+      ocrText: String(clip.ocr_text || ""),
       createdAt: root.createdMs(clip)
     };
   }
@@ -817,16 +824,35 @@ Panel {
     root.runAction(root.dbCmd("copy " + row.clipId), !root.closePanelAfterAction);
     if (root.closePanelAfterAction) {
       root.close();
-      // Auto-paste only ever runs after the panel is gone, otherwise the
-      // synthetic Ctrl+V lands in the panel instead of the focused window.
+      // Auto-paste only ever runs after the panel is gone, otherwise the paste
+      // lands in the panel instead of the window the user was working in.
       // The wtype guard stays in the command as well as in the setting: the
       // binary can be uninstalled between the probe and the keystroke.
       if (root.pasteSelectedClipImmediately && root.wtypeAvailable) {
-        root.runAction("command -v wtype >/dev/null 2>&1 && sleep 0.12 && wtype -M ctrl -P v -p v -m ctrl", false);
+        root.runAction(root.autoPasteCommand(row), false);
       }
     } else {
       root.showNotice("Copied.");
     }
+  }
+
+  // Builds the shell command that pastes the just-copied clip into whatever
+  // window now holds focus. Text and links are typed straight in with `wtype -`
+  // (reading the clipboard on stdin), so the paste works in every app no matter
+  // which key that app binds paste to -- a terminal that pastes on
+  // Ctrl+Shift+V gets the text just the same, without ever sending Ctrl+V.
+  // Images and file lists cannot be typed, so those fall back to a synthetic
+  // Ctrl+V, the only way to hand a non-text selection to the window. `wl-paste`
+  // is only ever read after `copy` has finished writing it, because the action
+  // queue runs one command at a time; the sleep gives the compositor a moment
+  // to move focus back off the closing panel first.
+  function autoPasteCommand(row) {
+    var guard = "command -v wtype >/dev/null 2>&1 && sleep 0.12 && ";
+    var kind = row ? String(row.kind) : "";
+    if (kind === "text" || kind === "url") {
+      return guard + "wl-paste --no-newline | wtype -";
+    }
+    return guard + "wtype -M ctrl -P v -p v -m ctrl";
   }
 
   // The desktop app derives Markdown by running turndown over the clip's
@@ -1021,6 +1047,7 @@ Panel {
   readonly property int detailImageW: root.detailRow ? root.detailRow.imageWidth : 0
   readonly property int detailImageH: root.detailRow ? root.detailRow.imageHeight : 0
   readonly property string detailSourceApp: root.detailRow ? root.detailRow.sourceApp : ""
+  readonly property string detailOcrText: root.detailRow ? root.detailRow.ocrText : ""
   readonly property string detailWhen: root.detailRow ? root.formatAbsolute(root.detailRow.createdAt) : ""
   readonly property bool detailHasMarkdown: root.supportsMarkdown(root.detailRow)
 
@@ -1201,6 +1228,17 @@ Panel {
         if (root.lightboxOpen) { root.lightboxOpen = false; return true; }
       }
       return false;
+    }
+    // ALT+K jumps focus to the search field from anywhere in the panel and
+    // selects any existing query, so the user can immediately retype. Handled
+    // before the settings/detail guards so it works in every panel view, and
+    // guarded on Alt so it never eats a plain `k` typed into the search box.
+    if (event.key === Qt.Key_K && (event.modifiers & Qt.AltModifier)) {
+      if (root.settingsOpen) root.settingsOpen = false;
+      if (root.detailOpen) root.closeDetail();
+      searchInput.forceActiveFocus();
+      searchInput.selectAll();
+      return true;
     }
     if (root.settingsOpen) return root.handleSettingsKey(event);
     if (root.detailOpen) return root.handleDetailKey(event);
@@ -1815,6 +1853,33 @@ Panel {
                   font: searchInput.font
                   verticalAlignment: Text.AlignVCenter
                 }
+              }
+            }
+
+            // A quiet keycap hint that ALT+K jumps focus here. Only shown while
+            // the field is idle -- empty and unfocused -- so it never sits on
+            // top of a query or competes with the caret once the user is
+            // typing. handleNavKey owns the shortcut itself.
+            Rectangle {
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              visible: !searchInput.activeFocus && searchInput.text.length === 0
+              height: Style.space(18)
+              width: hintText.implicitWidth + Style.space(12)
+              radius: Style.space(4)
+              color: root.fg(0.06)
+              border.width: 1
+              border.color: root.fg(0.12)
+
+              Text {
+                id: hintText
+                anchors.centerIn: parent
+                text: "ALT + K"
+                color: root.barForeground
+                opacity: 0.45
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
               }
             }
           }
@@ -2775,6 +2840,10 @@ Panel {
 
             DetailField { label: "Dimensions"; value: root.detailDimensions }
             DetailField { label: "Type"; value: root.detailMime }
+            // Only present on an image the OCR pass has read; DetailField hides
+            // itself when the value is empty, so it never shows for text, files
+            // or an image that carries no recognised text.
+            DetailField { label: "Recognised text"; value: root.detailOcrText }
 
             // ---- always present
             DetailField { label: "Source app"; value: root.detailSourceApp }
@@ -3104,7 +3173,7 @@ Panel {
           subtitle: !root.wtypeAvailable
             ? "Install wtype to enable automatic paste"
             : root.closePanelAfterAction
-              ? "After picking a clip, paste it into the focused window"
+              ? "Selecting a clip pastes it straight into the focused window \u2014 no Ctrl+V"
               : "Auto-paste requires closing the popup first."
           Toggle {
             checked: root.pasteSelectedClipImmediately

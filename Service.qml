@@ -59,6 +59,20 @@ Item {
   // unreadable settings file must not quietly start recording passwords.
   property bool ignoreConfidentialCopies: true
 
+  // Whether a recorded image is handed to clipbasket-ocr so its text becomes
+  // searchable. Defaults on, but the feature is itself a no-op unless tesseract
+  // is installed, so this only decides whether to try. Reaches capture as
+  // CLIPBASKET_OCR, read once at spawn like the settings above.
+  property bool ocrImages: true
+
+  // Whether a recorded image is also handed to clipbasket-caption, which
+  // describes a photo in a short sentence so an image with no text of its own
+  // still gets a readable, searchable title. Defaults off: it is the heaviest
+  // add-on and is itself a no-op unless the optional caption Python is
+  // installed. Reaches capture as CLIPBASKET_CAPTION, read once at spawn like
+  // the settings above.
+  property bool captionImages: false
+
   // A watcher that comes back up faster than this did not run, it failed.
   // Mirrors MIN_HEALTHY_SECONDS in the daemon this replaced.
   readonly property int minHealthyMs: 5000
@@ -133,6 +147,8 @@ Item {
   function applySettings(raw) {
     var next = root.defaultMaxClips;
     var nextConfidential = true;
+    var nextOcr = true;
+    var nextCaption = false;
     try {
       var parsed = JSON.parse(String(raw));
       if (parsed && typeof parsed === "object") {
@@ -147,6 +163,15 @@ Item {
         if ("ignoreConfidentialCopies" in parsed) {
           nextConfidential = parsed.ignoreConfidentialCopies !== false;
         }
+        // Off only on an explicit false, mirroring the pattern above.
+        if ("ocrImages" in parsed) {
+          nextOcr = parsed.ocrImages !== false;
+        }
+        // On only on an explicit true: the expensive add-on stays opt-in, so a
+        // broken or partially written value never starts captioning.
+        if ("captionImages" in parsed) {
+          nextCaption = parsed.captionImages === true;
+        }
       }
     } catch (e) {
       // A half-written or hand-broken settings file must not take capture down
@@ -154,9 +179,12 @@ Item {
       // failure.
     }
 
-    var changed = next !== root.maxClips || nextConfidential !== root.ignoreConfidentialCopies;
+    var changed = next !== root.maxClips || nextConfidential !== root.ignoreConfidentialCopies
+      || nextOcr !== root.ocrImages || nextCaption !== root.captionImages;
     root.maxClips = next;
     root.ignoreConfidentialCopies = nextConfidential;
+    root.ocrImages = nextOcr;
+    root.captionImages = nextCaption;
     root.settingsResolved = true;
 
     if (!root.watchersStarted) root.startWatchers();
@@ -192,7 +220,9 @@ Item {
     // qmllint disable incompatible-type
     environment: ({
       "CLIPBASKET_MAX_CLIPS": String(root.maxClips),
-      "CLIPBASKET_IGNORE_CONFIDENTIAL": root.ignoreConfidentialCopies ? "1" : "0"
+      "CLIPBASKET_IGNORE_CONFIDENTIAL": root.ignoreConfidentialCopies ? "1" : "0",
+      "CLIPBASKET_OCR": root.ocrImages ? "1" : "0",
+      "CLIPBASKET_CAPTION": root.captionImages ? "1" : "0"
     })
     // qmllint enable incompatible-type
     onRunningChanged: if (textWatcher.running) textWatcher.startedAt = Date.now()
@@ -210,7 +240,9 @@ Item {
     // qmllint disable incompatible-type
     environment: ({
       "CLIPBASKET_MAX_CLIPS": String(root.maxClips),
-      "CLIPBASKET_IGNORE_CONFIDENTIAL": root.ignoreConfidentialCopies ? "1" : "0"
+      "CLIPBASKET_IGNORE_CONFIDENTIAL": root.ignoreConfidentialCopies ? "1" : "0",
+      "CLIPBASKET_OCR": root.ocrImages ? "1" : "0",
+      "CLIPBASKET_CAPTION": root.captionImages ? "1" : "0"
     })
     // qmllint enable incompatible-type
     onRunningChanged: if (imageWatcher.running) imageWatcher.startedAt = Date.now()

@@ -742,6 +742,33 @@ cmd_doctor() {
   check_binary "wl-clipboard (wl-copy)"  "wl-copy"  "wl-clipboard"
   check_binary "wl-clipboard (wl-paste)" "wl-paste" "wl-clipboard"
   check_binary "jq"            "jq"           "jq"
+  # OCR is an optional, used-if-present feature (like pandoc for Markdown), so a
+  # missing tesseract is information, never a failure: image text search is off
+  # and everything else works.
+  if have tesseract; then
+    local tess_ver tess_langs
+    tess_ver="$(tesseract --version 2>/dev/null | awk 'NR==1 {print $2}')"
+    tess_langs="$(tesseract --list-langs 2>/dev/null | tail -n +2 | paste -sd, - 2>/dev/null)"
+    check_pass "OCR (image text search)" "tesseract ${tess_ver:-?}${tess_langs:+ [$tess_langs]}"
+  else
+    check_info "OCR (image text search)" "optional — pacman -S tesseract tesseract-data-eng to search text inside images"
+  fi
+  # Semantic (CLIP) image search is a further opt-in add-on: a Python venv with
+  # fastembed. Absent is information, never a failure.
+  local embed_cli="$PLUGIN_DIR/bin/clipbasket-embed"
+  [ -x "$embed_cli" ] || embed_cli="$(dirname "$0")/clipbasket-embed"
+  if [ -x "$embed_cli" ] && "$embed_cli" status >/dev/null 2>&1; then
+    check_pass "Semantic image search (CLIP)" "add-on ready"
+  else
+    check_info "Semantic image search (CLIP)" "optional — see docs/SEMANTIC.md to enable natural-language photo search"
+  fi
+  local caption_cli="$PLUGIN_DIR/bin/clipbasket-caption"
+  [ -x "$caption_cli" ] || caption_cli="$(dirname "$0")/clipbasket-caption"
+  if [ -x "$caption_cli" ] && "$caption_cli" status >/dev/null 2>&1; then
+    check_pass "Image captioning" "add-on ready"
+  else
+    check_info "Image captioning" "optional — see docs/SEMANTIC.md to describe & title no-text photos"
+  fi
   if have omarchy; then check_pass "omarchy CLI" "$(command -v omarchy)"; else check_fail "omarchy CLI" "not found"; fi
   if have omarchy-shell; then check_pass "omarchy-shell CLI" "$(command -v omarchy-shell)"; else check_fail "omarchy-shell CLI" "not found"; fi
 

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# clipbasket-embed — optional CLIP semantic image search for Clipbasket.
+#
+#   clipbasket-embed index [--all] [--id N] [--limit N]   embed images
+#   clipbasket-embed search <query> [--limit K] [--min-score S]
+#   clipbasket-embed status                                is the add-on ready?
+#
+# This is the opt-in realisation of natural-language *text -> image* search:
+# it embeds images and a query into the shared CLIP ViT-B/32 space so "a photo
+# of a beach" ranks images by meaning, including photos with no text for OCR to
+# read. It needs a Python with `fastembed` + `onnxruntime` (CPU, no PyTorch),
+# which a stock Clipbasket install does not ship — so this whole feature is a
+# clean no-op unless that runtime is present, exactly like pandoc for Markdown.
+#
+# The interpreter is found at $CLIPBASKET_EMBED_PYTHON, else the default venv at
+# $XDG_DATA_HOME/clipbasket/clip-venv. Install it once with:
+#
+#   python3 -m venv ~/.local/share/clipbasket/clip-venv
+#   ~/.local/share/clipbasket/clip-venv/bin/pip install fastembed
+#
+# (or point CLIPBASKET_EMBED_PYTHON at any python that has fastembed).
+
+set -euo pipefail
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+EMBED_PY="${CLIPBASKET_EMBED_PYTHON:-$DATA_HOME/clipbasket/clip-venv/bin/python}"
+EMBED_MODULE="${CLIPBASKET_EMBED_MODULE:-$SCRIPT_DIR/clipbasket_embed.py}"
+
+# `status` answers whether the add-on can run without importing anything heavy,
+# so callers (doctor, the panel) can show it as available/unavailable cheaply.
+if [ "${1:-}" = "status" ]; then
+	if [ -x "$EMBED_PY" ] && "$EMBED_PY" -c 'import fastembed' >/dev/null 2>&1; then
+		printf '{"ok":true,"python":%s}\n' "\"$EMBED_PY\""
+		exit 0
+	fi
+	printf '{"ok":false,"error":"semantic search add-on not installed","python":%s}\n' "\"$EMBED_PY\""
+	exit 3
+fi
+
+if [ ! -x "$EMBED_PY" ]; then
+	printf '{"ok":false,"error":"clipbasket-embed is not installed (no python at %s)"}\n' "$EMBED_PY" >&2
+	exit 3
+fi
+
+# Serialise indexing: model load is the heavy part, so a burst of copies should
+# queue behind a single embedder rather than fan-forking. The lock rides through
+# the exec (the fd stays open) and releases when the Python process exits. Search
+# is not locked.
+if [ "${1:-}" = "index" ]; then
+	STATE_DIR="${CLIPBASKET_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/clipbasket}"
+	lock="$STATE_DIR/.embed.lock"
+	if command -v flock >/dev/null 2>&1 && mkdir -p "$STATE_DIR" 2>/dev/null && { : >"$lock"; } 2>/dev/null; then
+		exec {lockfd}>>"$lock" || true
+		flock -w 300 "$lockfd" 2>/dev/null || true
+	fi
+fi
+
+exec "$EMBED_PY" "$EMBED_MODULE" "$@"

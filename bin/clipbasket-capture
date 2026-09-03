@@ -54,6 +54,29 @@ MAX_IMAGE_DIMENSION="${CLIPBASKET_MAX_IMAGE_DIMENSION:-16384}"
 # clips; 0 records them anyway. The service passes the user's setting through.
 IGNORE_CONFIDENTIAL="${CLIPBASKET_IGNORE_CONFIDENTIAL:-1}"
 
+# Optional content-aware image search. When enabled (and `tesseract` is on
+# PATH), a recorded image clip is handed to clipbasket-ocr, which reads the text
+# out of the picture and stores it so a screenshot becomes searchable by what it
+# shows. 1 is the default; the service passes the user's setting through, and
+# the whole feature is a no-op when tesseract is not installed -- exactly like
+# pandoc/ImageMagick, it is used-if-present and never required.
+OCR_ENABLED="${CLIPBASKET_OCR:-1}"
+OCR_CLI="${CLIPBASKET_OCR_CLI:-$SCRIPT_DIR/clipbasket-ocr}"
+TESSERACT_BIN="${CLIPBASKET_TESSERACT:-tesseract}"
+
+# Optional CLIP semantic-search indexing. Off unless the opt-in embed add-on is
+# installed (a Python with fastembed at the venv path below, or
+# CLIPBASKET_EMBED_PYTHON). Like OCR, it runs detached and never blocks capture.
+EMBED_ENABLED="${CLIPBASKET_EMBED:-1}"
+EMBED_CLI="${CLIPBASKET_EMBED_CLI:-$SCRIPT_DIR/clipbasket-embed}"
+EMBED_PYTHON="${CLIPBASKET_EMBED_PYTHON:-${XDG_DATA_HOME:-$HOME/.local/share}/clipbasket/clip-venv/bin/python}"
+
+# Optional image captioning (heavier: a torch model). Off by default because it
+# is the most expensive add-on and screenshots are already covered by OCR; set
+# CLIPBASKET_CAPTION=1 (or run `clipbasket-caption caption --all`) to enable.
+CAPTION_ENABLED="${CLIPBASKET_CAPTION:-0}"
+CAPTION_CLI="${CLIPBASKET_CAPTION_CLI:-$SCRIPT_DIR/clipbasket-caption}"
+
 WL_PASTE_BIN="${CLIPBASKET_WL_PASTE:-wl-paste}"
 
 TMPFILES=()
@@ -623,17 +646,53 @@ read_html_flavor() {
 
 # --- recording -------------------------------------------------------------
 
+# The id and dedupe status of the last successful record(), so an image capture
+# can hand the fresh row to OCR without re-parsing or re-querying.
+LAST_INSERT_ID=''
+LAST_INSERT_DEDUPED=0
+
 record() {
 	# JSON payload on stdin
 	local out
+	LAST_INSERT_ID=''
+	LAST_INSERT_DEDUPED=0
 	if ! out=$("$DB_CLI" insert); then
 		log "insert failed: $out"
 		return 1
 	fi
+	LAST_INSERT_ID=${out#*\"id\":}
+	LAST_INSERT_ID=${LAST_INSERT_ID%%[!0-9]*}
 	case "$out" in
-	*'"deduped":true'*) return 0 ;;
+	*'"deduped":true'*)
+		LAST_INSERT_DEDUPED=1
+		return 0
+		;;
 	esac
 	"$DB_CLI" prune --max "$MAX_CLIPS" >/dev/null 2>&1 || true
+}
+
+# Hands a freshly recorded image clip to the optional analysis worker, detached
+# and at low priority so it never delays the next clipboard event. The worker
+# reads the image's text (tesseract) and/or its perceptual hash (ImageMagick),
+# so this fires when either tool is present. A no-op unless enabled, the worker
+# exists, and the row is genuinely new (a deduped re-copy was already handed
+# over the first time). Confidential offers never reach here -- they are dropped
+# before any capture_* runs -- so an image analysed is one already stored.
+maybe_ocr_image() {
+	local id="$1" deduped="${2:-0}"
+	[ "$OCR_ENABLED" = "1" ] || return 0
+	[ "$deduped" = "1" ] && return 0
+	case "$id" in '' | *[!0-9]*) return 0 ;; esac
+	# The selftest drives capture_* in-process against a stubbed DB; it must not
+	# fork a real worker at the live tools.
+	[ -z "${SELFTEST_ROOT:-}" ] || return 0
+	[ -x "$OCR_CLI" ] || return 0
+	command -v "$TESSERACT_BIN" >/dev/null 2>&1 ||
+		command -v magick >/dev/null 2>&1 ||
+		command -v convert >/dev/null 2>&1 || return 0
+	setsid nice -n 19 "$OCR_CLI" "$id" >/dev/null 2>&1 &
+	disown 2>/dev/null || true
+	return 0
 }
 
 # Fetches and parses text/uri-list into the NUL-delimited file at $1. The raw
@@ -876,6 +935,44 @@ capture_image() {
 	if [ -n "$staged_thumb" ]; then
 		safe_write "$THUMB_DIR" "$hash.png" 644 "$MAX_IMAGE_BYTES" <"$staged_thumb" || true
 	fi
+	# The image and its row now exist on disk; read the text out of it in the
+	# background so it becomes searchable by content. Never on the hot path.
+	maybe_ocr_image "$LAST_INSERT_ID" "$LAST_INSERT_DEDUPED"
+	maybe_embed_image "$LAST_INSERT_ID" "$LAST_INSERT_DEDUPED"
+	maybe_caption_image "$LAST_INSERT_ID" "$LAST_INSERT_DEDUPED"
+	return 0
+}
+
+# Hands a freshly recorded image to the opt-in captioner so a photo with no text
+# gets a readable, searchable description. Off unless CLIPBASKET_CAPTION=1 and
+# the add-on's Python is present; detached, low priority, lock-serialised.
+maybe_caption_image() {
+	local id="$1" deduped="${2:-0}"
+	[ "$CAPTION_ENABLED" = "1" ] || return 0
+	[ "$deduped" = "1" ] && return 0
+	case "$id" in '' | *[!0-9]*) return 0 ;; esac
+	[ -z "${SELFTEST_ROOT:-}" ] || return 0
+	[ -x "$CAPTION_CLI" ] || return 0
+	[ -x "$EMBED_PYTHON" ] || return 0
+	setsid nice -n 19 "$CAPTION_CLI" caption --id "$id" >/dev/null 2>&1 &
+	disown 2>/dev/null || true
+	return 0
+}
+
+# Hands a freshly recorded image to the opt-in CLIP indexer so it becomes
+# findable by a natural-language query. A no-op unless the add-on is installed
+# (its Python with fastembed exists); detached and low-priority so it never
+# delays capture. Serialised by a lock inside clipbasket-embed.
+maybe_embed_image() {
+	local id="$1" deduped="${2:-0}"
+	[ "$EMBED_ENABLED" = "1" ] || return 0
+	[ "$deduped" = "1" ] && return 0
+	case "$id" in '' | *[!0-9]*) return 0 ;; esac
+	[ -z "${SELFTEST_ROOT:-}" ] || return 0
+	[ -x "$EMBED_CLI" ] || return 0
+	[ -x "$EMBED_PYTHON" ] || return 0
+	setsid nice -n 19 "$EMBED_CLI" index --id "$id" >/dev/null 2>&1 &
+	disown 2>/dev/null || true
 	return 0
 }
 
