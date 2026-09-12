@@ -105,6 +105,15 @@ manager do not land in your history.
 
 Defaults on. A privacy default should never need to be discovered.
 
+### Clear history / Delete all history — buttons, not settings
+
+The History section ends with two destructive buttons (mirrored by the trash
+icon in the list footer). **Clear history** runs `clipbasket-db clear` — pinned
+and saved clips survive. **Delete all history** runs `clear --all` — nothing
+survives. Both arm on first click and run on the confirming second click, and
+the arm expires after 4 s. They are buttons rather than keys in
+`settings.json` because they act, they do not configure.
+
 ## Behavior
 
 ### `closePanelAfterAction` — boolean, default `true`
