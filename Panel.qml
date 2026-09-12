@@ -51,6 +51,11 @@ Panel {
 
   // ---- Delete confirmation (armed by clip id, like the desktop app)
   property int armedDeleteId: -1
+  // ---- Clear-all confirmation. "" disarmed, "keep" = `clear` (pinned and
+  // saved survive), "all" = `clear --all` (everything goes). Shared by the
+  // footer trash, the footer scope menu and the settings buttons, so arming
+  // in one place and confirming in another always agrees.
+  property string armedClearScope: ""
 
   // ---- Detail view. Keyed by clip *id*, not by row index: pin, save and copy
   // all queue a reload that re-sorts the model underneath us, so the index is
@@ -479,6 +484,7 @@ Panel {
       root.settingsOpen = false;
       root.resetDetail();
       root.armedDeleteId = -1;
+      root.armedClearScope = "";
       root.closeMenu();
       root.notice = "";
       root.warning = "";
@@ -701,12 +707,19 @@ Panel {
   function showNotice(message) { root.notice = message; noticeTimer.restart(); }
 
   // Armed delete expires after 4 s, same as DELETE_CONFIRMATION_DURATION_MS.
-  Timer { id: armTimer; interval: 4000; onTriggered: root.armedDeleteId = -1 }
+  // The clear-all arm rides the same timer: one armed destructive intent at a
+  // time, and re-arming anything restarts it.
+  Timer {
+    id: armTimer
+    interval: 4000
+    onTriggered: { root.armedDeleteId = -1; root.armedClearScope = ""; }
+  }
 
   function clearTransientState() {
     root.notice = "";
     noticeTimer.stop();
     root.armedDeleteId = -1;
+    root.armedClearScope = "";
     armTimer.stop();
     root.closeMenu();
   }
@@ -966,6 +979,45 @@ Panel {
     root.runAction(root.dbCmd("delete " + id), true);
   }
 
+  // ---- Clear-all history. Two scopes, matching `clipbasket-db clear`
+  // (pinned and saved survive) and `clear --all` (everything goes). Both arm
+  // the way a protected clip delete does: the first click arms and says what
+  // is armed, the second click runs. The scope travels in
+  // `root.armedClearScope`, so the footer trash, the footer scope menu and
+  // the settings buttons arm and confirm interchangeably.
+  function requestClear(all) {
+    var scope = all ? "all" : "keep";
+    if (root.armedClearScope === scope) { root.executeClear(all); return; }
+    root.clearTransientState();
+    root.armedClearScope = scope;
+    armTimer.restart();
+    if (all) root.showNotice("Delete EVERYTHING, including pinned and saved clips? Click again to confirm.");
+    else root.showNotice("Clear history? Pinned and saved clips are kept. Click again to confirm.");
+  }
+
+  function executeClear(all) {
+    root.clearTransientState();
+    root.runAction(root.dbCmd(all ? "clear --all" : "clear"), true);
+    root.showNotice(all ? "All history deleted." : "History cleared.");
+  }
+
+  // Footer trash: confirms an already-armed scope, otherwise offers the scope
+  // menu. The menu reuses the panel-level copy-variant menu under a sentinel
+  // id, so no second menu implementation exists to drift out of sync.
+  function footerClearPressed(item) {
+    if (root.armedClearScope !== "") { root.executeClear(root.armedClearScope === "all"); return; }
+    if (root.menuClipId === -2) { root.closeMenu(); return; }
+    root.closeMenu();
+    root.menuActions = [
+      { id: "clear-keep", label: "Clear history (keep pinned and saved)" },
+      { id: "clear-all", label: "Delete everything" }
+    ];
+    root.menuClipId = -2;
+    var point = item.mapToItem(keyCatcher, 0, item.height);
+    root.menuX = point.x;
+    root.menuY = point.y + Style.space(4);
+  }
+
   // ----------------------------------------------------------- copy variants
 
   function menuActionsFor(row) {
@@ -995,6 +1047,14 @@ Panel {
   function closeMenu() { root.menuClipId = -1; root.menuActions = []; }
 
   function invokeMenuAction(actionId) {
+    // Sentinel for the footer history menu, which names no clip: arm the
+    // chosen scope and let the trash button take the confirming click.
+    if (root.menuClipId === -2) {
+      root.closeMenu();
+      if (actionId === "clear-keep") root.requestClear(false);
+      else if (actionId === "clear-all") root.requestClear(true);
+      return;
+    }
     // Re-resolved at invoke time, so the action lands on the clip the menu was
     // opened for even if the list has re-sorted since.
     var index = root.indexOfClipId(root.menuClipId);
@@ -1658,6 +1718,37 @@ Panel {
     }
   }
 
+  // ---- Small danger-zone button for the settings history rows. Arming lives
+  // in root.armedClearScope; the label flips to a confirm prompt while armed,
+  // and the danger tint mirrors the armed per-clip delete.
+  component ClearButton: Rectangle {
+    id: btn
+    property bool armed: false
+    property string label: ""
+    signal pressed
+    width: Math.max(Style.space(76), btnLabel.implicitWidth + Style.space(20))
+    height: Style.space(24)
+    radius: height / 2
+    color: "transparent"
+    border.width: 1
+    border.color: btn.armed ? root.dangerTint : root.fg(0.12)
+
+    Text {
+      id: btnLabel
+      anchors.centerIn: parent
+      text: btn.armed ? "Confirm?" : btn.label
+      color: btn.armed ? root.dangerTint : root.barForeground
+      opacity: btn.armed ? 1.0 : 0.7
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      onClicked: btn.pressed()
+    }
+  }
+
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -2260,7 +2351,8 @@ Panel {
 
             Text {
               id: shortcutLabel
-              anchors.right: parent.right
+              anchors.right: clearTrash.left
+              anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
               visible: root.globalShortcut.length > 0
               text: root.globalShortcut
@@ -2268,6 +2360,19 @@ Panel {
               opacity: 0.4
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
+            }
+
+            // History clear-all: confirms an armed scope, otherwise offers
+            // both scopes in the panel-level menu. Burns danger-tint while
+            // armed, like the per-clip delete.
+            RowAction {
+              id: clearTrash
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              glyph: root.glyphTrash
+              tint: root.armedClearScope !== "" ? root.dangerTint : root.barForeground
+              restOpacity: root.armedClearScope !== "" ? 1.0 : 0.45
+              onActivated: root.footerClearPressed(clearTrash)
             }
           }
 
@@ -3081,6 +3186,26 @@ Panel {
           Toggle {
             checked: root.ignoreConfidentialCopies
             onToggled: function (next) { root.ignoreConfidentialCopies = next; root.persist(); }
+          }
+        }
+
+        SettingRow {
+          title: "Clear history"
+          subtitle: "Remove all clips except pinned and saved ones"
+          ClearButton {
+            label: "Clear"
+            armed: root.armedClearScope === "keep"
+            onPressed: root.requestClear(false)
+          }
+        }
+
+        SettingRow {
+          title: "Delete all history"
+          subtitle: "Remove everything, including pinned and saved clips"
+          ClearButton {
+            label: "Delete all"
+            armed: root.armedClearScope === "all"
+            onPressed: root.requestClear(true)
           }
         }
 
