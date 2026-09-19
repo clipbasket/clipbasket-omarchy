@@ -1,0 +1,492 @@
+#!/usr/bin/env bash
+# clipbasket-ocr — read the text out of an image clip so a screenshot becomes
+# searchable by what it actually shows.
+#
+#   clipbasket-ocr <id>              OCR one image clip, store its recognised text
+#   clipbasket-ocr --all [--limit N] Backfill every image clip that has none yet
+#   clipbasket-ocr --selftest        Regression tests against a stubbed tesseract
+#
+# This is the Linux stand-in for content-aware image search. It is deliberately
+# built the same way as clipbasket-html2md: it uses `tesseract` (and, when
+# present, ImageMagick to downscale/grayscale first) **only if they are already
+# installed**, and it is a clean no-op otherwise. Nothing is installed on the
+# user's behalf, nothing leaves the machine, and no image that was not already
+# stored is ever read.
+#
+# The design rules that matter if you edit this file:
+#
+#   * Off the hot path. clipbasket-capture records the clip first and only then
+#     forks this, detached and `nice`d, so recognising text never delays the
+#     next clipboard event. An OCR crash, timeout, or missing binary can never
+#     affect capture latency or lose a clip.
+#   * Bounded compute. A wall-clock timeout plus the same ImageMagick decoder
+#     envelope the rest of the plugin uses (memory/map/area/time) means a
+#     hostile or enormous image cannot pin a core.
+#   * One at a time. A flock in the state directory serialises workers, so a
+#     burst of copies queues behind a single tesseract rather than fan-forking.
+#   * Descriptor-bound reads. The image bytes are streamed out of images/
+#     through clipbasket-safefile (O_NOFOLLOW, fstat regular-and-owned), never
+#     by handing a pathname to tesseract. A planted symlink yields no bytes.
+#   * The database is the only writer. Recognised text goes back through
+#     `clipbasket-db set-ocr`, which bounds and UTF-8 scrubs it and re-derives
+#     the FTS index. This file never touches clips.db directly.
+
+set -euo pipefail
+
+STATE_DIR="${CLIPBASKET_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/clipbasket}"
+IMAGE_DIR="$STATE_DIR/images"
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+DB_CLI="${CLIPBASKET_DB_CLI:-$SCRIPT_DIR/clipbasket-db}"
+SAFEFILE="${CLIPBASKET_SAFEFILE:-$SCRIPT_DIR/clipbasket-safefile}"
+TESSERACT_BIN="${CLIPBASKET_TESSERACT:-tesseract}"
+
+# Recognition tuning. Every one is overridable, but the defaults are chosen for
+# clipboard screenshots: crisp, high-contrast, mostly Latin UI text.
+OCR_LANGS="${CLIPBASKET_OCR_LANGS:-eng}"
+OCR_PSM="${CLIPBASKET_OCR_PSM:-3}"           # automatic page segmentation; a
+                                             # screenshot is scattered UI text,
+                                             # not one uniform block (psm 6)
+OCR_CONF_MIN="${CLIPBASKET_OCR_CONF_MIN:-55}" # drop words tesseract is unsure of
+OCR_TIMEOUT="${CLIPBASKET_OCR_TIMEOUT:-25}"   # wall-clock seconds per image
+OCR_MAX_DIM="${CLIPBASKET_OCR_MAX_DIM:-2600}" # downscale a bigger image first
+MAX_IMAGE_BYTES="${CLIPBASKET_MAX_IMAGE_BYTES:-67108864}"
+
+log() { printf 'clipbasket-ocr: %s\n' "$*" >&2; }
+
+TMPFILES=()
+cleanup() {
+	[ "${#TMPFILES[@]}" -gt 0 ] && rm -f "${TMPFILES[@]}" || true
+}
+trap cleanup EXIT
+trap 'cleanup; trap - INT; kill -s INT $$' INT
+trap 'cleanup; trap - TERM; kill -s TERM $$' TERM
+trap 'cleanup; trap - HUP; kill -s HUP $$' HUP
+
+mktempfile() {
+	REPLY_TMPFILE=$(mktemp "${TMPDIR:-/tmp}/clipbasket-ocr.XXXXXX") ||
+		{ log "could not create a temp file"; exit 1; }
+	TMPFILES[${#TMPFILES[@]}]="$REPLY_TMPFILE"
+}
+
+# ---------------------------------------------------------------------------
+# the OCR pipeline
+# ---------------------------------------------------------------------------
+
+# $1 image file -> best-effort text on stdout. Downscales and grayscales with
+# ImageMagick first when it is present (smaller, cleaner, faster), and falls
+# back to letting tesseract's own Leptonica decode the original when it is not.
+# Confidence filtering keeps only words tesseract is reasonably sure of, and the
+# tsv layout is reassembled into lines so the stored text stays readable.
+recognise() {
+	local img="$1" pre="$1" gray
+	if command -v magick >/dev/null 2>&1; then
+		mktempfile
+		gray="$REPLY_TMPFILE"
+		if magick -limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10 \
+			"${img}[0]" -resize "${OCR_MAX_DIM}x${OCR_MAX_DIM}>" -colorspace Gray \
+			"png:$gray" 2>/dev/null && [ -s "$gray" ]; then
+			pre="$gray"
+		fi
+	elif command -v convert >/dev/null 2>&1; then
+		mktempfile
+		gray="$REPLY_TMPFILE"
+		if convert -limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10 \
+			"${img}[0]" -resize "${OCR_MAX_DIM}x${OCR_MAX_DIM}>" -colorspace Gray \
+			"png:$gray" 2>/dev/null && [ -s "$gray" ]; then
+			pre="$gray"
+		fi
+	fi
+
+	# tsv columns: level page block par line word left top width height conf text
+	timeout "$OCR_TIMEOUT" "$TESSERACT_BIN" "$pre" stdout \
+		--psm "$OCR_PSM" -l "$OCR_LANGS" tsv 2>/dev/null |
+		awk -F'\t' -v min="$OCR_CONF_MIN" '
+			NR == 1 { next }
+			{ w = $12; conf = $11 + 0 }
+			w == "" { next }
+			conf < min { next }
+			{
+				key = $3 "/" $4 "/" $5
+				if (started && key != prevkey) printf "\n"
+				else if (started) printf " "
+				printf "%s", w
+				started = 1; prevkey = key
+			}
+			END { if (started) printf "\n" }'
+}
+
+# Picks the single most content-bearing line of the recognised text as a
+# concise title, so a full-screen screenshot reads as its actual subject
+# instead of a dump of the status bar, clock, prices and icons. The winning
+# line is the one with the most real words (>=3 letters); ties go to the longer
+# line. Pure number/symbol/price/time tokens and lone letters are then stripped
+# and the result is capped. Empty when nothing qualifies, so a textless or
+# chrome-only screenshot keeps its "Image WxH" title rather than getting noise.
+core_title() {
+	awk '
+		{
+			line = $0
+			gsub(/\t/, " ", line); gsub(/^ +| +$/, "", line); gsub(/  +/, " ", line)
+			if (line == "") next
+			tmp = line; n = 0
+			while (match(tmp, /[A-Za-z][A-Za-z][A-Za-z]+/)) { n++; tmp = substr(tmp, RSTART + RLENGTH) }
+			if (n > bestn || (n == bestn && length(line) > length(best))) { bestn = n; best = line }
+		}
+		END {
+			if (bestn < 2) exit                       # nothing with real words
+			m = split(best, a, " "); out = ""; c = 0
+			for (i = 1; i <= m; i++) {
+				w = a[i]; t = w; nl = gsub(/[A-Za-z]/, "", t)
+				if (nl < 2) continue                  # drop numbers, prices, times, symbols
+				if (nl * 2 < length(w)) continue      # drop tokens that are mostly non-letters
+				out = out (c ? " " : "") w; c++
+				if (length(out) >= 60) break
+			}
+			print out
+		}'
+}
+
+# Turns recognised text into a short, filesystem-safe slug: lowercased, only
+# [a-z0-9], the first few meaningful words joined with hyphens. Empty when the
+# text has nothing usable, which is the caller's signal to leave the hash name.
+slugify() {
+	printf '%s' "$1" |
+		tr '[:upper:]' '[:lower:]' |
+		tr -c 'a-z0-9' ' ' |
+		awk '{
+			n = 0; out = "";
+			for (i = 1; i <= NF; i++) {
+				if (length($i) < 2 && $i !~ /[0-9]/) continue;   # drop lone letters
+				out = out (n ? "-" : "") $i; n++;
+				if (n >= 6) break;                               # first few words
+			}
+			print substr(out, 1, 48);
+		}' |
+		sed -E 's/-+$//'
+}
+
+# Computes a 64-bit perceptual hash (dHash) of an image: ImageMagick shrinks it
+# to a 9x8 grayscale, and each of the 8 rows contributes 8 bits comparing
+# adjacent pixels. Two visually similar images differ in only a few of those 64
+# bits, so Hamming distance ranks look-alikes and near-duplicates — including
+# photos that carry no text. Empty when ImageMagick is absent or the decode
+# fails, so the clip simply carries no hash.
+compute_phash() {
+	local mg=''
+	if command -v magick >/dev/null 2>&1; then mg=magick
+	elif command -v convert >/dev/null 2>&1; then mg=convert
+	else return 0; fi
+	"$mg" -limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10 \
+		"${1}[0]" -resize '9x8!' -colorspace Gray -depth 8 gray:- 2>/dev/null |
+		python3 -c '
+import sys
+d = sys.stdin.buffer.read()
+W, H = 9, 8
+if len(d) < W * H:
+    sys.exit(1)
+b = 0
+for y in range(H):
+    row = y * W
+    for x in range(W - 1):
+        b = (b << 1) | (1 if d[row + x] < d[row + x + 1] else 0)
+sys.stdout.write("%016x" % b)
+' 2>/dev/null || true
+}
+
+# Analyses one image clip: reads the recognised text (if tesseract is present
+# and it has none yet) and/or its perceptual hash (if ImageMagick is present and
+# it has none yet). Reads the image_path from the database, verifies it is a
+# direct child of images/, and streams the bytes out through clipbasket-safefile.
+# A missing/gone clip is a benign no-op, not an error.
+ocr_one() {
+	local id="$1" force="${2:-0}" clip image_path base tmp_img text rc
+	local have_tess=0 have_magick=0 need_ocr=0 need_phash=0
+	case "$id" in '' | *[!0-9]*) log "not a numeric id: $id"; return 1 ;; esac
+
+	clip=$("$DB_CLI" get "$id" 2>/dev/null) || return 0
+	[ -n "$clip" ] && [ "$clip" != "null" ] || return 0
+	case "$clip" in *'"kind":"image"'*) ;; *) return 0 ;; esac
+
+	command -v "$TESSERACT_BIN" >/dev/null 2>&1 && have_tess=1 || true
+	{ command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1; } && have_magick=1 || true
+
+	# `"ocr_text":null` / `"phash":null` mean the work was never done; any other
+	# value means it has been, and redoing it wastes a core. --force redoes both.
+	if [ "$have_tess" = 1 ]; then
+		if [ "$force" = 1 ]; then need_ocr=1; else case "$clip" in *'"ocr_text":null'*) need_ocr=1 ;; esac; fi
+	fi
+	if [ "$have_magick" = 1 ]; then
+		if [ "$force" = 1 ]; then need_phash=1; else case "$clip" in *'"phash":null'*) need_phash=1 ;; esac; fi
+	fi
+	[ "$need_ocr" = 1 ] || [ "$need_phash" = 1 ] || return 0
+
+	image_path=${clip#*\"image_path\":\"}
+	image_path=${image_path%%\"*}
+	[ -n "$image_path" ] && [ "$image_path" != "null" ] || return 0
+	# Only ever a direct child of images/, exactly like clipbasket-db copy. A
+	# prefix-shaped value such as images/../secret is refused, not followed.
+	case "$image_path" in
+	"$IMAGE_DIR"/*) base=${image_path#"$IMAGE_DIR"/} ;;
+	*) log "image_path for $id is not under images/; skipping"; return 0 ;;
+	esac
+	case "$base" in */* | '' | . | ..) log "bad image name for $id; skipping"; return 0 ;; esac
+
+	mktempfile
+	tmp_img="$REPLY_TMPFILE"
+	rc=0
+	"$SAFEFILE" read "$IMAGE_DIR" "$base" >"$tmp_img" || rc=$?
+	case "$rc" in
+	0) ;;
+	2) log "image for $id is gone; skipping"; return 0 ;;
+	*) log "refusing to read image for $id (safefile exit $rc)"; return 1 ;;
+	esac
+	[ -s "$tmp_img" ] || { log "image for $id is empty; skipping"; return 0; }
+
+	if [ "$need_ocr" = 1 ]; then
+		text=$(recognise "$tmp_img" || true)
+		# The full text is stored for search (so the image is still findable by any
+		# word in it), but the clip's title is just the core content line.
+		local title
+		title=$(printf '%s' "$text" | core_title)
+		# set-ocr bounds and scrubs the text and re-derives the FTS index. An empty
+		# result is still stored so the clip is marked done.
+		printf '%s' "$text" | "$DB_CLI" set-ocr "$id" --title "$title" >/dev/null ||
+			{ log "storing OCR for $id failed"; return 1; }
+
+		# Name the stored file after the same core content that titles the clip, so
+		# a screenshot is recognisable on disk and in the lightbox. A screenshot
+		# with no core text keeps its hash name rather than getting a noisy one.
+		# Best-effort: a failure here never undoes the searchable text.
+		local slug
+		slug=$(slugify "$title")
+		if [ -n "$slug" ]; then
+			"$DB_CLI" rename-image "$id" --slug "$slug" >/dev/null 2>&1 || true
+		fi
+	fi
+
+	if [ "$need_phash" = 1 ]; then
+		local hex
+		hex=$(compute_phash "$tmp_img")
+		if [ -n "$hex" ]; then
+			"$DB_CLI" set-phash "$id" "$hex" >/dev/null 2>&1 || true
+		fi
+	fi
+	return 0
+}
+
+# Backfill every image clip still missing its recognised text or perceptual
+# hash. Both pending lists are unioned so one pass over the history handles
+# whichever piece each image lacks.
+ocr_all() {
+	local limit="${1:-1000}" ids id
+	ids=$(
+		{
+			"$DB_CLI" ocr-pending --limit "$limit" 2>/dev/null
+			"$DB_CLI" phash-pending --limit "$limit" 2>/dev/null
+		} | grep -o '"id":[0-9]*' | grep -o '[0-9]*' | sort -n -u
+	) || true
+	[ -n "$ids" ] || return 0
+	for id in $ids; do
+		ocr_one "$id" 0 || true
+	done
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# entry point (single-flight)
+# ---------------------------------------------------------------------------
+
+# The worker has something to do if it can read text (tesseract) or compute a
+# perceptual hash (ImageMagick). With neither it is a clean no-op, exactly like
+# the rest of the plugin degrades when an optional tool is absent.
+require_capability() {
+	command -v "$TESSERACT_BIN" >/dev/null 2>&1 && return 0
+	command -v magick >/dev/null 2>&1 && return 0
+	command -v convert >/dev/null 2>&1 && return 0
+	log "neither tesseract nor ImageMagick installed; image analysis is off"
+	exit 0
+}
+
+main() {
+	case "${1:-}" in
+	--selftest) shift; selftest "$@"; return ;;
+	-h | --help | '')
+		printf 'usage: clipbasket-ocr <id> | --all [--limit N] | --selftest\n' >&2
+		exit 2
+		;;
+	esac
+
+	require_capability
+
+	# Serialise workers: one at a time so a burst of copies queues
+	# behind a single process rather than fan-forking. Best-effort -- if the
+	# state dir or flock is unavailable we simply run without the lock.
+	local lock="$STATE_DIR/.ocr.lock"
+	if command -v flock >/dev/null 2>&1 && { : >"$lock"; } 2>/dev/null; then
+		exec {lockfd}>>"$lock" || true
+		flock -w 120 "$lockfd" 2>/dev/null || true
+	fi
+
+	case "$1" in
+	--all)
+		shift
+		local limit=1000
+		while [ $# -gt 0 ]; do
+			case "$1" in
+			--limit) limit="${2:-1000}"; shift 2 ;;
+			*) log "unknown option: $1"; exit 2 ;;
+			esac
+		done
+		ocr_all "$limit"
+		;;
+	*) ocr_one "$1" "${OCR_FORCE:-0}" ;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# selftest — a stubbed tesseract, no model or Wayland required
+# ---------------------------------------------------------------------------
+
+selftest() {
+	local pass=0 fail=0 root out
+	root=$(mktemp -d "${TMPDIR:-/tmp}/clipbasket-ocr-selftest.XXXXXX")
+	trap 'rm -rf "${root:-}"; cleanup' EXIT
+
+	check() {
+		if [ "$2" = "$3" ]; then
+			pass=$((pass + 1))
+		else
+			fail=$((fail + 1))
+			printf 'FAIL: %s\n  expected: %s\n  actual:   %s\n' "$1" "$2" "$3" >&2
+		fi
+	}
+	check_contains() {
+		case "$3" in
+		*"$2"*) pass=$((pass + 1)) ;;
+		*)
+			fail=$((fail + 1))
+			printf 'FAIL: %s\n  expected to contain: %s\n  actual: %s\n' "$1" "$2" "$3" >&2
+			;;
+		esac
+	}
+
+	# A stubbed tesseract that emits a fixed tsv, and records that it ran. Two
+	# words, one below the confidence floor, on two lines.
+	local bindir="$root/bin"
+	mkdir -p "$bindir"
+	cat >"$bindir/tesseract" <<-STUB
+		#!/usr/bin/env bash
+		printf 'ran\n' >>"$root/tess.log"
+		printf 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n'
+		printf '5\t1\t1\t1\t1\t1\t0\t0\t9\t9\t92\tMeeting\n'
+		printf '5\t1\t1\t1\t1\t2\t0\t0\t9\t9\t88\troadmap\n'
+		printf '5\t1\t1\t1\t2\t1\t0\t0\t9\t9\t12\tblurry\n'
+	STUB
+	chmod +x "$bindir/tesseract"
+
+	# recognise() over the stub: keeps the two confident words on one line,
+	# drops the low-confidence one.
+	out=$(TESSERACT_BIN="$bindir/tesseract" OCR_CONF_MIN=55 recognise "$root/does-not-matter")
+	check 'confident words are kept, joined on their line' 'Meeting roadmap' "$out"
+	check_contains 'the low-confidence word is dropped' '' "${out##*blurry}"
+	case "$out" in *blurry*) fail=$((fail + 1)); printf 'FAIL: blurry leaked\n' >&2 ;; *) pass=$((pass + 1)) ;; esac
+
+	# A lower floor lets the third word through, on its own line.
+	out=$(TESSERACT_BIN="$bindir/tesseract" OCR_CONF_MIN=5 recognise "$root/x")
+	check 'a lower floor keeps the third word, on a new line' "$(printf 'Meeting roadmap\nblurry')" "$out"
+
+	# slugify: lowercased, hyphenated, punctuation and lone letters dropped, capped.
+	check 'slugify makes a readable slug' 'meeting-moved-to-3pm' "$(slugify 'Meeting Moved To 3pm!!')"
+	check 'slugify drops lone letters and caps the word count' 'invoice-acme-corp-total-99-now' \
+		"$(slugify 'A Invoice: ACME Corp total 99 x now please today')"
+	check 'slugify is empty when there is nothing usable' '' "$(slugify '!!! ... @@@')"
+
+	# core_title: pick the most content-bearing line, skip the status-bar noise.
+	out=$(printf '0012 3 4 n ZEC $792.88 0 & \xc2\xa9 3 19:30\nX For you\nWe recently identified unauthorised external access to records\n:56\n' | core_title)
+	check 'core_title picks the content line over the status bar' \
+		'We recently identified unauthorised external access to records' "$out"
+	out=$(printf 'ZEC $786.13 18:43\n0O & 3%%\nHey there it is too crazy not to do\n' | core_title)
+	check 'core_title drops prices, times and symbols' 'Hey there it is too crazy not to do' "$out"
+	out=$(printf 'Image 2976x1852\n@ 3 19:30\n0012\n' | core_title)
+	check 'core_title is empty for a chrome-only screenshot' '' "$out"
+
+	# require_tesseract exits 0 (never 1) when the binary is missing, so a box
+	# without tesseract degrades silently rather than erroring.
+	out=$( (CLIPBASKET_TESSERACT="$root/no-such-tesseract" "$0" 999 >/dev/null 2>&1; echo "exit=$?") )
+	check 'a missing tesseract is a clean no-op' 'exit=0' "$out"
+
+	# End to end against a real clipbasket-db in a scratch state dir: an image
+	# clip with a planted asset gets its recognised text stored and indexed.
+	local state="$root/state"
+	mkdir -p "$state/images"
+	# An image so safefile read yields bytes; the stub tesseract ignores its
+	# content. A real one when ImageMagick is present so compute_phash has a
+	# clean 9x8 to work on; otherwise a tiny raw PNG (phash checks are skipped).
+	if command -v magick >/dev/null 2>&1; then
+		magick -size 16x16 gradient:black-white "$state/images/deadbeef.png" 2>/dev/null
+	elif command -v convert >/dev/null 2>&1; then
+		convert -size 16x16 gradient:black-white "$state/images/deadbeef.png" 2>/dev/null
+	else
+		printf '\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\000\000\000\001\010\002\000\000\000\220wS\336\000\000\000\014IDATx\234c\370\317\300\360\037\000\005\005\002\000\015\012\333\337\000\000\000\000IEND\256B`\202' >"$state/images/deadbeef.png"
+	fi
+	local chash="abc123def4560000000000000000000000000000000000000000000000000000"
+	out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" \
+		"$DB_CLI" insert <<-JSON
+		{"kind":"image","hash":"$chash","preview":"Image 1x1","image_path":"$state/images/deadbeef.png","thumb_path":"$state/images/deadbeef.png","source_app":"grim"}
+		JSON
+	)
+	local id
+	id=${out#*\"id\":}
+	id=${id%%[!0-9]*}
+	CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" \
+		CLIPBASKET_TESSERACT="$bindir/tesseract" CLIPBASKET_DB_CLI="$DB_CLI" \
+		"$0" "$id" >/dev/null 2>&1 || true
+	out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" \
+		"$DB_CLI" list --limit 5 --query roadmap)
+	check_contains 'an OCR word makes the image findable by search' '"kind":"image"' "$out"
+	out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" \
+		"$DB_CLI" ocr-pending)
+	check 'and the clip is no longer pending' '[]' "$out"
+
+	# The stored file is renamed from its opaque hash to what the image shows.
+	check 'the image file is renamed to a readable name' 'meeting-roadmap-abc123def456.png' \
+		"$(ls "$state/images")"
+	check 'the old hash-named file is gone' 'absent' \
+		"$( [ -e "$state/images/deadbeef.png" ] && echo present || echo absent )"
+	out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" "$DB_CLI" get "$id")
+	check_contains 'and the row points at the renamed file' 'meeting-roadmap-abc123def456.png' "$out"
+
+	# Perceptual hash: computed from the same read when ImageMagick is present.
+	if command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1; then
+		out=$(compute_phash "$state/images/meeting-roadmap-abc123def456.png")
+		check 'compute_phash yields 16 hex chars' '16' "${#out}"
+		out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" "$DB_CLI" get "$id")
+		case "$out" in
+		*'"phash":"'[0-9a-f]*) pass=$((pass + 1)) ;;
+		*) fail=$((fail + 1)); printf 'FAIL: phash not stored for the image\n' >&2 ;;
+		esac
+		out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" "$DB_CLI" phash-pending)
+		check 'the image is no longer phash-pending' '[]' "$out"
+	fi
+
+	# image_path outside images/ is refused rather than read.
+	out=$(CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" \
+		"$DB_CLI" insert <<-JSON
+		{"kind":"image","hash":"h-evil","preview":"Image","image_path":"/etc/shadow","source_app":"x"}
+		JSON
+	)
+	local eid
+	eid=${out#*\"id\":}
+	eid=${eid%%[!0-9]*}
+	out=$( (CLIPBASKET_STATE_DIR="$state" CLIPBASKET_DB="$state/clips.db" \
+		CLIPBASKET_TESSERACT="$bindir/tesseract" "$0" "$eid" 2>&1; echo "exit=$?") )
+	check_contains 'an image_path outside images/ is refused' 'not under images/' "$out"
+	check_contains 'and the worker still exits cleanly' 'exit=0' "$out"
+
+	printf '\n%s passed, %s failed\n' "$pass" "$fail"
+	[ "$fail" -eq 0 ] || return 1
+	return 0
+}
+
+main "$@"

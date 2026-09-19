@@ -24,7 +24,23 @@
 set -euo pipefail
 
 # 1 -> 2 added clips.html, the text/html clipboard flavour a web copy carries.
-SCHEMA_VERSION=2
+# 2 -> 3 added clips.ocr_text, the text an optional OCR pass reads out of an
+#        image so a screenshot becomes searchable by what it actually shows.
+# 3 -> 4 added clips.phash, a 64-bit perceptual hash of an image so visually
+#        similar and near-duplicate images can be found — including photos with
+#        no text for OCR to read.
+# 4 -> 5 added clips.clip_embed, an optional CLIP image embedding (float32 blob)
+#        for natural-language semantic image search. Written by the opt-in
+#        clipbasket-embed helper; absent unless that add-on is installed.
+# 5 -> 6 added clips.caption, a natural-language description of an image so a
+#        photo with no text becomes keyword-searchable and gets a readable
+#        title. Written by the opt-in clipbasket-caption helper.
+SCHEMA_VERSION=6
+
+# The recognised-text payload is bounded before it reaches SQLite, exactly like
+# every other producer read: a hostile or enormous image must not be able to
+# push an unbounded string into the database through the OCR path.
+MAX_OCR_BYTES="${CLIPBASKET_MAX_OCR_BYTES:-65536}"
 APP_NAME=Clipbasket
 
 STATE_DIR="${CLIPBASKET_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/clipbasket}"
@@ -40,6 +56,7 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 # relative $0 stops resolving the moment it does.
 SELF_BIN="$SCRIPT_DIR/$(basename -- "$0")"
 HTML2MD="${CLIPBASKET_HTML2MD:-$SCRIPT_DIR/clipbasket-html2md}"
+EMBED_CLI="${CLIPBASKET_EMBED_CLI:-$SCRIPT_DIR/clipbasket-embed}"
 SAFEFILE="${CLIPBASKET_SAFEFILE:-$SCRIPT_DIR/clipbasket-safefile}"
 
 # The state, image and thumbnail directories sit at predictable paths, so
@@ -106,6 +123,20 @@ safe_unlink() {
 	local rc=0
 	"$SAFEFILE" unlink "$1" "$2" || rc=$?
 	[ "$rc" -eq 0 ] || die "refusing to remove $1/$2 (clipbasket-safefile exit $rc)"
+}
+
+# Renames one asset to a new name inside the same verified directory. Returns 1
+# (not die) when the source is already gone, so a caller that renames an image
+# and its thumbnail can carry on if only one of them is present.
+safe_rename() {
+	# $1 dir, $2 old name, $3 new name
+	local rc=0
+	"$SAFEFILE" rename "$1" "$2" "$3" || rc=$?
+	case "$rc" in
+	0) return 0 ;;
+	2) return 1 ;;
+	*) die "refusing to rename $1/$2 (clipbasket-safefile exit $rc)" ;;
+	esac
 }
 
 safe_ensure_dir() {
@@ -362,6 +393,10 @@ base_schema() {
 		  files_json   TEXT,
 		  mime         TEXT,
 		  size_bytes   INTEGER,
+		  ocr_text     TEXT,
+		  phash        TEXT,
+		  clip_embed   BLOB,
+		  caption      TEXT,
 		  searchable   TEXT    NOT NULL DEFAULT ''
 		);
 		CREATE INDEX IF NOT EXISTS idx_clips_order
@@ -443,15 +478,19 @@ build_projections() {
 	                         THEN json(c.files_json) ELSE json('null') END,
 	  'mime',           c.mime,
 	  'size_bytes',     c.size_bytes,
-	  'has_html',       json($has_html_expr)%HTML%
+	  'has_html',       json($has_html_expr)%HTML%%OCR%
 	)"
 
+	# `list` omits both the html payload and the ocr_text: a listing stays small
+	# and the panel asks `get` for either when the user opens a clip.
 	CLIP_JSON_LIST=${template/\%TEXT\%/$text_expr}
 	CLIP_JSON_LIST=${CLIP_JSON_LIST/\%TRUNCATED\%/$truncated_expr}
 	CLIP_JSON_LIST=${CLIP_JSON_LIST/\%HTML\%/}
+	CLIP_JSON_LIST=${CLIP_JSON_LIST/\%OCR\%/}
 	CLIP_JSON_FULL=${template/\%TEXT\%/c.text}
 	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%TRUNCATED\%/\'false\'}
 	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%HTML\%/,$'\n'"	  'html',           c.html"}
+	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%OCR\%/,$'\n'"	  'ocr_text',       c.ocr_text,"$'\n'"	  'phash',          c.phash,"$'\n'"	  'caption',        c.caption"}
 }
 
 # Adds a column to an existing table, once. Checking pragma_table_info rather
@@ -491,6 +530,27 @@ migrate_schema() {
 	# row is valid as it stands and simply reports has_html:false.
 	if [ "$from" -lt 2 ]; then
 		add_column clips html TEXT
+	fi
+	# v2 -> v3: the OCR reading of an image. Nullable, so every existing image
+	# row is valid as it stands and simply carries no recognised text until the
+	# optional OCR pass (or `ocr --all` backfill) fills it in.
+	if [ "$from" -lt 3 ]; then
+		add_column clips ocr_text TEXT
+	fi
+	# v3 -> v4: the perceptual hash of an image. Nullable; filled in by the same
+	# background worker that does OCR, and simply absent until then.
+	if [ "$from" -lt 4 ]; then
+		add_column clips phash TEXT
+	fi
+	# v4 -> v5: the CLIP embedding blob. Nullable; only the opt-in embed add-on
+	# ever writes it, so it is simply absent on a stock install.
+	if [ "$from" -lt 5 ]; then
+		add_column clips clip_embed BLOB
+	fi
+	# v5 -> v6: the image caption. Nullable; only the opt-in caption add-on writes
+	# it. Folds into searchable, and titles a photo that has no text of its own.
+	if [ "$from" -lt 6 ]; then
+		add_column clips caption TEXT
 	fi
 }
 
@@ -901,7 +961,17 @@ cmd_insert() {
 			WHERE (SELECT recent FROM d) = 0
 			ON CONFLICT(hash) DO UPDATE SET
 			  kind         = excluded.kind,
-			  preview      = excluded.preview,
+			  -- Keep the OCR-derived title when re-recording an image that has
+			  -- already been read: capture always offers a plain "Image WxH"
+			  -- preview, and letting it win here would wipe the content title
+			  -- (its recognised text) every time the same screenshot is re-copied or
+			  -- re-read off the clipboard on shell start. A not-yet-OCR'd image
+			  -- still takes the fresh preview, and OCR titles it shortly after.
+			  preview      = CASE
+			    WHEN clips.kind = 'image'
+			         AND ((clips.ocr_text IS NOT NULL AND clips.ocr_text <> '')
+			              OR (clips.caption IS NOT NULL AND clips.caption <> ''))
+			    THEN clips.preview ELSE excluded.preview END,
 			  text         = excluded.text,
 			  -- Not COALESCEd: the dedupe hash covers the plain text only, so
 			  -- a re-copy of the same text from a source that offers no HTML
@@ -919,7 +989,13 @@ cmd_insert() {
 			  file_count   = excluded.file_count,
 			  mime         = COALESCE(excluded.mime, clips.mime),
 			  size_bytes   = COALESCE(excluded.size_bytes, clips.size_bytes),
-			  searchable   = excluded.searchable;
+			  -- ocr_text is deliberately not overwritten: the insert payload never
+			  -- carries it (OCR runs after the row exists), so a re-record keeps the
+			  -- reading already made. It is folded back into searchable here so the
+			  -- recomputed index does not lose the recognised words until the next
+			  -- OCR pass.
+			  searchable   = TRIM(excluded.searchable || ' ' || COALESCE(clips.ocr_text, '')
+			                      || ' ' || COALESCE(clips.caption, ''));
 
 			SELECT json_object(
 			  'id',      (SELECT id FROM clips WHERE hash = (SELECT hash FROM p)),
@@ -1234,6 +1310,417 @@ cmd_markdown() {
 	printf '%s\n' "$out"
 }
 
+# set-ocr <id>  (recognised text on stdin)
+#
+# Stores the OCR reading of an image clip and re-derives `searchable` so the
+# recognised words are indexed by FTS5 (the AFTER UPDATE OF searchable trigger
+# reindexes automatically). Empty input is stored as '' rather than NULL: that
+# marks the clip "OCR done, nothing found" so `ocr-pending` does not hand it out
+# again on every backfill. The payload is bounded and UTF-8 scrubbed exactly
+# like an inserted clip, because it too is produced by a tool we do not control.
+cmd_set_ocr() {
+	local id title='' text_file q_text q_title out
+	require_id "${1:-}"
+	id="$1"
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--title)
+			title="${2:-}"
+			shift 2
+			;;
+		*) die "set-ocr: unknown option $1" ;;
+		esac
+	done
+
+	out=$(run_sql "SELECT count(*) FROM clips WHERE id = $id;") || die "set-ocr failed"
+	[ "${out:-0}" = "1" ] || die "no clip with id $id"
+
+	mktempfile
+	text_file="$REPLY_TMPFILE"
+	# head -c bounds a hostile or runaway OCR producer at ingest, before the
+	# whole stream is buffered, and sends it SIGPIPE when the cap is reached.
+	head -c "$MAX_OCR_BYTES" >"$text_file" || true
+	scrub_utf8 "$text_file"
+	sql_quote "$text_file"
+	q_text="$REPLY_QUOTED"
+	# The concise core-content title the OCR worker picked. Already cleaned, but
+	# whitespace is flattened and it is capped defensively below.
+	sql_quote "$title"
+	q_title="$REPLY_QUOTED"
+
+	# searchable is recomputed from the clip's own columns plus the new reading,
+	# mirroring the expression cmd_insert builds. This is the authoritative
+	# rebuild whenever the OCR text changes.
+	# For an image with a title, that core-content line becomes the clip's
+	# `preview` — the one line the panel shows — so a screenshot reads as its
+	# subject, not a dump of the status bar, clock and prices. The full text
+	# still goes into ocr_text/searchable, so search finds the image by any word
+	# in it. The dimensions stay in the detail view; an image with no core text
+	# (empty title) keeps its "Image WxH" preview.
+	run_sql "UPDATE clips SET
+	           ocr_text = COALESCE(CAST(readfile($q_text) AS TEXT), ''),
+	           preview = CASE
+	             WHEN kind = 'image' AND TRIM(replace(replace(replace(
+	                    $q_title, char(10), ' '), char(13), ' '), char(9), ' ')) <> ''
+	             THEN substr(TRIM(replace(replace(replace(
+	                    $q_title, char(10), ' '), char(13), ' '), char(9), ' ')), 1, $PREVIEW_CHARS)
+	             ELSE preview
+	           END,
+	           searchable = TRIM(
+	             COALESCE(text, '') || ' ' || preview || ' ' ||
+	             COALESCE(source_app, '') || ' ' || COALESCE(url_domain, '') || ' ' ||
+	             COALESCE(url_title, '') || ' ' || COALESCE(mime, '') || ' ' ||
+	             CASE WHEN kind = 'image'
+	                  THEN 'image ' || COALESCE(image_width, '') || ' ' || COALESCE(image_height, '')
+	                  ELSE '' END || ' ' ||
+	             COALESCE(replace(replace(replace(files_json, '\"', ' '), '{', ' '), '}', ' '), '') || ' ' ||
+	             COALESCE(CAST(readfile($q_text) AS TEXT), '') || ' ' || COALESCE(caption, '')
+	           )
+	         WHERE id = $id;" >/dev/null || die "set-ocr failed"
+	printf '{"ok":true}\n'
+}
+
+# set-caption <id> --caption TEXT
+#
+# Stores a natural-language description of an image, folds it into `searchable`
+# (so a photo is keyword-findable by what it depicts), and — when the image has
+# no OCR text of its own — makes it the clip's title. OCR text, when present,
+# still wins the title, because words actually in the image are more specific.
+cmd_set_caption() {
+	local id caption='' q_caption
+	require_id "${1:-}"
+	id="$1"
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--caption)
+			caption="${2:-}"
+			shift 2
+			;;
+		*) die "set-caption: unknown option $1" ;;
+		esac
+	done
+	local out
+	out=$(run_sql "SELECT count(*) FROM clips WHERE id = $id AND kind = 'image';") || die "set-caption failed"
+	[ "${out:-0}" = "1" ] || die "no image clip with id $id"
+	sql_quote "$caption"
+	q_caption="$REPLY_QUOTED"
+
+	# Title the image with its caption only while the title is still the plain
+	# "Image WxH" placeholder — i.e. OCR found no words to title it with. A real
+	# OCR title (any other preview) is more specific and is left to win, even
+	# when a photo also produced a few spurious OCR characters.
+	run_sql "UPDATE clips SET
+	           caption = NULLIF($q_caption, ''),
+	           preview = CASE
+	             WHEN TRIM($q_caption) <> '' AND (
+	                    preview IS NULL OR preview = '' OR preview = 'Image'
+	                    OR preview GLOB 'Image [0-9]*x[0-9]*')
+	             THEN substr(TRIM(replace(replace(replace($q_caption,
+	                    char(10), ' '), char(13), ' '), char(9), ' ')), 1, $PREVIEW_CHARS)
+	             ELSE preview
+	           END,
+	           searchable = TRIM(
+	             COALESCE(text, '') || ' ' || preview || ' ' ||
+	             COALESCE(source_app, '') || ' ' || COALESCE(url_domain, '') || ' ' ||
+	             COALESCE(url_title, '') || ' ' || COALESCE(mime, '') || ' ' ||
+	             CASE WHEN kind = 'image'
+	                  THEN 'image ' || COALESCE(image_width, '') || ' ' || COALESCE(image_height, '')
+	                  ELSE '' END || ' ' ||
+	             COALESCE(ocr_text, '') || ' ' || $q_caption
+	           )
+	         WHERE id = $id;" >/dev/null || die "set-caption failed"
+	printf '{"ok":true}\n'
+}
+
+# caption-pending [--limit N]
+#
+# Image clips with no caption yet ({id, image_path}, newest first), for the
+# opt-in caption add-on to backfill.
+cmd_caption_pending() {
+	local limit=1000 out
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--limit)
+			require_count "${2:-}"
+			limit="$2"
+			shift 2
+			;;
+		*) die "caption-pending: unknown option $1" ;;
+		esac
+	done
+	out=$(run_sql "SELECT COALESCE(json_group_array(json_object('id', id, 'image_path', image_path)), '[]')
+	               FROM (SELECT id, image_path FROM clips
+	                     WHERE kind = 'image' AND caption IS NULL AND image_path IS NOT NULL
+	                     ORDER BY created_at DESC LIMIT $limit);") || die "caption-pending failed"
+	printf '%s\n' "${out:-[]}"
+}
+
+# ocr-pending [--limit N]
+#
+# A JSON array of {id, image_path} for image clips that have never been OCR'd
+# (ocr_text IS NULL, so a clip already read and found empty is not re-offered).
+# The optional OCR worker uses it to backfill images that predate the feature.
+cmd_ocr_pending() {
+	local limit=1000 out
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--limit)
+			require_count "${2:-}"
+			limit="$2"
+			shift 2
+			;;
+		*) die "ocr-pending: unknown option $1" ;;
+		esac
+	done
+	out=$(run_sql "SELECT COALESCE(json_group_array(json_object('id', id, 'image_path', image_path)), '[]')
+	               FROM (SELECT id, image_path FROM clips
+	                     WHERE kind = 'image' AND ocr_text IS NULL AND image_path IS NOT NULL
+	                     ORDER BY created_at DESC LIMIT $limit);") || die "ocr-pending failed"
+	printf '%s\n' "${out:-[]}"
+}
+
+# rename-image <id> --slug <slug>
+#
+# Renames an image clip's stored file (and its thumbnail) from the opaque
+# content hash to a human-readable name derived from what the image shows, and
+# updates image_path/thumb_path to match so copy, the lightbox and asset GC all
+# follow. The name is `<slug>-<hash12>.<ext>`: the slug is readable, the 12 hex
+# of the content hash keep it unique and stable, so re-running is idempotent and
+# two different images that read the same words never collide. Renames go
+# through clipbasket-safefile (descriptor-bound), and only a file that is a
+# direct child of images/ (or thumbs/) is ever touched. A no-op, not an error,
+# when the clip is not an image, has no usable slug, or its file is elsewhere.
+cmd_rename_image() {
+	local id slug='' row hash image_path thumb_path kind
+	local img_base ext hash12 new_img_name new_thumb_name
+	local new_image_path new_thumb_path did=0 q_img q_thumb
+	require_id "${1:-}"
+	id="$1"
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--slug)
+			slug="${2:-}"
+			shift 2
+			;;
+		*) die "rename-image: unknown option $1" ;;
+		esac
+	done
+
+	# Fetched with separate queries rather than one delimited row: the sqlite3
+	# CLI renders a control character (char(31) and friends) in caret notation in
+	# its output, so no such byte survives to split on. kind and hash are a single
+	# safe token each; the paths are captured whole, one query apiece.
+	row=$(run_sql "SELECT COALESCE(kind,'')||' '||COALESCE(hash,'') FROM clips WHERE id = $id;") ||
+		die "rename-image failed"
+	read -r kind hash <<<"$row"
+	image_path=$(run_sql "SELECT COALESCE(image_path,'') FROM clips WHERE id = $id;") || die "rename-image failed"
+	thumb_path=$(run_sql "SELECT COALESCE(thumb_path,'') FROM clips WHERE id = $id;") || die "rename-image failed"
+
+	[ "$kind" = "image" ] && [ -n "$image_path" ] || {
+		printf '{"ok":true,"renamed":false}\n'
+		return 0
+	}
+	# Only rename a file that actually lives in images/.
+	case "$image_path" in "$IMAGE_DIR"/*) ;; *) printf '{"ok":true,"renamed":false}\n'; return 0 ;; esac
+	img_base=${image_path##*/}
+	case "$img_base" in */* | '' | . | ..) printf '{"ok":true,"renamed":false}\n'; return 0 ;; esac
+
+	# Defensive slug hygiene (the caller already slugifies): keep [a-z0-9-],
+	# collapse and trim separators, cap the length.
+	slug=$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' |
+		sed -E 's/-+/-/g; s/^-+//; s/-+$//')
+	slug=${slug:0:48}
+	slug=${slug%-}
+	[ -n "$slug" ] || { printf '{"ok":true,"renamed":false}\n'; return 0; }
+
+	ext=''
+	case "$img_base" in *.*) ext=${img_base##*.} ;; esac
+	hash12=$(printf '%s' "$hash" | tr -cd 'a-f0-9')
+	hash12=${hash12:0:12}
+	[ -n "$hash12" ] || hash12=$(printf '%s' "$id")
+	new_img_name="${slug}-${hash12}${ext:+.$ext}"
+	new_thumb_name="${slug}-${hash12}.png"
+
+	new_image_path="$IMAGE_DIR/$new_img_name"
+	if [ "$img_base" != "$new_img_name" ]; then
+		if safe_rename "$IMAGE_DIR" "$img_base" "$new_img_name"; then
+			did=1
+		else
+			# The image file is gone; leave the row pointing where it was rather
+			# than at a name that does not exist.
+			new_image_path="$image_path"
+		fi
+	fi
+
+	# Thumbnail: three shapes. When it is the original image itself (no separate
+	# thumb was made) it simply follows the image to its new path. When it is a
+	# real file under thumbs/, rename it too. Anything else is left untouched.
+	new_thumb_path="$thumb_path"
+	if [ -n "$thumb_path" ] && [ "$thumb_path" = "$image_path" ]; then
+		new_thumb_path="$new_image_path"
+	elif [ -n "$thumb_path" ]; then
+		case "$thumb_path" in
+		"$THUMB_DIR"/*)
+			local thumb_base=${thumb_path##*/}
+			if [ "$thumb_base" != "$new_thumb_name" ] &&
+				safe_rename "$THUMB_DIR" "$thumb_base" "$new_thumb_name"; then
+				new_thumb_path="$THUMB_DIR/$new_thumb_name"
+				did=1
+			elif [ "$thumb_base" = "$new_thumb_name" ]; then
+				new_thumb_path="$THUMB_DIR/$new_thumb_name"
+			fi
+			;;
+		esac
+	fi
+
+	sql_quote "$new_image_path"
+	q_img="$REPLY_QUOTED"
+	sql_quote "$new_thumb_path"
+	q_thumb="$REPLY_QUOTED"
+	run_sql "UPDATE clips SET image_path = $q_img, thumb_path = $q_thumb WHERE id = $id;" >/dev/null ||
+		die "rename-image failed"
+	printf '{"ok":true,"renamed":%s,"image_path":%s}\n' \
+		"$([ "$did" = 1 ] && printf true || printf false)" "$(json_string "$new_image_path")"
+}
+
+# set-phash <id> <hex>
+#
+# Stores the 64-bit perceptual hash (16 lowercase hex chars) the worker
+# computed for an image, so `similar` can find visually close images. A no-op
+# for a non-image clip.
+cmd_set_phash() {
+	local id hex
+	require_id "${1:-}"
+	id="$1"
+	hex="${2:-}"
+	case "$hex" in
+	[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+	*) die "set-phash: expected 16 lowercase hex chars, got: ${hex:-<missing>}" ;;
+	esac
+	run_sql "UPDATE clips SET phash = '$hex' WHERE id = $id AND kind = 'image';" >/dev/null ||
+		die "set-phash failed"
+	printf '{"ok":true}\n'
+}
+
+# phash-pending [--limit N]
+#
+# A JSON array of {id, image_path} for image clips that have no perceptual hash
+# yet, newest first. The worker uses it to backfill images that predate the
+# feature, alongside `ocr-pending`.
+cmd_phash_pending() {
+	local limit=1000 out
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--limit)
+			require_count "${2:-}"
+			limit="$2"
+			shift 2
+			;;
+		*) die "phash-pending: unknown option $1" ;;
+		esac
+	done
+	out=$(run_sql "SELECT COALESCE(json_group_array(json_object('id', id, 'image_path', image_path)), '[]')
+	               FROM (SELECT id, image_path FROM clips
+	                     WHERE kind = 'image' AND phash IS NULL AND image_path IS NOT NULL
+	                     ORDER BY created_at DESC LIMIT $limit);") || die "phash-pending failed"
+	printf '%s\n' "${out:-[]}"
+}
+
+# similar <id> [--max-distance N] [--limit K]
+#
+# Finds images visually close to the given one by Hamming distance between
+# their perceptual hashes: a JSON array of {id, distance, kind, preview,
+# thumb_path, image_path}, nearest first, distance <= N (default 12 of 64
+# bits), at most K results (default 20). This finds near-duplicates and
+# look-alikes — including photos with no text — which OCR alone cannot. Empty
+# when the clip is not an image or has no hash yet.
+cmd_similar() {
+	local id maxd=12 limit=20 target rows ranked values
+	require_id "${1:-}"
+	id="$1"
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--max-distance)
+			require_count "${2:-}"
+			maxd="$2"
+			shift 2
+			;;
+		--limit)
+			require_count "${2:-}"
+			limit="$2"
+			shift 2
+			;;
+		*) die "similar: unknown option $1" ;;
+		esac
+	done
+
+	target=$(run_sql "SELECT COALESCE(phash, '') FROM clips WHERE id = $id AND kind = 'image';") ||
+		die "similar failed"
+	[ -n "$target" ] || { printf '[]\n'; return 0; }
+
+	rows=$(run_sql "SELECT id || ' ' || phash FROM clips
+	                WHERE kind = 'image' AND phash IS NOT NULL AND id <> $id;") || die "similar failed"
+	[ -n "$rows" ] || { printf '[]\n'; return 0; }
+
+	# Hamming distance over the 16 hex nibbles: xor each nibble and add its
+	# popcount. gawk has the bitwise xor; the popcount table is 16 entries.
+	ranked=$(printf '%s\n' "$rows" | gawk -v t="$target" -v maxd="$maxd" '
+		BEGIN {
+			for (i = 0; i < 16; i++) { c = 0; v = i; while (v) { c += v % 2; v = int(v / 2) } pc[i] = c }
+			split("0 1 2 3 4 5 6 7 8 9 a b c d e f", hx, " ")
+			for (i = 1; i <= 16; i++) hv[hx[i]] = i - 1
+			n = length(t)
+		}
+		{
+			if (length($2) != n) next
+			d = 0
+			for (i = 1; i <= n; i++) d += pc[xor(hv[substr(t, i, 1)], hv[substr($2, i, 1)])]
+			if (d <= maxd) print d, $1
+		}' | sort -n -k1,1 -k2,2 | head -n "$limit")
+	[ -n "$ranked" ] || { printf '[]\n'; return 0; }
+
+	# Turn the ranked "distance id" lines into a VALUES list joined back to the
+	# clips, so the caller gets rich objects, nearest first.
+	values=''
+	while read -r dist rid; do
+		[ -n "$rid" ] || continue
+		values="${values:+$values,}($rid,$dist)"
+	done <<<"$ranked"
+	[ -n "$values" ] || { printf '[]\n'; return 0; }
+
+	run_sql "WITH d(id, dist) AS (VALUES $values)
+	         SELECT COALESCE(json_group_array(json_object(
+	           'id', c.id, 'distance', j.dist, 'kind', c.kind, 'preview', c.preview,
+	           'thumb_path', c.thumb_path, 'image_path', c.image_path)), '[]')
+	         FROM (SELECT id, dist FROM d ORDER BY dist, id) j JOIN clips c ON c.id = j.id;" ||
+		die "similar failed"
+}
+
+# semantic <query> [--limit K] [--min-score S]
+#
+# Natural-language image search: ranks images by how well their CLIP embedding
+# matches the query, so "a photo of a beach" finds beach pictures that carry no
+# text. Passes through to the opt-in clipbasket-embed add-on; a clear error
+# (not a crash) when that runtime is not installed.
+cmd_semantic() {
+	local query rc=0 out
+	query="${1:-}"
+	[ -n "$query" ] || die "semantic: expected a query"
+	shift
+	[ -x "$EMBED_CLI" ] || die "semantic search add-on is not installed (see docs/SEMANTIC.md)"
+	out=$("$EMBED_CLI" search "$query" "$@" 2>/dev/null) || rc=$?
+	case "$rc" in
+	0) ;;
+	3) die "semantic search add-on is not installed (see docs/SEMANTIC.md)" ;;
+	*) die "semantic search failed" ;;
+	esac
+	printf '%s\n' "$out"
+}
+
 cmd_info() {
 	local total fts
 	# `info` is the diagnostic, so it never reports a stale "no FTS5": it pays
@@ -1357,12 +1844,20 @@ cmd_selftest() {
 			       ('url',  'example.com', 'https://example.com/', 'h-legacy-url', 1700000001, 0, 'example.com');
 		SQL
 		check 'a v1 database has no html column' '0' "$(column_count html)"
+		check 'a v1 database has no ocr_text column' '0' "$(column_count ocr_text)"
+		check 'a v1 database has no phash column' '0' "$(column_count phash)"
+		check 'a v1 database has no clip_embed column' '0' "$(column_count clip_embed)"
+		check 'a v1 database has no caption column' '0' "$(column_count caption)"
 		check 'a v1 database reports user_version 1' '1' \
 			"$(printf 'PRAGMA user_version;\n' | run_raw)"
 
 		ensure_schema
 
 		check 'migration adds html to the existing table' '1' "$(column_count html)"
+		check 'migration adds ocr_text to the existing table' '1' "$(column_count ocr_text)"
+		check 'migration adds phash to the existing table' '1' "$(column_count phash)"
+		check 'migration adds clip_embed to the existing table' '1' "$(column_count clip_embed)"
+		check 'migration adds caption to the existing table' '1' "$(column_count caption)"
 		check 'migration stamps the new schema version' "$SCHEMA_VERSION" \
 			"$(printf 'PRAGMA user_version;\n' | run_raw)"
 		check 'migration keeps every existing row' '2' "$(run_sql 'SELECT count(*) FROM clips;')"
@@ -1567,7 +2062,160 @@ tab	here"
 	check 'suppress writes a token' '{"ok":true}' "$out"
 	check 'suppress token is readable by the watcher' 'deadbeef' "$(cat "$SUPPRESS_FILE")"
 	out=$(cmd_info)
-	check_contains 'info reports the schema version' '"schema_version":2' "$out"
+	check_contains 'info reports the schema version' "\"schema_version\":$SCHEMA_VERSION" "$out"
+
+	# --- OCR: content-aware image search ----------------------------------
+	printf '{"kind":"image","hash":"h-ocr","preview":"Image 800x600","image_path":"%s/h-ocr.png","image_width":800,"image_height":600,"mime":"image/png","source_app":"grim"}\n' \
+		"$IMAGE_DIR" | cmd_insert >/dev/null
+	local ocr_id
+	ocr_id=$(run_sql "SELECT id FROM clips WHERE hash = 'h-ocr';")
+	out=$(cmd_ocr_pending)
+	check_contains 'a fresh image clip is pending OCR' "\"id\":$ocr_id" "$out"
+	out=$(cmd_list --limit 50 --query 'kangaroo')
+	check 'before OCR the image is not found by an image word' '[]' "$out"
+	printf 'a leaping kangaroo diagram' | cmd_set_ocr "$ocr_id" --title 'a leaping kangaroo diagram' >/dev/null
+	out=$(cmd_list --limit 50 --query 'kangaroo')
+	check_contains 'after set-ocr the image is found by its recognised text' '"kind":"image"' "$out"
+	out=$(cmd_get "$ocr_id")
+	check_contains 'get returns the ocr_text' '"ocr_text":"a leaping kangaroo diagram"' "$out"
+	# The recognised text becomes the image's title (preview), replacing "Image WxH".
+	check 'set-ocr retitles the image to its recognised text' 'a leaping kangaroo diagram' \
+		"$(run_sql "SELECT preview FROM clips WHERE id = $ocr_id;")"
+	out=$(cmd_list --limit 50 --query 'kangaroo')
+	check_contains 'the new title shows in a listing' '"preview":"a leaping kangaroo diagram"' "$out"
+	check_contains 'list never leaks ocr_text' '' "${out##*ocr_text}"
+	case "$out" in *ocr_text*) fail=$((fail + 1)); printf 'FAIL: list leaked ocr_text\n' >&2 ;; *) pass=$((pass + 1)) ;; esac
+	out=$(cmd_ocr_pending)
+	check 'an OCR-processed clip is no longer pending' '[]' "$out"
+	printf '' | cmd_set_ocr "$ocr_id" >/dev/null
+	check 'an empty OCR result still marks the clip done' '' \
+		"$(run_sql "SELECT ocr_text FROM clips WHERE id = $ocr_id;")"
+	check 'and an empty re-read keeps the existing title, not a blank one' 'a leaping kangaroo diagram' \
+		"$(run_sql "SELECT preview FROM clips WHERE id = $ocr_id;")"
+	out=$(cmd_ocr_pending)
+	check 'and an empty-OCR clip is not re-offered as pending' '[]' "$out"
+	# The title is the concise line the worker passes with --title; the full text
+	# on stdin still feeds search, so a word only in the body is still found while
+	# the title stays short.
+	printf 'quarterly earnings up 12 percent kangaroo' | cmd_set_ocr "$ocr_id" --title 'quarterly earnings' >/dev/null
+	check 'the title is the --title line, not the whole text' 'quarterly earnings' \
+		"$(run_sql "SELECT preview FROM clips WHERE id = $ocr_id;")"
+	out=$(cmd_list --limit 50 --query 'percent')
+	check_contains 'but a body-only word still finds the image' '"kind":"image"' "$out"
+	# set-ocr with no --title leaves the existing title untouched.
+	printf 'body words only here' | cmd_set_ocr "$ocr_id" >/dev/null
+	check 'set-ocr without --title does not change the title' 'quarterly earnings' \
+		"$(run_sql "SELECT preview FROM clips WHERE id = $ocr_id;")"
+
+	# A re-record of the same image keeps its recognised text indexed.
+	printf 'a leaping kangaroo diagram' | cmd_set_ocr "$ocr_id" --title 'a leaping kangaroo diagram' >/dev/null
+	run_sql "UPDATE clips SET created_at = 1 WHERE id = $ocr_id;" >/dev/null
+	printf '{"kind":"image","hash":"h-ocr","preview":"Image 800x600","image_path":"%s/h-ocr.png","image_width":800,"image_height":600,"mime":"image/png","source_app":"grim"}\n' \
+		"$IMAGE_DIR" | cmd_insert >/dev/null
+	out=$(cmd_list --limit 50 --query 'kangaroo')
+	check_contains 'a re-recorded image keeps its OCR words searchable' '"kind":"image"' "$out"
+	check 'and its ocr_text survives the re-record' 'a leaping kangaroo diagram' \
+		"$(run_sql "SELECT ocr_text FROM clips WHERE hash = 'h-ocr';")"
+	check 'and the re-record keeps the OCR title, not the plain Image WxH' 'a leaping kangaroo diagram' \
+		"$(run_sql "SELECT preview FROM clips WHERE hash = 'h-ocr';")"
+	out=$(cmd_set_ocr 999999 2>/dev/null) || true
+	check_contains 'set-ocr on a missing id is a JSON error' '"error"' "$out"
+
+	# --- rename-image: name the file after what the image shows ------------
+	safe_ensure_dir "$IMAGE_DIR" 755
+	safe_ensure_dir "$THUMB_DIR" 755
+	local rn_hash="feed0011223344556677889900aabbccddeeff00112233445566778899aabbcc"
+	printf 'imgbytes' | safe_write "$IMAGE_DIR" "$rn_hash.png" 644 1048576
+	printf 'thumbbytes' | safe_write "$THUMB_DIR" "$rn_hash.png" 644 1048576
+	printf '{"kind":"image","hash":"%s","preview":"Image","image_path":"%s/%s.png","thumb_path":"%s/%s.png","mime":"image/png"}\n' \
+		"$rn_hash" "$IMAGE_DIR" "$rn_hash" "$THUMB_DIR" "$rn_hash" | cmd_insert >/dev/null
+	local rn_id
+	rn_id=$(run_sql "SELECT id FROM clips WHERE hash = '$rn_hash';")
+	out=$(cmd_rename_image "$rn_id" --slug 'Quarterly Report FINAL')
+	check_contains 'rename-image reports the readable new path' 'quarterly-report-final-feed00112233.png' "$out"
+	check 'the image file is renamed on disk' 'present' \
+		"$( [ -f "$IMAGE_DIR/quarterly-report-final-feed00112233.png" ] && echo present || echo absent )"
+	check 'the thumbnail is renamed too' 'present' \
+		"$( [ -f "$THUMB_DIR/quarterly-report-final-feed00112233.png" ] && echo present || echo absent )"
+	check 'the opaque hash name is gone' 'absent' \
+		"$( [ -e "$IMAGE_DIR/$rn_hash.png" ] && echo present || echo absent )"
+	out=$(cmd_get "$rn_id")
+	check_contains 'the row image_path follows the rename' 'quarterly-report-final-feed00112233.png' "$out"
+	out=$(cmd_rename_image "$rn_id" --slug 'quarterly report final')
+	check_contains 'rename-image is idempotent' '"renamed":false' "$out"
+	out=$(cmd_rename_image "$rn_id" --slug '!!!')
+	check_contains 'an empty slug leaves the name alone' '"renamed":false' "$out"
+	# delete cleans up the renamed assets, proving GC follows image_path.
+	cmd_delete "$rn_id" >/dev/null
+	check 'delete removes the renamed image asset' 'absent' \
+		"$( [ -e "$IMAGE_DIR/quarterly-report-final-feed00112233.png" ] && echo present || echo absent )"
+	check 'delete removes the renamed thumbnail' 'absent' \
+		"$( [ -e "$THUMB_DIR/quarterly-report-final-feed00112233.png" ] && echo present || echo absent )"
+	out=$(cmd_rename_image 999999 --slug 'x' 2>/dev/null) || true
+	check_contains 'rename-image on a non-image/missing id is a clean no-op' '"renamed":false' "$out"
+
+	# --- perceptual hash + similar-image search ---------------------------
+	local ph_a ph_b ph_c
+	printf '{"kind":"image","hash":"ph-a","preview":"Image","image_path":"%s/pa.png","mime":"image/png"}\n' "$IMAGE_DIR" | cmd_insert >/dev/null
+	printf '{"kind":"image","hash":"ph-b","preview":"Image","image_path":"%s/pb.png","mime":"image/png"}\n' "$IMAGE_DIR" | cmd_insert >/dev/null
+	printf '{"kind":"image","hash":"ph-c","preview":"Image","image_path":"%s/pc.png","mime":"image/png"}\n' "$IMAGE_DIR" | cmd_insert >/dev/null
+	ph_a=$(run_sql "SELECT id FROM clips WHERE hash='ph-a';")
+	ph_b=$(run_sql "SELECT id FROM clips WHERE hash='ph-b';")
+	ph_c=$(run_sql "SELECT id FROM clips WHERE hash='ph-c';")
+	out=$(cmd_phash_pending)
+	check_contains 'a fresh image is pending a perceptual hash' "\"id\":$ph_a" "$out"
+	cmd_set_phash "$ph_a" ffff0000ffff0000 >/dev/null
+	cmd_set_phash "$ph_b" ffff0000ffff0011 >/dev/null   # 2 bits from a
+	cmd_set_phash "$ph_c" 0000ffff0000ffff >/dev/null   # far from a
+	out=$(cmd_phash_pending)
+	case "$out" in *"\"id\":$ph_a"*) fail=$((fail + 1)); printf 'FAIL: hashed image still phash-pending\n' >&2 ;; *) pass=$((pass + 1)) ;; esac
+	out=$(cmd_similar "$ph_a")
+	check_contains 'similar finds the near-duplicate' "\"id\":$ph_b,\"distance\":2" "$out"
+	case "$out" in *"\"id\":$ph_c"*) fail=$((fail + 1)); printf 'FAIL: similar returned the far image\n' >&2 ;; *) pass=$((pass + 1)) ;; esac
+	case "$out" in *"\"id\":$ph_a"*) fail=$((fail + 1)); printf 'FAIL: similar returned the query image itself\n' >&2 ;; *) pass=$((pass + 1)) ;; esac
+	out=$(cmd_similar "$ph_a" --max-distance 64)
+	check_contains 'a wide distance reaches the far image too' "\"id\":$ph_c" "$out"
+	out=$(cmd_set_phash "$ph_a" nothex 2>/dev/null) || true
+	check_contains 'set-phash rejects a non-hex value' '"error"' "$out"
+	out=$(cmd_similar 999999)
+	check 'similar on a missing/hashless clip is []' '[]' "$out"
+
+	# --- captions: describe & title no-text photos ------------------------
+	printf '{"kind":"image","hash":"cap-photo","preview":"Image 640x480","image_path":"%s/cap1.png","mime":"image/png"}\n' "$IMAGE_DIR" | cmd_insert >/dev/null
+	local cap_photo
+	cap_photo=$(run_sql "SELECT id FROM clips WHERE hash='cap-photo';")
+	out=$(cmd_caption_pending)
+	check_contains 'a fresh image is pending a caption' "\"id\":$cap_photo" "$out"
+	cmd_set_caption "$cap_photo" --caption 'a dog running on a grassy field' >/dev/null
+	check 'a no-text photo is titled by its caption' 'a dog running on a grassy field' \
+		"$(run_sql "SELECT preview FROM clips WHERE id = $cap_photo;")"
+	out=$(cmd_list --limit 50 --query 'grassy')
+	check_contains 'a caption word makes the photo findable' '"kind":"image"' "$out"
+	out=$(cmd_caption_pending)
+	case "$out" in *"\"id\":$cap_photo"*) fail=$((fail + 1)); printf 'FAIL: captioned image still pending\n' >&2 ;; *) pass=$((pass + 1)) ;; esac
+	# A screenshot with OCR text keeps the OCR title; the caption only adds search.
+	printf '{"kind":"image","hash":"cap-shot","preview":"Image 800x600","image_path":"%s/cap2.png","mime":"image/png"}\n' "$IMAGE_DIR" | cmd_insert >/dev/null
+	local cap_shot
+	cap_shot=$(run_sql "SELECT id FROM clips WHERE hash='cap-shot';")
+	printf 'Quarterly revenue report' | cmd_set_ocr "$cap_shot" --title 'Quarterly revenue report' >/dev/null
+	cmd_set_caption "$cap_shot" --caption 'a screenshot of a spreadsheet' >/dev/null
+	check 'OCR text wins the title over a caption' 'Quarterly revenue report' \
+		"$(run_sql "SELECT preview FROM clips WHERE id = $cap_shot;")"
+	out=$(cmd_list --limit 50 --query 'spreadsheet')
+	check_contains 'but the caption is still searchable on a screenshot' '"kind":"image"' "$out"
+	out=$(cmd_set_caption 999999 --caption 'x' 2>&1) || true
+	check_contains 'set-caption on a non-image/missing id is an error' '"error"' "$out"
+
+	# --- semantic search passthrough (add-on forced absent) ---------------
+	# `|| true` sits OUTSIDE the $(): die exits, which bypasses an inner || and
+	# would trip set -e on the assignment.
+	local keep_embed="$EMBED_CLI"
+	EMBED_CLI="$SELFTEST_ROOT/no-embed"
+	out=$(cmd_semantic 'a beach' 2>&1) || true
+	check_contains 'semantic errors clearly when the add-on is absent' 'not installed' "$out"
+	out=$(cmd_semantic 2>&1) || true
+	check_contains 'semantic requires a query' 'expected a query' "$out"
+	EMBED_CLI="$keep_embed"
 
 	# --- error handling ---------------------------------------------------
 	out=$(cmd_get abc 2>/dev/null) || true
@@ -1989,6 +2637,17 @@ usage() {
 		  copy   <id>                (extension: re-copy via wl-copy)
 		  touch  <id>                (extension: bump to top)
 		  suppress <hash>            (extension: arm self-capture suppression)
+		  set-ocr <id>               (store an image's recognised text; text on stdin)
+		  ocr-pending [--limit N]    (image clips still awaiting OCR)
+		  rename-image <id> --slug S (rename an image's file to a readable name)
+		  set-phash <id> <hex>       (store an image's 64-bit perceptual hash)
+		  phash-pending [--limit N]  (image clips with no perceptual hash yet)
+		  set-caption <id> --caption S (store an image's description; titles no-text photos)
+		  caption-pending [--limit N]  (image clips with no caption yet)
+		  similar <id> [--max-distance N] [--limit K]
+		                             (images visually close to this one)
+		  semantic <query> [--limit K] [--min-score S]
+		                             (natural-language image search; opt-in add-on)
 		  info
 		  selftest
 	TXT
@@ -2023,6 +2682,15 @@ main() {
 	copy) cmd_copy "$@" ;;
 	touch) cmd_touch "$@" ;;
 	suppress) cmd_suppress "$@" ;;
+	set-ocr) cmd_set_ocr "$@" ;;
+	ocr-pending) cmd_ocr_pending "$@" ;;
+	rename-image) cmd_rename_image "$@" ;;
+	set-phash) cmd_set_phash "$@" ;;
+	phash-pending) cmd_phash_pending "$@" ;;
+	set-caption) cmd_set_caption "$@" ;;
+	caption-pending) cmd_caption_pending "$@" ;;
+	similar) cmd_similar "$@" ;;
+	semantic) cmd_semantic "$@" ;;
 	info) cmd_info "$@" ;;
 	*) die "unknown subcommand: $subcommand" ;;
 	esac
