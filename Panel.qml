@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // Three views in one panel: the clip list, the detail view for a single clip
@@ -1506,7 +1507,7 @@ Panel {
       radius: width / 2
       y: 2
       x: sw.checked ? parent.width - width - 2 : 2
-      color: sw.checked ? Color.background : root.fg(0.75)
+      color: sw.checked ? Commons.Color.background : root.fg(0.75)
       Behavior on x { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
     }
 
@@ -1840,7 +1841,7 @@ Panel {
                   id: chipText
                   anchors.centerIn: parent
                   text: root.filterLabels[index]
-                  color: parent.selected ? Color.background : root.barForeground
+                  color: parent.selected ? Commons.Color.background : root.barForeground
                   opacity: parent.selected ? 1 : 0.7
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
@@ -2134,7 +2135,7 @@ Panel {
                         id: copyLabel
                         anchors.centerIn: parent
                         text: "Copy"
-                        color: Color.background
+                        color: Commons.Color.background
                         font.family: Style.font.family
                         font.pixelSize: Style.font.caption
                       }
@@ -2170,7 +2171,7 @@ Panel {
                       Text {
                         anchors.centerIn: parent
                         text: root.glyphChevron
-                        color: Color.background
+                        color: Commons.Color.background
                         font.family: Style.font.family
                         font.pixelSize: Style.font.caption
                       }
@@ -2282,7 +2283,7 @@ Panel {
         visible: root.lightboxOpen && root.detailHasImage
         z: 60
         anchors.fill: parent
-        color: Color.background
+        color: Commons.Color.background
 
         MouseArea {
           anchors.fill: parent
@@ -2337,7 +2338,7 @@ Panel {
         width: Math.max(Style.space(150), menuColumn.implicitWidth + Style.space(16))
         height: menuColumn.implicitHeight + Style.space(8)
         radius: 8
-        color: Color.background
+        color: Commons.Color.background
         border.width: 1
         border.color: root.fg(0.16)
 
@@ -2582,7 +2583,7 @@ Panel {
                   width: expandHint.implicitWidth + Style.space(14)
                   height: Style.space(20)
                   radius: height / 2
-                  color: Color.background
+                  color: Commons.Color.background
                   opacity: 0.85
 
                   Text {
@@ -2918,7 +2919,7 @@ Panel {
                   id: detailCopyLabel
                   anchors.centerIn: parent
                   text: root.detailKind === "image" ? "Copy image" : "Copy"
-                  color: Color.background
+                  color: Commons.Color.background
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
                 }
